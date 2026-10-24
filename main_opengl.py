@@ -351,6 +351,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     presets.update({twin: build_twin(name) for name, twin in FULLSCREEN_TWINS.items()})
     twins = {**FULLSCREEN_TWINS, **{twin: name for name, twin in FULLSCREEN_TWINS.items()}}
     panel_open = False  # the floating sidebar in a fullscreen world (SPACE)
+    shown_name = None  # the active world's name last frame (a fullscreen world is unpaused when it's switched to)
 
     def toggle_fullscreen():
         """H / the Palette card's button: switch to the active world's twin, keeping its palette; the fullscreen one
@@ -399,6 +400,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         profiler.frame()
         world, editor = session.world, session.editor  # the active world (anything may have switched / replaced it)
         full = getattr(world, "fullscreen", False)
+        if full and session.name != shown_name:  # a fullscreen world runs however it was opened (H, W panel, ...)
+            editor.paused, panel_open = False, False
+        shown_name = session.name
         sidebar_shown = not full or panel_open
         if full:
             editor.sidebar = hud.rect if panel_open else no_sidebar

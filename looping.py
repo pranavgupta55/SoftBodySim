@@ -34,6 +34,9 @@ SIDES = ("left", "right", "top", "bottom")
 OPPOSITE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 REACH = 0.5  # destination spots are searched up to this fraction of the band's length past the first one
 MAX_SPOTS = 64
+LIFT_SPOTS = 16  # a left / right wrap with no free spot level with the body also tries this many spots stacked above
+RETURN_SPEED = 5.0  # px/s: a group fully past a left / right edge wraps unless it's heading back in faster than this
+RETRY_FRAMES = 8  # a group with no free spot at all waits this many frames before searching again
 
 
 def clearance():
@@ -205,17 +208,23 @@ def bodies_clear(pts_a, pts_b, gap):
     return True
 
 
-def spot_free(world, members, shift, gap=None):
-    """Whether the bodies `members` (indices), translated by shift (dx, dy), are clear of every other body."""
+def body_boxes(world):
+    """Every body's bounding box: (lo, hi), each (2, bodies)."""
+    starts = world.offsets[:-1]
+    return (np.stack([np.minimum.reduceat(world.P[k], starts) for k in range(2)]),
+            np.stack([np.maximum.reduceat(world.P[k], starts) for k in range(2)]))
+
+
+def spot_free(world, members, shift, gap=None, boxes=None):
+    """Whether the bodies `members` (indices), translated by shift (dx, dy), are clear of every other body. boxes:
+    body_boxes(world), if the caller already has them (they must be current)."""
     gap = clearance() if gap is None else gap
     member_set = set(members)
     d = np.reshape(np.asarray(shift, dtype=float), (2, 1))
     moved = [world.bodies[k].points + d for k in members]
     lo = np.min([m.min(axis=1) for m in moved], axis=0) - gap
     hi = np.max([m.max(axis=1) for m in moved], axis=0) + gap
-    starts = world.offsets[:-1]
-    o_lo = np.stack([np.minimum.reduceat(world.P[k], starts) for k in range(2)])
-    o_hi = np.stack([np.maximum.reduceat(world.P[k], starts) for k in range(2)])
+    o_lo, o_hi = body_boxes(world) if boxes is None else boxes
     near = np.flatnonzero(np.all(o_lo <= hi[:, None], axis=0) & np.all(o_hi >= lo[:, None], axis=0)
                           & (world.body_counts > 0))  # boxes within the gap of the moved group's box
     for k in near:
@@ -251,15 +260,16 @@ def _parallel_wall_ok(wall, members, world, d):
 
 def _exit_side(lo, hi, vel, bounds, active):
     """The side a group with box lo..hi and mean velocity vel has fully left through while moving outward, among
-    the `active` sides, or None."""
+    the `active` sides, or None. Left / right also take a group that has stopped out there (not heading back in
+    faster than RETURN_SPEED): bodies come to rest off screen on a floor that runs past the side edges."""
     x0, y0, x1, y1 = bounds
     if "bottom" in active and lo[1] > y1 and vel[1] > 0:
         return "bottom"
     if "top" in active and hi[1] < y0 and vel[1] < 0:
         return "top"
-    if "right" in active and lo[0] > x1 and vel[0] > 0:
+    if "right" in active and lo[0] > x1 and vel[0] > -RETURN_SPEED:
         return "right"
-    if "left" in active and hi[0] < x0 and vel[0] < 0:
+    if "left" in active and hi[0] < x0 and vel[0] < RETURN_SPEED:
         return "left"
     return None
 
@@ -291,6 +301,22 @@ def _spots(world, entry, lo, hi, gap):
     return out
 
 
+def _lifted(world, entry, spots, lo, hi, gap):
+    """For a left / right wrap: spots just inside the entry edge (an unwalled entry's spots are all outside it),
+    from level with the body up by a box height + gap at a time, up to LIFT_SPOTS, staying below the top of the
+    bounds. A pile resting against the entry edge (e.g. on a floor that runs past the screen) blocks every spot level
+    with it; above it there's room, and the body falls in from there."""
+    rise = hi[1] - lo[1] + gap
+    inward = 0.0 if world.walls.get(entry) in world.bodies else (hi[0] - lo[0] + gap) * (1 if entry == "left" else -1)
+    out = []
+    for k in range(LIFT_SPOTS + 1):
+        d = spots[0] + (inward, -k * rise)
+        if lo[1] + d[1] < world.bounds[1]:
+            break
+        out.append(d)
+    return out
+
+
 def loop_step(world):
     """One looping pass (World.step calls it before each frame's substeps): add pending walls that are clear, then
     wrap every group that fully left through a looping side. Moves P and PREV only; velocities untouched.
@@ -301,10 +327,8 @@ def loop_step(world):
     if not active or not world.bodies or world.bounds is None:
         return []
     # cheap vectorized pre-check: is any movable body fully outside the bounds at all?
-    starts = world.offsets[:-1]
     nonempty = world.body_counts > 0
-    box_lo = np.stack([np.minimum.reduceat(world.P[k], starts) for k in range(2)])  # (2, bodies)
-    box_hi = np.stack([np.maximum.reduceat(world.P[k], starts) for k in range(2)])
+    box_lo, box_hi = body_boxes(world)  # (2, bodies); kept current below as groups move
     x0, y0, x1, y1 = world.bounds
     outside = nonempty & ~world.body_fixed & ((box_lo[0] > x1) | (box_hi[0] < x0) | (box_lo[1] > y1) | (box_hi[1] < y0))
     if not outside.any():
@@ -313,8 +337,17 @@ def loop_step(world):
     grabbed_body = None if world.grabbed is None else int(world.point_body[world.grabbed])
     gap = clearance()
     wraps = []
+    # groups that found no free spot recently: id(first body) -> frames left before they search again
+    waiting = world.__dict__.setdefault("_wrap_wait", {})
+    for key in list(waiting):
+        waiting[key] -= 1
+        if waiting[key] <= 0:
+            del waiting[key]
     for root, members in groups.items():
         if root in anchored or grabbed_body in members or not all(outside[k] for k in members):
+            continue
+        key = id(world.bodies[members[0]])
+        if key in waiting:
             continue
         idx = np.concatenate([np.arange(world.offsets[k], world.offsets[k + 1]) for k in members])
         pts = world.P[:, idx]
@@ -322,10 +355,17 @@ def loop_step(world):
         side = _exit_side(lo, hi, world.V[:, idx].mean(axis=1), world.bounds, active)
         if side is None:
             continue
-        for d in _spots(world, OPPOSITE[side], lo, hi, gap):
-            if spot_free(world, members, d, gap):
+        spots = _spots(world, OPPOSITE[side], lo, hi, gap)
+        if side in ("left", "right") and spots:  # just past the edge, then above a pile there, then further out
+            spots = spots[:1] + _lifted(world, OPPOSITE[side], spots, lo, hi, gap) + spots[1:]
+        waiting[key] = RETRY_FRAMES  # cleared below when a spot is found
+        for d in spots:
+            if spot_free(world, members, d, gap, (box_lo, box_hi)):
                 world.P[:, idx] += d[:, None]
                 world.PREV[:, idx] += d[:, None]
+                box_lo[:, members] += d[:, None]
+                box_hi[:, members] += d[:, None]
+                del waiting[key]
                 wraps.extend((world.bodies[k], (float(d[0]), float(d[1]))) for k in members)
                 break
         # every spot taken: leave the group where it is and try again next frame
