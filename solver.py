@@ -405,8 +405,9 @@ class World:
     def _ccd_pairs(self, D, cells=None):
         """(point, edge) pairs whose swept boxes (start -> start + D) share a grid cell. `cells`: _ccd_cells(D)."""
         cells = self._ccd_cells(D) if cells is None else cells
-        if self.backend is not None:
-            return self.backend.ccd_pairs(cells)
+        pairs = None if self.backend is None else self.backend.ccd_pairs(cells)  # None: use the CPU code below
+        if pairs is not None:
+            return pairs
         return self._filter_pairs(*self._cell_pairs(*cells), contact=False)
 
     def _ccd_new_pairs(self, old_cells, cells):

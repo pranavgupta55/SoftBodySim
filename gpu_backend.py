@@ -4,7 +4,7 @@ Metal GPUs have no float64, so the work is split by what float32 / int32 can do 
 no-intersection guarantee:
 
 GPU:
-- Broad phases (contact candidates and CCD pairs). Cell ranges are still computed on the CPU in float64 (O(points),
+- Broad phases: contact candidates always, CCD pairs only with GpuBackend.gpu_ccd_broadphase. Cell ranges are still computed on the CPU in float64 (O(points),
   the same floor() as World._candidates / World._ccd_cells), so the GPU only does integer work: a hash grid over
   point cells (count, prefix sum, scatter) and one thread per edge that walks its cells and emits the (point, edge)
   pairs whose cell ranges overlap, with World._filter_pairs' body rules. The pair set is exactly the CPU one.
@@ -17,7 +17,7 @@ Gauss-Seidel impulses and rigid impact zones. The guarantee rests on those plus 
 pair, which holds because the GPU pair set equals the CPU one.
 
 Scenes with ropes, or with bodies that override predict / solve_constraints, run their PBD part on the CPU
-(pbd_substep returns False); their CCD broad phase still runs here.
+(pbd_substep returns False).
 
 GPU time goes to world.profiler as gpu-tagged sections that end in a device sync (see profiler.py).
 """
@@ -296,6 +296,10 @@ class GpuTopology:
 class GpuBackend:
     """Hooks called by World when EnvConfig.backend == "gpu": pbd_substep(h) and ccd_pairs(cells)."""
 
+    # The CCD broad phase on the GPU gives the same pairs, but measured slower than World's vectorized CPU version
+    # at every size tried (one extra device sync per call, plus pair download and sort), so it's off by default.
+    gpu_ccd_broadphase = False
+
     def __init__(self, world):
         self.world = world
         self.gtopo = None  # built on first use (World rebuilds the backend whenever a body is added)
@@ -336,11 +340,12 @@ class GpuBackend:
 
     # ---------------- CCD broad phase
     def ccd_pairs(self, cells):
-        """World._ccd_pairs: same pairs, same (point, edge) order. cells = World._ccd_cells(D) (float64 floors)."""
+        """World._ccd_pairs: same pairs, same (point, edge) order. cells = World._ccd_cells(D) (float64 floors).
+        None when gpu_ccd_broadphase is off (World then uses its CPU code)."""
         w = self.world
         n_edges = w.edges.shape[1]
-        if n_edges == 0:
-            return np.empty(0, dtype=int), np.empty(0, dtype=int)
+        if not self.gpu_ccd_broadphase or n_edges == 0:
+            return None
         plo, phi, elo, ehi = cells
         with self._gpu_section("gpu pairs"):
             while True:
