@@ -2,11 +2,13 @@
 
 Importing this module has no side effects beyond defining things (no display, no game loop).
 """
+import math
+
 import numpy as np
 
 from entities import RigidBody, SoftBody, FixedBody, Rope, rect_points, polygon_points
+from looping import add_world_box
 from solver import World
-from presets_basic import PRESETS as BASIC_PRESETS
 
 
 class Endesga:
@@ -80,23 +82,11 @@ class ViewConfig:
 INSET = 5  # the world box walls sit this many world units in from each edge
 
 
-def add_world_box(world, width, height, inset, col=Endesga.greyD):
-    """STAND-IN for looping.add_world_box (same signature, minus ext): world.bounds and four 2-point fixed walls
-    `inset` in from each edge, kept in world.walls; sides already looping get no wall."""
-    world.bounds = (0.0, 0.0, float(width), float(height))
-    corners = [(inset, inset), (width - inset, inset), (width - inset, height - inset), (inset, height - inset)]
-    for side, k in zip(("top", "right", "bottom", "left"), range(4)):
-        wall = FixedBody(np.array([corners[k], corners[(k + 1) % 4]]).T, point_col=col, stick_col=col,
-                         point_radius=1, stick_width=2, fill_col=col)
-        world.walls[side] = wall
-        if not world.looping[side]:
-            world.add(wall)
-
-
 def build_scene(world_width, world_height, inset=INSET):
     """Test scene: world box, ground platform, rigid square, soft pentagon and dodecagons, ropes and a hollow box."""
     world_center = [world_width / 2, world_height / 2]
     world = World()
+    # World box: four tagged 2-point fixed walls (segments) sitting 5px in from each screen edge (looping.add_world_box)
     add_world_box(world, world_width, world_height, inset, col=Endesga.greyD)
     ground_top = world_height - 40
     ground_thickness = 6
@@ -138,6 +128,52 @@ def build_scene(world_width, world_height, inset=INSET):
     return world
 
 
-# name -> builder(world_width, world_height) -> World; "default" is the demo scene above
-PRESETS = {"default": build_scene}
-PRESETS.update(BASIC_PRESETS)
+# ENDESGA 32 (https://lospec.com/palette-list/endesga-32), for random body colors
+ENDESGA_32 = [Endesga.rust_red, Endesga.burnt_orange, Endesga.sand, Endesga.tan, Endesga.clay, Endesga.brown,
+              Endesga.dark_brown, Endesga.crimson, Endesga.red, Endesga.orange, Endesga.amber, Endesga.yellow,
+              Endesga.grass_green, Endesga.green, Endesga.forest_green, Endesga.deep_teal, Endesga.navy_blue,
+              Endesga.sky_blue, Endesga.cyan, Endesga.white, Endesga.pale_steel, Endesga.steel_grey, Endesga.slate,
+              Endesga.dark_slate, Endesga.midnight_blue, Endesga.near_black, Endesga.neon_red, Endesga.plum,
+              Endesga.orchid, Endesga.salmon, Endesga.peach, Endesga.caramel]
+# ...minus the darkest few, which vanish against the background (Endesga.my_blue)
+BRIGHT_ENDESGA_32 = [c for c in ENDESGA_32 if sum(c) > 230]
+
+DIAMONDS_HEXAGONS = 140  # falling hexagons in the "diamonds" preset
+
+
+def build_diamonds_scene(world_width, world_height, seed=7, fraction=0.10, hexagons=DIAMONDS_HEXAGONS, inset=INSET):
+    """"diamonds" preset: a seeded random `fraction` of the rhombi of a tumbling-blocks image (maps/diamonds.json,
+    fitted to cover the world) as fixed diamonds in the image's colors, and `hexagons` soft hexagons of random sizes
+    (8-20) and ENDESGA 32 colors that fall through them. Looping is on: there is no floor or ceiling, so what falls
+    off the bottom comes back in at the top, same x and velocity (looping.py). The side walls run a world size past
+    the screen at both ends, so bodies passing through the off-screen bands above and below stay between them."""
+    from diamonds_map import fit_to_world, load_tiling, pick_diamonds, place_hexagons
+
+    world = World()
+    add_world_box(world, world_width, world_height, inset, col=Endesga.greyD)
+    world.set_looping("top", True)  # no ceiling: what loops off the bottom comes in from above the screen
+    world.set_looping("bottom", True)  # no floor
+    diamonds = pick_diamonds(fit_to_world(load_tiling(), world_width, world_height), world_width, world_height,
+                             seed=seed, fraction=fraction, side=inset)
+    for corners, col in diamonds:
+        world.add(FixedBody(corners, point_col=col, stick_col=col, point_radius=2, fill_col=col))
+    rng = np.random.default_rng(seed + 2)
+    for cx, cy, r, angle in place_hexagons([c for c, _ in diamonds], world_width, world_height, hexagons, seed=seed,
+                                           side=inset):
+        col = BRIGHT_ENDESGA_32[int(rng.integers(len(BRIGHT_ENDESGA_32)))]
+        world.add(SoftBody(polygon_points(cx, cy, r, 6, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
+                           point_col=col, stick_col=Endesga.very_light_blue, point_radius=2, fill_col=col))
+    return world
+
+
+# Preset scenes by name: builder(world_width, world_height) -> World. main_opengl.py --scene NAME picks one.
+# Imported last: preset modules import from here.
+from presets_cradle import build_newtons_cradle  # noqa: E402
+from presets_basic import PRESETS as BASIC_PRESETS  # noqa: E402
+
+PRESETS = {
+    "default": build_scene,
+    "diamonds": build_diamonds_scene,
+    "newtons cradle": build_newtons_cradle,
+}
+PRESETS.update(BASIC_PRESETS)  # blank, random walls, looping (presets_basic.py)

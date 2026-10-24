@@ -13,7 +13,7 @@ class EnvConfig:
     contact_radius = 3.0  # px; a point collides with an edge when closer than this
     friction = 0.5  # 0 = ice, 1 = sticky
     damping = 0.2  # fraction of velocity lost per second
-    # px/s; no point moves faster than this (None = no limit; a World's terminal_velocity overrides it).
+    # px/s; no point moves faster than this (None = no limit; per world via World.env).
     # A fall down a whole 982-unit-tall world peaks near 850 px/s, so only longer falls (looping worlds) reach it.
     terminal_velocity = 1000.0
     cell_size = 24.0  # px; spatial hash grid cell size, keep >= longest edge you care about
@@ -46,6 +46,10 @@ class Body:
     """A closed polygon of points. Collision outline is the loop 0 -> 1 -> ... -> n-1 -> 0."""
     fixed = False
     self_collide = False  # whether a point can hit this body's own non-neighboring edges
+    # Opt-in bounce between two bodies that both have restitution > 0 (World._bounce): 0 = the usual inelastic
+    # contacts, 1 = perfectly elastic. Treats the bodies as balls (impulses through the centres, no spin), e.g. the
+    # Newton's cradle. Set it before World.add.
+    restitution = 0.0
 
     def __init__(self, points=None, vels=None, mass=1.0, point_col=None, stick_col=None, point_radius=2, stick_width=1,
                  fill_col=None):

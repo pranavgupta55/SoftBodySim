@@ -2,7 +2,7 @@
 loops on all four sides. Each builder takes (world_width, world_height) in world units and returns a World that
 starts intersection-free (validate_layout checks it).
 
-scene imports this module, so the palette and world box helpers are imported inside the builders.
+scene imports this module, so the palette and world box helper are imported inside the builders.
 """
 import math
 
