@@ -1,9 +1,9 @@
 """Slow motion and frame stepping for main_opengl.py (keys [ / ] and N).
 
 The time scale multiplies the physics dt only; rendering, the editor and the profiler keep running at the display
-rate. To keep slow motion smooth and the physics the same, the substep length h stays what it is at 1x: a frame at
-scale s runs round(EnvConfig.substeps * s) substeps (at least 1) over s times the frame's dt, and the hitch clamp
-(EnvConfig.max_dt) scales the same way. So with the default 4 substeps per frame:
+rate. To keep slow motion smooth and the physics the same, the substep length h stays what it is at 1x: World.step(dt,
+scale) runs round(substeps * s) substeps (at least 1) over s times the frame's dt, and the hitch clamp (max_dt) scales
+the same way (substeps / max_dt are the world's own: EnvConfig or its env overrides). With the default 4 substeps:
 
     0.25x   1 substep  of 1/240 s per frame   (the 1x trajectory, a quarter as far per frame; 1/4 the physics cost)
     0.5x    2 substeps of 1/240 s per frame
@@ -47,6 +47,9 @@ class TimeControl:
         return n
 
     def step_args(self, dt):
-        """World.step arguments (dt, substeps, max_dt) for `dt` seconds of display time at the current scale."""
-        s = self.scale
-        return dt * s, max(1, round(EnvConfig.substeps * s)), EnvConfig.max_dt * s
+        """World.step arguments (dt, scale) for `dt` seconds of display time at the current scale."""
+        return dt, self.scale
+
+    def substeps(self, base=None):
+        """Substeps per frame at the current scale, for `base` substeps at 1x (default EnvConfig.substeps)."""
+        return max(1, round((EnvConfig.substeps if base is None else base) * self.scale))
