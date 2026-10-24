@@ -158,7 +158,9 @@ class WorldSession:
     def _carry_ui(self, src, dst):
         """Per-frame UI flags the main loop and the F key set on the active editor."""
         dst.show_card, dst.show_compute, dst.compute_card = src.show_card, src.show_compute, src.compute_card
-        dst.gravity_card = getattr(src, "gravity_card", None)
+        for name in ("gravity_card", "overlays", "time"):  # set by the main loop on the active editor
+            if hasattr(src, name):
+                setattr(dst, name, getattr(src, name))
         self._shared = dst
 
     def _detach(self, slot):

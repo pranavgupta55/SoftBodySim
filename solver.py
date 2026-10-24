@@ -60,6 +60,9 @@ class World:
         self.last_wraps = []  # [(body, (dx, dy))] moved by looping in the last step(), e.g. to break motion trails
         self.env = {}  # per-world EnvConfig overrides (attribute name -> value), in effect only during step()
         self.bounce_bodies = []  # indices of bodies with restitution > 0 (see _bounce)
+        # Optional debug recorder (debug_overlay.StepRecorder), set only while an overlay needs solver data. It is
+        # told about each step's CCD hits and impact zone points; None (the default) costs one attribute check
+        self.debug = None
 
     def add(self, body, index=None):
         """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
@@ -202,35 +205,57 @@ class World:
         """A profiler timing section, or a shared no-op context when no profiler is attached."""
         return _NO_SECTION if self.profiler is None else self.profiler.section(name)
 
-    def step(self, dt):
+    def step(self, dt, scale=1.0):
+        """Advance dt * scale seconds. scale is the time scale (slow motion, timectl.py): the step then runs
+        round(substeps * scale) substeps (at least 1) and clamps at max_dt * scale, so the substep length stays what
+        it is at scale 1 (substeps / max_dt from EnvConfig, or this world's env overrides)."""
         if not self.env:
-            self._step(dt)
+            self._step(dt, scale)
             return
         saved = {name: getattr(EnvConfig, name) for name in self.env}
         try:  # this world's overrides apply for the whole step (backend included), then the globals come back
             for name, value in self.env.items():
                 setattr(EnvConfig, name, value)
-            self._step(dt)
+            self._step(dt, scale)
         finally:
             for name, value in saved.items():
                 setattr(EnvConfig, name, value)
 
-    def _step(self, dt):
+    def _step(self, dt, scale=1.0):
         # before the substeps, where the state is settled and intersection-free
         self.last_wraps = looping.loop_step(self) if self.pending_walls or any(self.looping.values()) else []
-        dt = min(dt, EnvConfig.max_dt)
-        h = dt / EnvConfig.substeps
+        if scale == 1.0:
+            dt, n = min(dt, EnvConfig.max_dt), EnvConfig.substeps
+        else:
+            dt, n = min(dt, EnvConfig.max_dt) * scale, max(1, round(EnvConfig.substeps * scale))
+        h = dt / n
         sec = self._section
-        for _ in range(EnvConfig.substeps):
+        if self.debug is not None:
+            self.debug.begin_step(self)
+        for _ in range(n):
             if self.bounce_bodies:
                 self._bounce(h)
             if self.backend is None or not self.backend.pbd_substep(h):  # False: the backend can't run this scene
                 self._pbd_substep(h)
             self.V[:] = (self.P - self.PREV) / h
+            self._limit_speed()  # before CCD, which then checks the (shorter) clamped paths
             with sec("ccd"):
                 self._resolve_ccd(h)
             self.P[:] = self.PREV + self.V * h
             self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
+
+    def _limit_speed(self):
+        """Terminal velocity: scale down any point velocity faster than the limit (direction kept). It runs on V
+        before CCD, so it only shortens the straight-line paths CCD then makes collision-free; it can't cause a
+        crossing. Shared by both backends (the GPU backend only replaces the PBD part of a substep)."""
+        vmax = EnvConfig.terminal_velocity  # per world: World.env["terminal_velocity"]
+        if vmax is None:
+            return
+        V = self.V
+        speed2 = V[0] * V[0] + V[1] * V[1]
+        fast = speed2 > vmax * vmax
+        if fast.any():
+            V[:, fast] *= vmax / np.sqrt(speed2[fast])
 
     # ---------------- Opt-in restitution (Body.restitution > 0), e.g. the Newton's cradle
     def _bounce(self, h):
@@ -608,6 +633,8 @@ class World:
             pairs = self._ccd_pairs(D, cells)
         with sec("narrow+impulses"):
             hits = self._ccd_detect(D, pairs)
+        if self.debug is not None:
+            self.debug.ccd_hits(self, hits, D)
         fresh = True  # V hasn't changed since the broad phase
         for _ in range(EnvConfig.ccd_passes):
             if hits[0].size == 0:
@@ -630,6 +657,8 @@ class World:
                     hits = self._ccd_detect(D, pairs)
                 if hits[0].size == 0:
                     return
+                if self.debug is not None:
+                    self.debug.ccd_hits(self, hits, D)
             with sec("narrow+impulses"):
                 V_before = V.copy()
                 self._ccd_impulses(*hits, h)
@@ -716,6 +745,8 @@ class World:
             roots = np.array([find(x) for x in range(n_pts)])
             for root in np.unique(roots[pts]):
                 members = np.flatnonzero(roots == root)
+                if self.debug is not None:
+                    self.debug.zone_points(self, members)
                 if (W[members] == 0).any():  # touching something fixed: the zone holds still this substep
                     V[:, members] = 0.0
                     continue
@@ -729,3 +760,5 @@ class World:
             if not merged:
                 break  # collisions inside a rigid zone can only be rounding; stop everything below
         V[:, W > 0] = 0.0  # last resort: no motion this substep, i.e. the (valid) start positions
+        if self.debug is not None:
+            self.debug.zone_points(self, np.flatnonzero(W > 0))
