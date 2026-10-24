@@ -19,8 +19,8 @@ it's uploaded only when it changes.
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
 GLSL 330 shaders. Hotkeys (all listed on the sidebar's Controls card): F compute card full / summary, G grid,
-V filled/points view, T motion trails, P pause, numpad 1-9 gravity (direction = numpad layout, 5 = off/on), W worlds, ESC quit,
-1-4 debug overlays (debug_overlay.py), [ / ] physics speed 0.25x-2x and N one physics frame while paused (timectl.py).
+V filled/points view, T motion trails, SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, ESC quit,
+1-4 debug overlays (debug_overlay.py), [ / ] or the Controls card's - / + physics speed 1%-10000% and N one physics frame while paused (timectl.py).
 
 Worlds: `session` (world_selector.WorldSession) holds the Custom world and the preset worlds; `world` and `editor`
 are always its active world and that world's editor (rebound whenever the selector switches or resets a world, and
