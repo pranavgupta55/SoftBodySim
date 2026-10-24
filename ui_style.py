@@ -17,6 +17,8 @@ ACCENT = (255, 96, 141)  # debug_red
 BUTTON = (66, 76, 110)  # grey_blue
 BUTTON_HOVER = (70, 74, 124)  # sebastian_lague_purple
 BUTTON_SELECTED = (137, 133, 181)  # sebastian_lague_light_purple
+BUTTON_DISABLED = (50, 50, 50)  # greyVD
+WHITE = (255, 255, 255)
 
 # layout: cards stack down the top-right corner
 CARD_MARGIN = 4  # px from the surface edges
@@ -44,10 +46,27 @@ def draw_frame(surface, rect, fill=CARD_BG):
     pygame.draw.rect(surface, BLACK, rect, BORDER)
 
 
-def text(surface, string, pos, color=TEXT, style="regular", size=TEXT_SIZE, align="left"):
-    """Non-antialiased text; align is "left", "center" or "right" relative to pos[0]. Returns the text rect."""
+def text(surface, string, pos, color=TEXT, style="regular", size=TEXT_SIZE, align="left", valign="top"):
+    """Non-antialiased text; align is "left", "center" or "right" relative to pos[0], valign "top" or "middle"
+    relative to pos[1]. Returns the text rect."""
     img = font(style, size).render(string, False, color)
     r = img.get_rect()
-    setattr(r, {"left": "topleft", "center": "midtop", "right": "topright"}[align], pos)
+    key = {"left": "topleft", "center": "midtop", "right": "topright"}[align]
+    if valign == "middle":
+        key = {"topleft": "midleft", "midtop": "center", "topright": "midright"}[key]
+    setattr(r, key, pos)
     surface.blit(img, r)
     return r
+
+
+def button_fill(hovered=False, selected=False, disabled=False):
+    return BUTTON_DISABLED if disabled else BUTTON_SELECTED if selected else BUTTON_HOVER if hovered else BUTTON
+
+
+def draw_button(surface, rect, label=None, hovered=False, selected=False, disabled=False, size=TEXT_SIZE):
+    """A framed button: Endesga fill, black border, a 1px light inner outline on hover, centered bold label."""
+    draw_frame(surface, rect, button_fill(hovered, selected, disabled))
+    if hovered and not disabled:
+        pygame.draw.rect(surface, TEXT, rect.inflate(-2 * BORDER, -2 * BORDER), 1)
+    if label:
+        text(surface, label, rect.center, TEXT_DIM if disabled else WHITE, "bold", size, "center", "middle")

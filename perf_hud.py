@@ -19,7 +19,7 @@ import ui_style as ui
 SEGMENTS = (
     ("physics", "phys", (237, 171, 80)),  # cream
     ("draw", "draw", (191, 111, 74)),  # light_brown
-    ("other", "other", (127, 36, 51)),  # lighter_maroon_red
+    ("other", "other", (255, 96, 141)),  # debug_red: bright, since this segment is usually thin
     ("gpu", "GPU", (99, 199, 77)),  # green
     ("idle", "idle", (66, 76, 110)),  # grey_blue: muted, but distinct from the graph background
 )
