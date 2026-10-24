@@ -5,6 +5,7 @@ import numpy as np
 import pygame
 
 from entities import Body, EnvConfig, RigidBody, SoftBody
+import looping
 
 _NO_SECTION = nullcontext()  # stands in for profiler sections when no profiler is attached
 
@@ -18,6 +19,16 @@ def _make_backend(world):
         from gpu_backend import GpuBackend
         return GpuBackend(world)
     raise ValueError(f"unknown EnvConfig.backend {EnvConfig.backend!r}, expected 'cpu' or 'gpu'")
+
+
+def _outline_gap(a, b):
+    """Smallest distance from a point of body a to an edge of body b (World._bounce)."""
+    p, q0, q1 = a.points, b.points[:, b.edges[0]], b.points[:, b.edges[1]]
+    e = q1 - q0  # (2, m)
+    d = p[:, :, None] - q0[:, None, :]  # (2, n, m)
+    t = np.clip(np.sum(d * e[:, None, :], axis=0) / np.maximum(np.sum(e * e, axis=0), 1e-12), 0.0, 1.0)
+    off = d - t * e[:, None, :]
+    return float(np.sqrt(np.min(off[0] ** 2 + off[1] ** 2)))
 
 
 class World:
@@ -39,6 +50,16 @@ class World:
         self.zone_count = 0  # how many substeps needed the rigid impact zone fallback (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
         self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend)
+        # Looping (looping.py): a body that fully leaves `bounds` through a looping side re-enters through the opposite
+        # one, same other coordinate and velocities. Done between frames, never inside a substep's CCD-checked motion.
+        # Change it with set_looping, which also removes / re-adds that side's wall.
+        self.looping = {side: False for side in looping.SIDES}
+        self.bounds = None  # (x0, y0, x1, y1) world rectangle bodies wrap around; set by looping.add_world_box
+        self.walls = {}  # side -> its world box wall (a FixedBody), whether or not it's in bodies right now
+        self.pending_walls = set()  # sides whose looping was turned off, waiting for room to re-add the wall
+        self.last_wraps = []  # [(body, (dx, dy))] moved by looping in the last step(), e.g. to break motion trails
+        self.env = {}  # per-world EnvConfig overrides (attribute name -> value), in effect only during step()
+        self.bounce_bodies = []  # indices of bodies with restitution > 0 (see _bounce)
 
     def add(self, body, index=None):
         """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
@@ -49,6 +70,11 @@ class World:
             self.bodies.insert(index, body)
             self.grabbed = None
         self._rebuild()
+
+    def set_looping(self, side, on):
+        """Looping for one side ("left", "right", "top", "bottom"): on removes that side's wall now; off re-adds it
+        once nothing is beyond its line (pending until then). True if done now. See looping.py."""
+        return looping.set_looping(self, side, on)
 
     def add_rope(self, rope):
         self.ropes.append(rope)
@@ -85,6 +111,7 @@ class World:
         self.point_local = np.arange(self.P.shape[1]) - offsets[self.point_body]
         self.point_ring = self.body_counts[self.point_body]
         self.edge_local = self.edges - offsets[self.edge_body]
+        self.bounce_bodies = [k for k, b in enumerate(bodies) if b.restitution > 0 and (b.inv_mass > 0).all()]
         self._pack_constraints()
         self.backend = _make_backend(self)
 
@@ -176,10 +203,27 @@ class World:
         return _NO_SECTION if self.profiler is None else self.profiler.section(name)
 
     def step(self, dt):
+        if not self.env:
+            self._step(dt)
+            return
+        saved = {name: getattr(EnvConfig, name) for name in self.env}
+        try:  # this world's overrides apply for the whole step (backend included), then the globals come back
+            for name, value in self.env.items():
+                setattr(EnvConfig, name, value)
+            self._step(dt)
+        finally:
+            for name, value in saved.items():
+                setattr(EnvConfig, name, value)
+
+    def _step(self, dt):
+        # before the substeps, where the state is settled and intersection-free
+        self.last_wraps = looping.loop_step(self) if self.pending_walls or any(self.looping.values()) else []
         dt = min(dt, EnvConfig.max_dt)
         h = dt / EnvConfig.substeps
         sec = self._section
         for _ in range(EnvConfig.substeps):
+            if self.bounce_bodies:
+                self._bounce(h)
             if self.backend is None or not self.backend.pbd_substep(h):  # False: the backend can't run this scene
                 self._pbd_substep(h)
             self.V[:] = (self.P - self.PREV) / h
@@ -187,6 +231,59 @@ class World:
                 self._resolve_ccd(h)
             self.P[:] = self.PREV + self.V * h
             self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
+
+    # ---------------- Opt-in restitution (Body.restitution > 0), e.g. the Newton's cradle
+    def _bounce(self, h):
+        """Elastic velocity pass between bodies that both have restitution > 0, at the start of a substep.
+
+        PBD contacts and CCD impulses are inelastic, and between touching bodies the Jacobi contacts spread a hit
+        over the whole row. So before the substep's PBD, pairs that are touching, or would get within
+        contact_radius during this substep at their current closing speed, swap momentum like balls: an impulse
+        along the line between the centres of mass with restitution min(e_a, e_b), applied as one velocity change to
+        every point of the body (no spin). Gauss-Seidel sweeps until no such pair is closing, so a hit travels down
+        a row of touching balls within one substep. Only velocities change here; the substep's PBD and CCD still
+        move the positions, so the no-intersection guarantee is untouched.
+        """
+        r = EnvConfig.contact_radius
+        bodies = [b for b in (self.bodies[k] for k in self.bounce_bodies) if (b.inv_mass > 0).all()]
+        if len(bodies) < 2:
+            return
+        mass = [float(np.sum(1.0 / b.inv_mass)) for b in bodies]
+        com = [(b.points / b.inv_mass).sum(axis=1) / m for b, m in zip(bodies, mass)]
+        vel = [(b.vels / b.inv_mass).sum(axis=1) / m for b, m in zip(bodies, mass)]
+        reach = [float(np.hypot(*(b.points - c[:, None])).max()) for b, c in zip(bodies, com)]
+        # pairs that could touch this substep, allowing the impulses below to speed bodies up to 2x the fastest
+        # (equal masses never pass it). A pair missed here still gets the usual inelastic contacts, never a crossing
+        far = 1.1 * r + 4.0 * h * max(float(np.hypot(*v)) for v in vel)
+        pairs = []
+        for i in range(len(bodies)):
+            for j in range(i + 1, len(bodies)):
+                d = com[j] - com[i]
+                dist = float(np.hypot(*d))
+                if dist < 1e-9 or dist > reach[i] + reach[j] + far:
+                    continue  # bounding circles too far apart to touch this substep
+                gap = min(_outline_gap(bodies[i], bodies[j]), _outline_gap(bodies[j], bodies[i]))
+                if gap < far:
+                    e = min(bodies[i].restitution, bodies[j].restitution)
+                    pairs.append((i, j, d / dist, gap, e, 1.0 / mass[i] + 1.0 / mass[j]))
+        if not pairs:
+            return
+        before = [v.copy() for v in vel]
+        for _ in range(4 * len(pairs) + 4):
+            hit = False
+            for i, j, n, gap, e, w in pairs:
+                closing = float(n @ (vel[i] - vel[j]))
+                # touching now, or closing in to within contact_radius during this substep at the current speeds
+                if closing > 1e-9 and gap - h * closing < 1.1 * r:
+                    jn = (1.0 + e) * closing / w * n
+                    vel[i] = vel[i] - jn / mass[i]
+                    vel[j] = vel[j] + jn / mass[j]
+                    hit = True
+            if not hit:
+                break
+        for b, v0, v in zip(bodies, before, vel):
+            if (v != v0).any():
+                b.vels += (v - v0)[:, None]  # in place: a view of self.V
 
     def _pbd_substep(self, h):
         """Predict, drag, then iterations of body constraints, ropes and soft contacts (moves P, from PREV)."""

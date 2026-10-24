@@ -12,6 +12,8 @@ it's uploaded only when it changes.
 
     python3 main_opengl.py                      fullscreen, GPU compositing
     python3 main_opengl.py --window 1280x800    windowed
+    python3 main_opengl.py --scene diamonds     a preset scene (scene.PRESETS; default "default"),
+    python3 main_opengl.py --scene "newtons cradle"    e.g. this one (quote names with spaces)
     python3 main_opengl.py --basic              the Framework pipeline as-is: layers composited on the CPU into one
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
 
@@ -35,7 +37,7 @@ from collections import namedtuple
 import moderngl
 import pygame
 
-from scene import Endesga, ViewConfig, INSET, build_scene
+from scene import Endesga, ViewConfig, INSET, PRESETS
 from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
 from perf_hud import PerfHUD
@@ -259,6 +261,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--window", help="windowed mode at WxH screen px instead of fullscreen, e.g. 1280x800")
     parser.add_argument("--basic", action="store_true", help="the Framework pipeline: CPU composite, one texture")
+    parser.add_argument("--scene", default="default", choices=sorted(PRESETS), help="preset scene to start with")
     args = parser.parse_args(argv)
 
     pygame.init()
@@ -293,7 +296,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     # surfaces (UI px) / the zoom. Every scene builder takes world_width / world_height, so all get the smaller world.
     world_px = (hud.rect.x // scaleDownFactor, screen_height)  # the world area, render-surface px
     world_width, world_height = world_px[0] / ViewConfig.zoom, world_px[1] / ViewConfig.zoom
-    world = build_scene(world_width, world_height)
+    world = PRESETS[args.scene](world_width, world_height)
     editor = Editor(world, Endesga, (screen_width, screen_height), (world_width, world_height), scaleDownFactor, INSET,
                     ViewConfig.zoom, view=ViewConfig, screen_size=display.window_size, sidebar=hud.rect)
     world_view = screen2.subsurface((0, 0) + world_px)  # the grid, trails and bodies are drawn in the world area only
