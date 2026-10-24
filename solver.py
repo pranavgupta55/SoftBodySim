@@ -22,6 +22,7 @@ class World:
     def __init__(self):
         self.bodies = []
         self.ropes = []  # tension-only constraints between body points / world anchors; not collidable
+        self.hooks = []  # entities.Hook: fixed points for ropes; drawn only, never stepped or collided
         self.grabbed = None  # global index of the point being dragged
         self.grab_target = np.zeros(2)
         self.zone_count = 0  # how many substeps needed the rigid impact zone fallback (for debugging)
@@ -33,6 +34,9 @@ class World:
 
     def add_rope(self, rope):
         self.ropes.append(rope)
+
+    def add_hook(self, hook):
+        self.hooks.append(hook)
 
     def _rebuild(self):
         """Pack every body into shared arrays; bodies keep views into them so they edit in place."""
@@ -120,6 +124,8 @@ class World:
                 b.draw(surface, zoom)
         for r in self.ropes:
             r.draw(surface, zoom)
+        for hk in self.hooks:  # over the ropes, so a rope ends inside its hook
+            hk.draw(surface, zoom, filled)
         if self.grabbed is not None:
             pygame.draw.line(surface, (255, 255, 255), self.P[:, self.grabbed] * zoom, self.grab_target * zoom, 1)
 

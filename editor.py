@@ -12,13 +12,15 @@ import numpy as np
 import pygame
 
 import ui_style as ui
-from entities import EnvConfig, FixedBody, RigidBody, Rope, SoftBody, polygon_points
+from entities import EnvConfig, FixedBody, Hook, RigidBody, Rope, SoftBody, polygon_points
 
-KIND_TITLES = {"soft": "Soft body", "rigid": "Rigid body", "fixed": "Fixed body", "rope": "Rope"}
+KIND_TITLES = {"soft": "Soft body", "rigid": "Rigid body", "fixed": "Fixed body", "rope": "Rope", "hook": "Hook"}
 POINT_COUNTS = {"soft": (3, 4, 5, 6, 7, 8, 12, 20), "rigid": (3, 4, 5, 6, 7, 8, 12, 20), "fixed": (2, 3, 4, 6, 8, 12)}
 STRENGTH_RANGE = (0.1, 1.0)  # soft body spring strength and rope stiffness
 ROPE_WIDTHS = (1, 2)
-SNAP_UI_PX = 5  # a rope end clicked this close (UI px) to a body point attaches to it
+SNAP_UI_PX = 5  # a rope end clicked this close (UI px) to a body point or hook attaches to it
+PEG_COL = (255, 255, 255)  # peg grid overlay shown while placing a hook (one pixel per peg, drawn over the scene)
+PEG_ALPHA = 100
 MESSAGE_SECONDS = 1.6
 BAD_SPOT = "you cannot spawn a point there"
 INCOMPLETE = "complete the new object to resume the sim"
@@ -86,6 +88,14 @@ def skip_springs(n, sets):
     return sorted(pairs)
 
 
+def peg_positions(lo, hi, spacing):
+    """Peg coordinates along one axis: the multiples of spacing (aligned to the world origin) strictly between lo
+    and hi, so pegs sit inside the world box and never on its walls."""
+    first = math.floor(lo / spacing + 1e-9) + 1
+    last = math.ceil(hi / spacing - 1e-9) - 1
+    return np.arange(first, last + 1) * float(spacing)
+
+
 class Editor:
     def __init__(self, world, palette, ui_size, world_size, scale, inset, zoom=1.0, view=None):
         """ui_size: the UI surface size (real screen / scale); scale: real screen px per UI px; zoom: UI px per world
@@ -97,7 +107,8 @@ class Editor:
         self.settings = {"soft": {"n": 6, "sets": 1, "strength": 0.1, "color": "network_green"},  # the hexagon
                          "rigid": {"n": 4, "color": "debug_red"},  # the square
                          "fixed": {"n": 4, "color": "grey"},
-                         "rope": {"n": 2, "stiffness": 1.0, "width": 1, "color": "light_brown"}}  # like the demo ropes
+                         "rope": {"n": 2, "stiffness": 1.0, "width": 1, "color": "light_brown"},  # like the demo ropes
+                         "hook": {"n": 1, "color": "greyL"}}  # one hook per Finish, like the other kinds
         self.paused = False
         self.active = False  # editor mode
         self.stage = None  # "menu" -> "config" -> "place"
@@ -113,6 +124,7 @@ class Editor:
         self.show_card = True  # the main loop mirrors its HUD toggle (SPACE) here: a hidden card takes no clicks
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
+        self._peg_layer, self._peg_key = None, None  # cached peg grid overlay and what it was built for
 
     # ---------------- Small utilities
     def _color(self, name):
@@ -180,6 +192,11 @@ class Editor:
             self._say(INCOMPLETE)
             return
         cfg, col = self._cfg(), self._color(self._cfg()["color"])
+        if self.kind == "hook":
+            self.world.add_hook(Hook(self.points[0], col=col))
+            self.close()
+            self.paused = False
+            return
         if self.kind == "rope":  # rest length = the ends' current distance, so it starts exactly taut
             ends = [snap if snap is not None else tuple(p) for p, snap in zip(self.points, self.snaps)]
             self.world.add_rope(Rope(ends[0], ends[1], stiffness=cfg["stiffness"], col=col, width=cfg["width"]))
@@ -288,24 +305,92 @@ class Editor:
                 return False
         if len(pts) == 2:
             (a, b), (sa, sb) = pts, snaps
-            if (sa is not None and sb is not None and sa[0] is sb[0] and sa[1] == sb[1]) or np.hypot(*(np.asarray(a) - b)) < 1.0:
+            if (sa is not None and sb is not None and self._same_snap(sa, sb)) or np.hypot(*(np.asarray(a) - b)) < 1.0:
                 return False
         return True
 
+    @staticmethod
+    def _same_snap(sa, sb):
+        if isinstance(sa, Hook) or isinstance(sb, Hook):
+            return sa is sb
+        return sa[0] is sb[0] and sa[1] == sb[1]
+
+    @staticmethod
+    def _snap_pos(snap):
+        """World position of a rope snap: a Hook or a (body, point_index)."""
+        return snap.pos.copy() if isinstance(snap, Hook) else np.array(snap[0].points[:, snap[1]], dtype=float)
+
     def _snap_target(self, wp):
-        """(body, point_index) of the nearest body point within SNAP_UI_PX of wp, or None."""
+        """The nearest hook or (body, point_index) body point within SNAP_UI_PX of wp, or None."""
         best, best_d = None, SNAP_UI_PX / self.zoom
         for body in self.world.bodies:
             d = np.hypot(*(body.points - np.reshape(wp, (2, 1))))
             i = int(np.argmin(d))
             if d[i] <= best_d:
                 best, best_d = (body, i), d[i]
+        for hook in self.world.hooks:
+            d = np.hypot(*(hook.pos - np.asarray(wp, dtype=float)))
+            if d <= best_d:
+                best, best_d = hook, d
         return best
 
     def _rope_end(self, wp):
-        """Where a rope end at wp goes: (position, snap) — onto a body point if one is close, else a free anchor."""
+        """Where a rope end at wp goes: (position, snap) — onto a body point or hook if one is close, else a free anchor."""
         snap = self._snap_target(wp)
-        return (np.array(snap[0].points[:, snap[1]], dtype=float), snap) if snap else (np.asarray(wp, dtype=float), None)
+        return (self._snap_pos(snap), snap) if snap is not None else (np.asarray(wp, dtype=float), None)
+
+    # ---------------- Hooks and the peg grid (world units)
+    def _pegs(self):
+        """Peg x and y coordinates: EnvConfig.peg_spacing apart, aligned to the world origin, inside the world box."""
+        s = EnvConfig.peg_spacing
+        return (peg_positions(self.inset, self.world_w - self.inset, s),
+                peg_positions(self.inset, self.world_h - self.inset, s))
+
+    def _in_box(self, p):
+        return self.inset < p[0] < self.world_w - self.inset and self.inset < p[1] < self.world_h - self.inset
+
+    def _hook_spot(self, wp):
+        """The peg a hook clicked at wp snaps to (the nearest one inside the world box), or None outside the box."""
+        xs, ys = self._pegs()
+        if not self._in_box(wp) or not (xs.size and ys.size):
+            return None
+        s = EnvConfig.peg_spacing
+        ix = int(np.clip(round((wp[0] - xs[0]) / s), 0, xs.size - 1))
+        iy = int(np.clip(round((wp[1] - ys[0]) / s), 0, ys.size - 1))
+        return np.array([xs[ix], ys[iy]])
+
+    def _valid_hook(self, p):
+        """Inside the world box and not on a peg that already has a hook. Hooks don't collide: bodies are fine."""
+        half = EnvConfig.peg_spacing / 2
+        return self._in_box(p) and not any(np.hypot(*(hook.pos - p)) < half for hook in self.world.hooks)
+
+    def _peg_px(self, p):
+        """The surface pixel a peg (or hook) at world position p lands on (the overlay uses the same rounding)."""
+        return int(math.floor(p[0] * self.zoom)), int(math.floor(p[1] * self.zoom))
+
+    def _peg_overlay(self):
+        """Translucent surface with one pixel per peg. Pre-rendered with a surfarray write and cached, so drawing it is
+        one alpha blit; rebuilt only when the surface size, zoom, peg spacing or world box changes."""
+        key = (self.W, self.H, self.zoom, EnvConfig.peg_spacing, self.inset, self.world_w, self.world_h)
+        if key != self._peg_key:
+            layer = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
+            layer.fill((*PEG_COL, 0))
+            xs, ys = self._pegs()
+            px, py = np.unique(np.floor(xs * self.zoom).astype(int)), np.unique(np.floor(ys * self.zoom).astype(int))
+            px, py = px[(px >= 0) & (px < self.W)], py[(py >= 0) & (py < self.H)]
+            alpha = pygame.surfarray.pixels_alpha(layer)  # indexed [x, y]
+            alpha[np.ix_(px, py)] = PEG_ALPHA
+            del alpha  # unlocks the surface
+            self._peg_layer, self._peg_key = layer, key
+        return self._peg_layer
+
+    def _valid_now(self):
+        """Is the object as placed so far valid?"""
+        if self.mode == "rope":
+            return self._valid_rope(self.points, self.snaps)
+        if self.mode == "hook":
+            return all(self._valid_hook(p) for p in self.points)
+        return self._valid(self.points, self._complete())
 
     def _regular_points(self, start, end):
         n = self._cfg()["n"]
@@ -343,6 +428,14 @@ class Editor:
                 self._push(("add", pos, snap))
             else:
                 self._say(BAD_SPOT)
+        elif self.mode == "hook":
+            spot = self._hook_spot(wp)
+            if spot is not None and self._valid_hook(spot):
+                self.points.append(spot)
+                self.snaps.append(None)
+                self._push(("add", spot, None))
+            else:
+                self._say(BAD_SPOT)
         elif self.mode == "custom":
             candidate = self.points + [wp]
             if self._valid(candidate, len(candidate) == self._cfg()["n"]):
@@ -356,17 +449,28 @@ class Editor:
 
     def _place_motion(self, wp):
         if self.drag_idx is not None:
-            self.points[self.drag_idx] = wp
+            if self.mode == "hook":  # a dragged hook jumps from peg to peg
+                spot = self._hook_spot(wp)
+                if spot is not None:
+                    self.points[self.drag_idx] = spot
+            else:
+                self.points[self.drag_idx] = wp
 
     def _place_up(self, wp):
         if self.drag_idx is not None:
             i, old, old_snap = self.drag_idx, self.drag_from, self.snaps[self.drag_idx]
             self.drag_idx = self.drag_from = None
-            new, snap = self._rope_end(wp) if self.mode == "rope" else (wp, None)
+            if self.mode == "rope":
+                new, snap = self._rope_end(wp)
+            elif self.mode == "hook":  # off the box there's no peg: keep wp so validation rejects it
+                spot = self._hook_spot(wp)
+                new, snap = (spot if spot is not None else np.asarray(wp, dtype=float)), None
+            else:
+                new, snap = wp, None
             self.points[i], self.snaps[i] = new, snap
-            if np.hypot(*(wp - old)) < 0.5:
+            if np.hypot(*((new if self.mode == "hook" else wp) - old)) < 0.5:  # a hook on its own peg didn't move
                 self.points[i], self.snaps[i] = old, old_snap
-            elif self._valid_rope(self.points, self.snaps) if self.mode == "rope" else self._valid(self.points, self._complete()):
+            elif self._valid_now():
                 self._push(("move", i, old, new, old_snap, snap))
             else:
                 self.points[i], self.snaps[i] = old, old_snap
@@ -422,8 +526,10 @@ class Editor:
                 ("drag", "grab bodies", None, not self.paused)]
 
     def _menu_layout(self):
-        bw, bh = 100, 104
-        panel = self._centered(len(KIND_TITLES) * (bw + PAD) + PAD, HEADER_H + bh + PAD)
+        n = len(KIND_TITLES)
+        room = self._area().w - 2 * ui.CARD_MARGIN  # narrow surfaces shrink the tiles so the row stays clear of the card
+        bw, bh = min(100, (room - (n + 1) * PAD) // n), 104
+        panel = self._centered(n * (bw + PAD) + PAD, HEADER_H + bh + PAD)
         kinds = [(pygame.Rect(panel.x + PAD + i * (bw + PAD), panel.y + HEADER_H, bw, bh), kind)
                  for i, kind in enumerate(KIND_TITLES)]
         return panel, kinds
@@ -443,6 +549,8 @@ class Editor:
             y += LABEL_H
             lay["widths"] = [(pygame.Rect(x0 + i * (30 + BTN_GAP), y, 30, BTN_H), w) for i, w in enumerate(ROPE_WIDTHS)]
             y += BTN_H + ROW_GAP
+        elif self.kind == "hook":
+            pass  # just a color: a hook is a single fixed point
         else:
             counts = POINT_COUNTS[self.kind]
             cols = 4 if len(counts) == 8 else 3
@@ -473,8 +581,8 @@ class Editor:
         y += 4 + ((len(self.colors) - 1) // per_row + 1) * (sw + BTN_GAP) - BTN_GAP + ROW_GAP + 2
 
         bw2 = (CONFIG_W - 3 * PAD) // 2
-        if self.kind == "rope":
-            lay["modes"] = [(pygame.Rect(PAD, y, CONFIG_W - 2 * PAD, MODE_H), "rope", "Place rope")]
+        if self.kind in ("rope", "hook"):
+            lay["modes"] = [(pygame.Rect(PAD, y, CONFIG_W - 2 * PAD, MODE_H), self.kind, f"Place {self.kind}")]
         else:
             lay["modes"] = [(pygame.Rect(PAD, y, bw2, MODE_H), "regular", "Regular polygon"),
                             (pygame.Rect(2 * PAD + bw2, y, bw2, MODE_H), "custom", "Draw points")]
@@ -636,6 +744,9 @@ class Editor:
         if self.mode == "rope":
             self._draw_rope_preview(surface, ghost_surface, wp, self._over_ui(mouse_ui))
             return
+        if self.mode == "hook":
+            self._draw_hook_preview(surface, ghost_surface, wp, self._over_ui(mouse_ui))
+            return
         if self._over_ui(mouse_ui) or self.drag_idx is not None or complete:
             pass  # no hover ghost while aiming at a button, dragging a point, or once the object is done
         elif self.mode == "custom":
@@ -671,7 +782,8 @@ class Editor:
             ghost = (200, 200, 200) if valid else tuple(pal.debug_red)
             pygame.draw.line(ghost_surface, ghost, tuple(pts[0] * z), tuple(pts[1] * z), max(1, self._cfg()["width"]))
         if target is not None:
-            pygame.draw.circle(surface, pal.white, tuple(target[0].points[:, target[1]] * z), 4, 1)
+            ring = target.radius + 2 if isinstance(target, Hook) else 4
+            pygame.draw.circle(surface, pal.white, tuple(self._snap_pos(target) * z), ring, 1)
         hover = self._near_point(wp)
         for i, (p, snap) in enumerate(zip(self.points, self.snaps)):
             col = pal.white if i in (hover, self.drag_idx) else pal.greyL
@@ -679,6 +791,31 @@ class Editor:
                 pygame.draw.rect(surface, col, (int(p[0] * z) - 2, int(p[1] * z) - 2, 5, 5))
             else:
                 pygame.draw.circle(surface, col, tuple(np.asarray(p) * z), 3, 1)
+
+    def _draw_hook_preview(self, surface, ghost_surface, wp, over_ui):
+        """Peg grid over the whole scene, the peg a click would use (white ring, ghost hook; red if taken), and the
+        placed hook. The overlay goes on the world surface after the bodies, so it's under the ghost layer and UI."""
+        surface.blit(self._peg_overlay(), (0, 0))
+        z, pal = self.zoom, self.palette
+        spot = None
+        if not over_ui:
+            if self.drag_idx is not None:
+                spot = self.points[self.drag_idx]  # already snapped to a peg while dragging
+            elif not self._complete() and self._near_point(wp) is None:
+                spot = self._hook_spot(wp)
+        if spot is not None:
+            c = self._peg_px(spot)
+            ghost = (200, 200, 200) if self._valid_hook(spot) else tuple(pal.debug_red)
+            pygame.draw.circle(ghost_surface, ghost, c, 4)
+            pygame.draw.circle(surface, pal.white, c, 6, 1)
+        hover = self._near_point(wp)
+        col = self._color(self._cfg()["color"])
+        for i, p in enumerate(self.points):
+            Hook(p, col=col).draw(surface, z, filled=True)
+            if i in (hover, self.drag_idx):
+                pygame.draw.circle(surface, pal.white, self._peg_px(p), 6, 1)
+        if spot is not None:
+            surface.set_at(self._peg_px(spot), pal.white)  # the target peg itself, on top
 
     # ---------------- Drawing: UI surface
     def draw_info_card(self, surface, mouse_ui):
@@ -729,8 +866,9 @@ class Editor:
         n = self._cfg()["n"]
         first = {"custom": "Click to place points in order",
                  "regular": "Press and drag to size and rotate, or click for the default size",
-                 "rope": "Click both ends: on a body point to attach, elsewhere to anchor"}[self.mode]
-        what = "an end" if self.mode == "rope" else "a placed point"
+                 "rope": "Click both ends: on a body point or hook to attach, elsewhere to anchor",
+                 "hook": "Click a peg to place the hook (it doesn't collide)"}[self.mode]
+        what = {"rope": "an end", "hook": "the hook"}.get(self.mode, "a placed point")
         return [f"{first}  ({len(self.points)}/{n})", f"drag {what} to move it  ·  Z undo  ·  X redo  ·  Esc back"]
 
     def _hint_box(self):
@@ -796,8 +934,22 @@ class Editor:
             ui.draw_frame(surface, pygame.Rect(cx - 18, cy - 18, 36, 36), pal.debug_red)
         elif kind == "fixed":
             ui.draw_frame(surface, pygame.Rect(cx - 30, cy - 5, 60, 10), pal.grey)
+        elif kind == "hook":
+            self._draw_hook_icon(surface, cx, cy - 8, pal.greyL)
         else:
             self._draw_rope_icon(surface, cx, cy, 30, pal.light_brown, 2)
+
+    def _draw_hook_icon(self, surface, cx, cy, col, step=7):
+        """A hook on a patch of the peg grid with a short rope and a weight hanging from it."""
+        for i in range(-3, 4):
+            for j in range(-2, 3):
+                surface.fill(ui.TEXT_DIM, (cx + i * step, cy + j * step, 1, 1))
+        drop = 3 * step
+        pygame.draw.line(surface, self.palette.light_brown, (cx, cy), (cx, cy + drop), 2)
+        ui.draw_frame(surface, pygame.Rect(cx - 6, cy + drop, 12, 12), self.palette.cream)
+        pygame.draw.circle(surface, ui.BLACK, (cx, cy), 6)
+        pygame.draw.circle(surface, col, (cx, cy), 4)
+        pygame.draw.circle(surface, ui.BLACK, (cx, cy), 1)
 
     @staticmethod
     def _draw_rope_icon(surface, cx, cy, half, col, width):
@@ -832,6 +984,8 @@ class Editor:
         r = min(box.w, box.h) * 0.34
         if self.kind == "rope":
             self._draw_rope_icon(surface, box.centerx, box.centery, int(r), col, cfg["width"])
+        elif self.kind == "hook":
+            self._draw_hook_icon(surface, box.centerx, box.centery - 9, col, step=6)  # icon spans cy - 12 .. cy + 30
         elif n == 2:
             a, b = (box.centerx - r, box.centery), (box.centerx + r, box.centery)
             pygame.draw.line(surface, ui.BLACK, a, b, 2 + 2 * ui.BORDER)
