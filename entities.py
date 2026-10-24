@@ -21,6 +21,7 @@ class EnvConfig:
     grab_radius = 15.0  # px; how close the cursor must be to a point to pick it up
     grab_stiffness = 0.3  # fraction of the gap to the cursor closed per substep
     grab_max_step = 4.0  # px; max pull per substep
+    peg_spacing = 5.0  # px; hooks snap to a grid of pegs this far apart, aligned to the world origin
 
 
 def rect_points(cx, cy, w, h):
@@ -180,10 +181,32 @@ class SoftBody(Body):
         self.points += acc / self.spring_count  # Jacobi: average the corrections hitting each point
 
 
+class Hook:
+    """A single fixed point (world units) for ropes to hang from. Not a body: no mass, no edges, never collides and
+    isn't packed into the World's collision arrays. Pass the Hook itself as a Rope end."""
+
+    def __init__(self, pos, col=None, radius=3):
+        self.pos = np.array(pos, dtype=float)  # shape (2,); ropes keep a reference to this array, so edit it in place
+        self.col = DEFAULT_COL if col is None else col
+        self.radius = radius  # marker radius in surface pixels
+
+    def draw(self, surface, zoom=1.0, filled=False):
+        """A ring with a hole: black-bordered disc in the filled view, a 1px ring around a dot in the points view."""
+        c = self.pos * zoom
+        r = self.radius
+        if filled:
+            pygame.draw.circle(surface, (0, 0, 0), c, r + 1)
+            pygame.draw.circle(surface, self.col, c, r - 0.5)
+            pygame.draw.circle(surface, (0, 0, 0), c, 1)
+        else:
+            pygame.draw.circle(surface, self.col, c, r, 1)
+            pygame.draw.circle(surface, self.col, c, 1)
+
+
 class Rope:
     """A tension-only spring between two ends: pulls them together when stretched past rest_length, never pushes.
 
-    Each end is either (body, point_index) to attach to a body's point, or (x, y) for a fixed world anchor.
+    Each end is either (body, point_index) to attach to a body's point, a Hook, or (x, y) for a fixed world anchor.
     It's a constraint, not a body: it has no points of its own and doesn't collide with anything.
     rest_length defaults to the starting distance between the ends. stiffness is the fraction of the stretch
     removed per solver pass (1.0 = inextensible).
@@ -198,6 +221,8 @@ class Rope:
 
     @staticmethod
     def _parse_end(end):
+        if isinstance(end, Hook):  # a fixed anchor that shares the hook's position array (inverse mass 0)
+            return None, end.pos
         if isinstance(end[0], Body):
             body, idx = end
             return body, int(idx)
