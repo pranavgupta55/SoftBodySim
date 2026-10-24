@@ -14,9 +14,9 @@ Global environment settings that a world may change (GLOBAL_ENV, e.g. EnvConfig.
 selector) are kept per world: saved when a world is left and restored when it's opened. A newly built or reset world
 starts from the launch defaults (then whatever its builder sets).
 
-Looping (World.looping / World.set_looping, a world without a side's wall wraps bodies across it) is toggled per world
-from the panel. Re-adding a wall may be deferred by the world while a body straddles that edge; the panel then shows
-the side as pending until the wall is back.
+Looping (World.looping / World.set_looping, looping.py: a side without its wall wraps bodies to the opposite side) is
+toggled per world from the panel. Re-adding a wall is deferred by the world while a body is beyond or straddles that
+edge (World.pending_walls); the panel shows such a side in pink until the wall is back.
 
 The panel is drawn on the scaled-down UI surface in the editor's pixel style (ui_style), over a dimmed scene; the sim
 keeps running behind it. Its rects are UI-surface px.
@@ -54,8 +54,13 @@ def env_snapshot():
 
 
 def env_restore(env):
+    """Put saved values back, in place where possible (other code may hold the EnvConfig arrays)."""
     for name, value in env.items():
-        setattr(EnvConfig, name, np.array(value, copy=True))
+        cur = getattr(EnvConfig, name)
+        if isinstance(cur, np.ndarray) and cur.shape == np.shape(value):
+            cur[...] = value
+        else:
+            setattr(EnvConfig, name, np.array(value, copy=True))
 
 
 def looping_of(world):
@@ -66,15 +71,9 @@ def looping_of(world):
     return {s: False for s in SIDES}
 
 
-def set_looping(world, side, on):
-    """World.set_looping(side, on); a world without that API just records the flag."""
-    fn = getattr(world, "set_looping", None)
-    if fn is not None:
-        fn(side, on)
-        return
-    if not isinstance(getattr(world, "looping", None), dict):
-        world.looping = {s: False for s in SIDES}
-    world.looping[side] = bool(on)
+def looping_pending(world, side):
+    """Is this side's wall waiting to be re-added (looping just turned off, something still beyond the edge)?"""
+    return side in getattr(world, "pending_walls", ())
 
 
 class Slot:
@@ -84,27 +83,22 @@ class Slot:
         self.name, self.builder, self.custom = name, builder, custom
         self.world = self.editor = None
         self.env = None  # GLOBAL_ENV values while the world isn't active
-        self.want = {}  # side -> looping state asked for that the world hasn't applied yet (a deferred wall)
 
     @property
     def built(self):
         return self.world is not None
 
     def pending(self, side):
-        """Is a looping change on this side still waiting (the world deferred it)?"""
-        if side not in self.want:
-            return False
-        if looping_of(self.world)[side] == self.want[side]:
-            del self.want[side]
-            return False
-        return True
+        """Is this side's wall re-add still waiting (see looping_pending)?"""
+        return self.built and looping_pending(self.world, side)
 
 
 class WorldSession:
-    def __init__(self, presets, world_size, make_editor, profiler=None, custom_builder=None):
+    def __init__(self, presets, world_size, make_editor, profiler=None, custom_builder=None, start=None):
         """presets: scene.PRESETS (name -> builder(world_width, world_height) -> World); make_editor(world) -> Editor;
         profiler: attached to the active world (world.profiler); custom_builder: what Custom starts as and resets to
-        (default: presets["default"])."""
+        (default: presets["default"]); start: a preset to open (running) at launch instead of Custom (main_opengl.py
+        --scene)."""
         self.world_size, self.make_editor, self.profiler = world_size, make_editor, profiler
         self.slots = [Slot(CUSTOM, custom_builder or presets["default"], custom=True)]
         self.slots += [Slot(name, builder) for name, builder in presets.items() if name != "default"]
@@ -113,8 +107,10 @@ class WorldSession:
         self.confirm_until = 0.0  # the Custom Reset's confirmation window
         self._shared = None  # UI preferences shared by every world's editor (see _share_ui)
         self._build(self.slots[0])
-        self.editor.paused = False  # the game starts running, as before
         self._attach(self.slots[0])
+        if start not in (None, "default"):
+            self.switch(self.index(start))
+        self.editor.paused = False  # the game starts running, as before
 
     # ---------------- The active world
     @property
@@ -145,7 +141,6 @@ class WorldSession:
         env_restore(_ENV_DEFAULTS)
         slot.world = slot.builder(*self.world_size)
         slot.env = env_snapshot()  # the builder may have changed them
-        slot.want = {}
         slot.editor = self.make_editor(slot.world)
         slot.editor.paused = True
         self._share_ui(slot.editor)
@@ -163,6 +158,7 @@ class WorldSession:
     def _carry_ui(self, src, dst):
         """Per-frame UI flags the main loop and the F key set on the active editor."""
         dst.show_card, dst.show_compute, dst.compute_card = src.show_card, src.show_compute, src.compute_card
+        dst.gravity_card = getattr(src, "gravity_card", None)
         self._shared = dst
 
     def _detach(self, slot):
@@ -215,21 +211,12 @@ class WorldSession:
             env = env_snapshot()
             self._build(slot)
             env_restore(env)  # building restored the defaults; the active world keeps its own
-        on = not self.looping_shown(slot)[side]
-        set_looping(slot.world, side, on)
-        if looping_of(slot.world)[side] != on:
-            slot.want[side] = on  # deferred by the world
-        else:
-            slot.want.pop(side, None)
+        slot.world.set_looping(side, not looping_of(slot.world)[side])  # off may stay pending (pending_walls)
 
     @staticmethod
     def looping_shown(slot):
-        """What the toggles show: the state asked for (pending sides show where they're heading)."""
-        lp = looping_of(slot.world) if slot.built else {s: False for s in SIDES}
-        for side in SIDES:
-            if slot.built and slot.pending(side):
-                lp[side] = slot.want[side]
-        return lp
+        """The toggles' states: World.looping (a pending side already reads off), all off for an unbuilt world."""
+        return looping_of(slot.world) if slot.built else {s: False for s in SIDES}
 
     def ask_reset(self, index):
         """Reset button: presets reset at once; Custom asks for a second click within CONFIRM_SECONDS."""
@@ -334,12 +321,12 @@ class WorldSession:
             elif kind == "loop":
                 _, i, side, on = spec
                 slot = self.slots[i]
-                pending = slot.built and slot.pending(side)
+                pending = slot.pending(side)
                 ui.draw_button(surface, rect, None, hovered, on and not pending, False)
                 col = ui.ACCENT if pending else ui.WHITE if on else ui.TEXT_DIM
                 ui.text(surface, SIDE_LABELS[side], rect.center, col, "bold", align="center", valign="middle")
         fy = lay["foot_y"]
-        pending = any(s.built and s.pending(side) for s in self.slots for side in SIDES)
+        pending = any(s.pending(side) for s in self.slots for side in SIDES)
         lines = ["click a world to open it (paused)  ·  W / Esc close"]
         lines.append("pink: wall returns once the edge is clear" if pending else "L R T B: loop out one side, in the other")
         for k, line in enumerate(lines):
