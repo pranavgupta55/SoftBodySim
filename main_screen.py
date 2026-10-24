@@ -66,6 +66,13 @@ click = False
 
 # ---------------- Test scene: ground platform, rigid square, soft pentagon dropped above the square
 world = World()
+# World box: four thin fixed walls whose inner faces sit 5px in from each screen edge
+inset, wall = 5, 6
+for cx, cy, w, h in ((screen_width / 2, inset - wall / 2, screen_width + 2 * wall, wall),  # top
+                     (screen_width / 2, screen_height - inset + wall / 2, screen_width + 2 * wall, wall),  # bottom
+                     (inset - wall / 2, screen_height / 2, wall, screen_height + 2 * wall),  # left
+                     (screen_width - inset + wall / 2, screen_height / 2, wall, screen_height + 2 * wall)):  # right
+    world.add(FixedBody(rect_points(cx, cy, w, h), point_col=Endesga.greyD, stick_col=Endesga.greyD, point_radius=1))
 ground_top = screen_height - 40
 ground_thickness = 6
 world.add(FixedBody(rect_points(screen_center[0], ground_top + ground_thickness / 2, screen_width * 0.5, ground_thickness),
@@ -74,8 +81,16 @@ square_half = 20
 square_y = ground_top - square_half - 40
 world.add(RigidBody(rect_points(screen_center[0], square_y, 2 * square_half, 2 * square_half),
                     point_col=Endesga.debug_red, stick_col=Endesga.greyL, point_radius=3))
-world.add(SoftBody(polygon_points(screen_center[0] + 4, square_y - square_half - 50, 18, 5),
-                   stiffness=1.0, point_col=Endesga.network_green, stick_col=Endesga.very_light_blue, point_radius=3))
+world.add(SoftBody(polygon_points(screen_center[0] + 4, square_y - square_half - 50, 20, 6),
+                   stiffness=0.1, point_col=Endesga.network_green, stick_col=Endesga.very_light_blue, point_radius=3))
+
+# Dodecagons (12 points, 2 sets of skip springs) with springs as strong as the hexagon, 25% weaker and 50% weaker
+hexagon_stiffness = 0.1
+for x_frac, y, strength, col in ((0.32, ground_top - 100, 1.0, Endesga.cream),
+                                 (0.68, ground_top - 100, 0.75, Endesga.sebastian_lague_light_purple),
+                                 (0.60, ground_top - 180, 0.5, Endesga.lighter_maroon_red)):
+    world.add(SoftBody(polygon_points(screen_width * x_frac, y, 18, 12),
+                       stiffness=hexagon_stiffness * strength, skip_sets=2, point_col=col, stick_col=Endesga.very_light_blue, point_radius=3))
 
 # ---------------- Main Game Loop
 last_time = time.time()
@@ -101,8 +116,10 @@ while running:
             running = False
         if event.type == pygame.MOUSEBUTTONDOWN:
             click = True
+            world.grab((mx, my))
         if event.type == pygame.MOUSEBUTTONUP:
             click = False
+            world.release()
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 running = False
@@ -112,6 +129,7 @@ while running:
             pass
 
     # ---------------- Updating Screen
+    world.drag_to((mx, my))
     world.step(dt / fps)  # dt is in frames here, World wants seconds
     world.draw(screen2)
 

@@ -15,6 +15,12 @@ class EnvConfig:
     damping = 0.2  # fraction of velocity lost per second
     cell_size = 24.0  # px; spatial hash grid cell size, keep >= longest edge you care about
     max_dt = 1 / 30  # clamp for frame hitches
+    ccd_passes = 8  # collision-impulse passes per substep before falling back to rigid impact zones
+    ccd_gap = 0.01  # px; minimum gap continuous collision detection keeps between a point and an edge
+    ccd_push = 0.25  # px; gap a collision impulse aims for, larger than ccd_gap so chains of contacts settle quickly
+    grab_radius = 15.0  # px; how close the cursor must be to a point to pick it up
+    grab_stiffness = 0.3  # fraction of the gap to the cursor closed per substep
+    grab_max_step = 4.0  # px; max pull per substep
 
 
 def rect_points(cx, cy, w, h):
@@ -32,6 +38,7 @@ def polygon_points(cx, cy, radius, n, angle=-math.pi / 2):
 class Body:
     """A closed polygon of points. Collision outline is the loop 0 -> 1 -> ... -> n-1 -> 0."""
     fixed = False
+    self_collide = False  # whether a point can hit this body's own non-neighboring edges
 
     def __init__(self, points=None, vels=None, mass=1.0, point_col=None, stick_col=None, point_radius=2, stick_width=1):
         # shape (2, n): row 0 = x, row 1 = y, one column per point
@@ -62,9 +69,6 @@ class Body:
 
     def solve_constraints(self):
         pass
-
-    def update_velocities(self, h):
-        self.vels[:] = (self.points - self.prev) / h * max(0.0, 1.0 - EnvConfig.damping * h)
 
     def draw(self, surface):
         if self.points.shape[1] == 0:
@@ -102,15 +106,21 @@ class RigidBody(Body):
 
 
 class SoftBody(Body):
-    """Springs (as PBD distance constraints) between neighbors and neighbors-of-neighbors."""
+    """Springs (as PBD distance constraints) around the perimeter plus `skip_sets` sets of longer-range springs.
 
-    def __init__(self, points=None, stiffness=1.0, **kwargs):
+    skip_sets=0: perimeter only. 1: also each point to its 2nd neighbor (both directions). 2: also its 3rd neighbor, etc.
+    Capped at n // 2, past which the sets would only repeat springs that already exist.
+    """
+    self_collide = True  # a dented soft body can fold over itself otherwise
+
+    def __init__(self, points=None, stiffness=1.0, skip_sets=1, **kwargs):
         super().__init__(points, **kwargs)
         self.stiffness = stiffness
         n = self.points.shape[1]
+        self.skip_sets = max(0, min(skip_sets, n // 2))
         pairs = set()
         for i in range(n):
-            for k in (1, 2):
+            for k in range(1, self.skip_sets + 2):
                 j = (i + k) % n
                 if i != j:
                     pairs.add((min(i, j), max(i, j)))  # sorted tuple so (i, j) and (j, i) are one spring
