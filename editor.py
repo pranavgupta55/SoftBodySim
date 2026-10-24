@@ -21,6 +21,7 @@ import pygame
 import ui_style as ui
 from ui_style import HUD
 from peg_layer import PegLayer
+from selection import SelectionTools
 from entities import (Chain, EnvConfig, FixedBody, Hook, RigidBody, Rope, SoftBody, chain_box_points, chain_counts,
                       chain_layout, draw_border, polygon_points)
 
@@ -167,7 +168,7 @@ def peg_positions(lo, hi, spacing):
     return np.arange(first, last + 1) * float(spacing)
 
 
-class Editor:
+class Editor(SelectionTools):
     def __init__(self, world, palette, ui_size, world_size, scale, inset, zoom=1.0, view=None, screen_size=None):
         """ui_size: the UI surface size (real screen / scale); scale: real screen px per UI px; zoom: UI px per world
         unit; view: an object with `show_grid` and `filled` (the G / V states listed on the info card); screen_size:
@@ -207,6 +208,7 @@ class Editor:
         self._dim.fill((0, 0, 0, 140))
         # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
         self.pegs = PegLayer((self.screen_w, self.screen_h), PEG_DOT)
+        self._init_selection()  # select / move / copy existing objects while paused (selection.py)
 
     # ---------------- Small utilities
     def _color(self, name):
@@ -248,8 +250,11 @@ class Editor:
             self.paused = not self.paused
             if self.paused:
                 self.world.release()
+            else:
+                self._end_edit()
 
     def open(self):
+        self._end_edit()
         self.active, self.stage = True, "menu"
 
     def close(self):
@@ -859,8 +864,8 @@ class Editor:
                 ("SPACE", "HUD", "shown", True),
                 ("Z", "undo", None, placing and bool(self.undo_stack)),
                 ("X", "redo", None, placing and bool(self.redo_stack)),
-                ("ESC", "back" if self.active else "quit", None, True),
-                ("drag", "grab bodies", None, not self.paused)]
+                ("ESC", "back" if self.active or self._esc_cancels() else "quit", None, True)] + (
+                self._edit_hotkeys() if self._editing() else [("drag", "grab bodies", None, not self.paused)])
 
     def _menu_layout(self):
         n, cols = len(KIND_TITLES), MENU_COLS
@@ -1098,6 +1103,8 @@ class Editor:
             if event.key == pygame.K_f:
                 self.toggle_compute()
                 return True
+            if self._editing():  # selection editing: Delete, Ctrl/Cmd+C / V / D, Q / E, Esc (selection.py)
+                return self._edit_key(event)
             if self.active:
                 cmd = event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)
                 if event.key == pygame.K_ESCAPE:
@@ -1132,17 +1139,23 @@ class Editor:
                 self._select(wp)
             elif self.active and self.stage == "place":
                 self._place_down(wp)
+            elif self._editing():
+                self._edit_down(wp)
             return self.paused
         if event.type == pygame.MOUSEMOTION:
             if self.slider_drag:
                 self._set_strength(pos[0])
             elif self.active and self.stage == "place":
                 self._place_motion(wp)
+            elif self._editing():
+                self._edit_motion(wp)
             return self.paused
         # MOUSEBUTTONUP
         self.slider_drag = False
         if self.active and self.stage == "place" and event.button == 1:
             self._place_up(wp)
+        elif self._editing() and event.button == 1:
+            self._edit_up(wp)
         return self.paused
 
     # ---------------- Drawing: world-space preview (scaled-down game surfaces)
@@ -1150,7 +1163,10 @@ class Editor:
         """Preview of the object being placed: grey ghost on the translucent layer, placed points on top.
         Before anything is placed the ghost follows the mouse (red where a click would be rejected). While picking
         objects (and while placing inside / around them) the picked objects are outlined, and the one under the
-        mouse too while picking."""
+        mouse too while picking. While paused with the editor closed: the selection and paste ghost (selection.py)."""
+        if self._editing():
+            self._draw_edit(surface, ghost_surface, self.to_world(mouse_ui), self._over_ui(mouse_ui))
+            return
         if not (self.active and self.stage in ("select", "place")):
             return
         wp = self.to_world(mouse_ui)
@@ -1306,7 +1322,7 @@ class Editor:
             ui.text(surface, title, (panel.centerx, panel.y + 6 + BTN_H // 2), ui.WHITE, "bold", ui.TITLE_SIZE, "center", "middle")
             if self.stage == "config":
                 self._draw_config_extras(surface, mouse_ui)
-        elif self.active and self.stage in ("select", "place"):
+        elif (self.active and self.stage in ("select", "place")) or (self._editing() and self.paste is not None):
             self._draw_hint(surface, mouse_ui)
         for area, _, spec in self._panel_widgets():
             self._draw_widget(surface, area, spec, area.collidepoint(mouse_ui))
@@ -1323,6 +1339,8 @@ class Editor:
         ui.text(surface, self.message, (cx, cy), tuple(self.palette.debug_red), "bold", size, "center", "middle")
 
     def _hint_lines(self):
+        if self._editing() and self.paste is not None:
+            return self._edit_hint_lines()
         if self.stage == "select":
             if self.relation == "inside":
                 return ["Click the object to spawn the new one inside", "Esc back"]

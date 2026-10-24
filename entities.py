@@ -1,9 +1,16 @@
+import itertools
 import math
 
 import numpy as np
 import pygame
 
 DEFAULT_COL = (127, 127, 127)
+_CHAIN_IDS = itertools.count(1)
+
+
+def new_chain_id():
+    """A fresh id for Chain.chain_id (copies of a chain get a new one, so they are a chain of their own)."""
+    return next(_CHAIN_IDS)
 
 
 class EnvConfig:
@@ -314,6 +321,10 @@ class Chain:
                 ra = (pieces[k - 1], 3) if k > 0 else end_a
                 rb = (pieces[k + 1], 0) if k + 1 < segments else end_b
                 self.ropes.append(Rope(ra, rb, stiffness=stiffness, col=rope_col, width=rope_width))
+        # every piece carries the chain's id, so the editor can select, move, copy and delete the chain as one object
+        self.chain_id = new_chain_id()
+        for piece in self.bodies + self.ropes:
+            piece.chain_id = self.chain_id
 
 
 def _chain_is_box(k, start):

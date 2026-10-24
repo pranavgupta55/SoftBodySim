@@ -62,6 +62,50 @@ class World:
         self._rebuild()
         self.ropes.extend(chain.ropes)
 
+    # ---------------- Editing (the editor's select / delete / paste, while paused; separate from step)
+    def add_many(self, bodies=(), ropes=(), hooks=()):
+        """Add bodies (at the end, in order), ropes and hooks with one repack."""
+        self.bodies.extend(bodies)
+        self.ropes.extend(ropes)
+        self.hooks.extend(hooks)
+        if bodies:
+            self._rebuild()
+
+    def remove(self, bodies=(), ropes=(), hooks=()):
+        """Remove bodies, ropes and hooks (by identity); ropes attached to a removed body or hook go too. One repack.
+        Removed bodies get their own copies of their arrays, so they stay valid objects (e.g. to add back later).
+        At least one body must remain (the packed arrays can't be empty)."""
+        gone_b, gone_h, gone_r = {id(b) for b in bodies}, {id(h.pos) for h in hooks}, {id(r) for r in ropes}
+
+        def attached(rope):  # an end on a removed body, or sharing a removed hook's position array
+            return any(id(body) in gone_b if body is not None else id(ref) in gone_h for body, ref in rope.ends)
+
+        self.ropes = [r for r in self.ropes if id(r) not in gone_r and not attached(r)]
+        self.hooks = [hk for hk in self.hooks if id(hk.pos) not in gone_h]
+        if gone_b:
+            for b in self.bodies:
+                if id(b) in gone_b:
+                    b.points, b.prev, b.vels, b.inv_mass = b.points.copy(), b.prev.copy(), b.vels.copy(), b.inv_mass.copy()
+            self.bodies = [b for b in self.bodies if id(b) not in gone_b]
+            self.grabbed = None
+            self._rebuild()
+
+    def remove_body(self, body):
+        self.remove(bodies=[body])
+
+    def remove_rope(self, rope):
+        self.remove(ropes=[rope])
+
+    def remove_hook(self, hook):
+        self.remove(hooks=[hook])
+
+    def reorder(self, bodies):
+        """Set the draw order: `bodies` is self.bodies in a new order (containers go before what they hold). Repacks."""
+        assert sorted(map(id, bodies)) == sorted(map(id, self.bodies))
+        self.bodies = list(bodies)
+        self.grabbed = None
+        self._rebuild()
+
     def _rebuild(self):
         """Pack every body into shared arrays; bodies keep views into them so they edit in place."""
         bodies = self.bodies
