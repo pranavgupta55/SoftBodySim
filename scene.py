@@ -144,7 +144,7 @@ BRIGHT_ENDESGA_32 = [c for c in ENDESGA_32 if sum(c) > 230]
 DIAMONDS_HEXAGONS = 140  # falling hexagons in the "diamonds" preset
 DIAMOND_SIDE = 32.0  # edge length of its diamonds (world units)
 DIAMOND_CHAIN_WIDTH = 120.0  # a cluster of touching diamonds is at most this wide (tall is fine): no long ledges
-DIAMOND_MARGIN = 60.0  # diamonds stay this far in from the side walls
+DIAMOND_MARGIN = 30.0  # diamonds stay this far in from the side walls
 CUP_GAP = 40.0  # diamonds whose corners are closer than this (the widest hexagon) can't form a cup either
 
 
