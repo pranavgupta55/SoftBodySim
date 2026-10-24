@@ -38,6 +38,12 @@ class World:
     def add_hook(self, hook):
         self.hooks.append(hook)
 
+    def add_chain(self, chain):
+        """An entities.Chain: its boxes (one repack) and then its ropes, in order along the chain."""
+        self.bodies.extend(chain.bodies)
+        self._rebuild()
+        self.ropes.extend(chain.ropes)
+
     def _rebuild(self):
         """Pack every body into shared arrays; bodies keep views into them so they edit in place."""
         bodies = self.bodies

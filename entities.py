@@ -103,18 +103,27 @@ class Body:
             return
         loop = np.round(pts[:, self.edges[0]]).astype(int)  # perimeter in loop order, whole pixels
         pygame.draw.polygon(surface, self.fill_col, loop.T.tolist())
-        # Border: the 1px outline of the perimeter plus copies shifted 1px at a time outward along each edge's minor
-        # axis. pygame's own thick lines grow to one side only, and its fill spills up to 1px past the outline on
-        # some edges, so a stroke on (and just outside) the outline is what fully covers the fill's rim.
-        d = np.roll(loop, -1, axis=1) - loop
-        steep = np.abs(d[1]) >= np.abs(d[0])
-        outward = self.winding * np.array([d[1], -d[0]])  # interior is left of each edge for positive shoelace area
-        shift = np.where(steep, [np.sign(outward[0]), np.zeros_like(d[0])], [np.zeros_like(d[0]), np.sign(outward[1])])
-        a, b = loop.T.tolist(), np.roll(loop, -1, axis=1).T.tolist()
-        for k in range(border_width):
-            offs = (shift * k).T.tolist()
-            for (ax, ay), (bx, by), (sx, sy) in zip(a, b, offs):
-                pygame.draw.line(surface, border_col, (ax + sx, ay + sy), (bx + sx, by + sy))
+        draw_border(surface, loop, border_col, border_width, self.winding)
+
+
+def draw_border(surface, loop, col=(0, 0, 0), width=2, winding=None):
+    """Border of a filled polygon whose corners are the whole-pixel (2, n) `loop`: the 1px outline plus copies
+    shifted 1px at a time outward along each edge's minor axis. pygame's own thick lines grow to one side only, and
+    its fill spills up to 1px past the outline on some edges, so a stroke on (and just outside) the outline is what
+    fully covers the fill's rim. winding: +1 / -1 for the loop's direction (computed from the loop if None)."""
+    loop = np.asarray(loop, dtype=int)
+    if winding is None:
+        x, y = loop
+        winding = 1.0 if np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y) >= 0 else -1.0
+    d = np.roll(loop, -1, axis=1) - loop
+    steep = np.abs(d[1]) >= np.abs(d[0])
+    outward = winding * np.array([d[1], -d[0]])  # interior is left of each edge for positive shoelace area
+    shift = np.where(steep, [np.sign(outward[0]), np.zeros_like(d[0])], [np.zeros_like(d[0]), np.sign(outward[1])])
+    a, b = loop.T.tolist(), np.roll(loop, -1, axis=1).T.tolist()
+    for k in range(width):
+        offs = (shift * k).T.tolist()
+        for (ax, ay), (bx, by), (sx, sy) in zip(a, b, offs):
+            pygame.draw.line(surface, col, (ax + sx, ay + sy), (bx + sx, by + sy))
 
 
 class FixedBody(Body):
@@ -255,3 +264,82 @@ class Rope:
 
     def draw(self, surface, zoom=1.0):
         pygame.draw.line(surface, self.col, self.end_pos(0) * zoom, self.end_pos(1) * zoom, self.width)
+
+
+def end_point(end):
+    """World position of a rope end spec: (body, point_index), a Hook, or (x, y)."""
+    if isinstance(end, Hook):
+        return end.pos.copy()
+    if isinstance(end[0], Body):
+        return np.array(end[0].points[:, int(end[1])], dtype=float)
+    return np.array(end, dtype=float)
+
+
+def chain_box_points(center, u, size):
+    """(2, 6) square of side `size` centred on `center`, sides along the unit vector u: the four corners plus the
+    midpoints of its back (-u) and front (+u) sides, where the chain's ropes attach (indices 0 and 3)."""
+    c, u = np.asarray(center, dtype=float), np.asarray(u, dtype=float)
+    v, h = np.array([-u[1], u[0]]), size / 2
+    pts = [c - h * u, c - h * u + h * v, c + h * u + h * v, c + h * u, c + h * u - h * v, c - h * u - h * v]
+    return np.array(pts).T
+
+
+class Chain:
+    """Builder for a chain: alternating ropes and small square RigidBodies in a straight line from end_a to end_b.
+
+    segments counts ropes + boxes; `start` / `end` ("rope" or "box") say what the chain begins and ends with, so it
+    must be odd when they match and even when they differ (see chain_counts). A rope end is any Rope end spec (body
+    point, Hook or (x, y) anchor); a box end is the (x, y) centre of that end's box. Ropes get rest length = their
+    starting length, so the chain starts exactly taut. Not a body itself: add .bodies and .ropes to a World (or use
+    World.add_chain). Box points are the corners plus the back / front side midpoints the ropes attach to.
+    """
+    BOX_SIZE = 10.0  # world units (5 px at the default zoom of 0.5)
+
+    def __init__(self, end_a, end_b, segments, start="rope", end="rope", box_size=BOX_SIZE, box_col=None, rope_col=None,
+                 stiffness=1.0, rope_width=1, point_radius=3):
+        a, b = end_point(end_a), end_point(end_b)
+        centers, u, _ = chain_layout(a, b, segments, start, end, box_size)
+        style = dict(point_col=box_col, stick_col=box_col, fill_col=box_col, point_radius=point_radius)
+        self.bodies = [RigidBody(chain_box_points(c, u, box_size), **style) for c in centers]
+        # the pieces in order (a box, or None for a rope); a rope joins the previous box's front midpoint (or end_a)
+        # to the next box's back midpoint (or end_b)
+        boxes = iter(self.bodies)
+        pieces = [next(boxes) if _chain_is_box(k, start) else None for k in range(segments)]
+        self.ropes = []
+        for k, p in enumerate(pieces):
+            if p is None:
+                ra = (pieces[k - 1], 3) if k > 0 else end_a
+                rb = (pieces[k + 1], 0) if k + 1 < segments else end_b
+                self.ropes.append(Rope(ra, rb, stiffness=stiffness, col=rope_col, width=rope_width))
+
+
+def _chain_is_box(k, start):
+    return (k % 2 == 0) == (start == "box")
+
+
+def chain_counts(segments, start="rope", end="rope"):
+    """(ropes, boxes) in a chain of `segments` alternating pieces. The count must be odd when both ends are the same
+    kind and even when they differ, and at least 3 (same ends) or 2 (mixed); raises ValueError otherwise."""
+    if (segments % 2 == 1) != (start == end) or segments < (3 if start == end else 2):
+        raise ValueError(f"{segments} segments can't start with a {start} and end with a {end}")
+    boxes = (segments + 1) // 2 if start == "box" else segments // 2
+    return segments - boxes, boxes
+
+
+def chain_layout(a, b, segments, start="rope", end="rope", box_size=Chain.BOX_SIZE):
+    """Box centres (k, 2), the unit direction a -> b, and the rope length, for a straight chain from a to b. A box
+    end's box is centred on that end. The rope length can come out short or negative when a and b are too close."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    ropes, boxes = chain_counts(segments, start, end)
+    dist = float(np.hypot(*(b - a)))
+    u = (b - a) / dist if dist > 1e-9 else np.array([1.0, 0.0])
+    covered = boxes * box_size - box_size / 2 * ((start == "box") + (end == "box"))  # box length between a and b
+    rope = (dist - covered) / ropes
+    centers, s = [], (-box_size / 2 if start == "box" else 0.0)  # s: distance along the chain so far
+    for k in range(segments):
+        if _chain_is_box(k, start):
+            centers.append(a + (s + box_size / 2) * u)
+            s += box_size
+        else:
+            s += rope
+    return np.array(centers).reshape(-1, 2), u, rope
