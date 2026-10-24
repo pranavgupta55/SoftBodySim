@@ -21,7 +21,15 @@ Objects ("units"): a body (not a wall), a rope, a hook, or a whole chain (its bo
 - Ctrl/Cmd+V shows the copy as a ghost following the mouse (Q / E rotate it); a click on a valid spot pastes it and
   selects the pasted objects, Esc cancels. Ctrl/Cmd+D duplicates the selection next to the original at the first valid
   spot nearby (right, below, left, above, then diagonals and further out), or as a paste ghost if there is no room.
-Every change calls before_world_change(label) first (world-level undo).
+- With exactly one rope or chain selected, each of its ends has a handle (filled square: fixed, hollow: free; see
+  editor.END_OPTIONS), beside an end attached to a body point or hook so that one can still be clicked. Clicking a handle, or F over it, toggles that end: fixed -> free gives it a bead (rope) or makes
+  the chain's end piece a box, free -> fixed pins it where it is (a world anchor, or the body point / hook it's
+  attached to). Dragging a handle moves the end: it attaches to a body point or hook within SNAP_UI_PX of the release,
+  else it's left in free space. Either way the rope or chain is rebuilt the way spawning it with those ends and
+  settings would build it (a chain is laid out straight again, its segment count fitted to the ends like the settings
+  panel does; it keeps its chain_id, colours and rope stiffness; a rope keeps its slack), and validated like spawning:
+  a rejected drag shows red and snaps back, a rejected toggle doesn't happen.
+Every change calls Editor.before_world_change(label) first: one world undo step (Z / X while paused).
 """
 import copy
 import math
@@ -29,13 +37,16 @@ import math
 import numpy as np
 import pygame
 
-from entities import EnvConfig, FixedBody, Hook, RigidBody, Rope, SoftBody, new_chain_id
+from entities import Chain, EnvConfig, FixedBody, Hook, RigidBody, Rope, SoftBody, new_chain_id
 
 ROTATE_STEP = 15.0  # degrees per Q / E press
 BAD_MOVE = "you cannot put it there"
 NOTHING_COPIED = "nothing copied yet"
 NO_ROOM = "no room nearby: click to place the copy"
 BAND_UI_PX = 3  # a press on empty space that moves less than this (UI px) is a click (clears the selection)
+HANDLE_UI_PX = 5  # a press this close (UI px) to a selected rope's / chain's end handle grabs it
+HANDLE_HALF = 3  # an end handle is a square of side 2 * HANDLE_HALF + 1 (UI px)
+HANDLE_OFFSET = 9  # UI px along the line from an attached end to its handle (the hook / body point stays clickable)
 
 
 def _unit(obj):
@@ -94,7 +105,8 @@ class _Pose:
 
 class SelectionTools:
     """Editor mixin: see the module docstring. State: picked (selected units), clipboard (deep copies), paste (the
-    ghost being placed), edit_drag (a move in progress), band (a box selection in progress)."""
+    ghost being placed), edit_drag (a move in progress), band (a box selection in progress), end_drag (a rope / chain
+    end handle pressed or dragged)."""
 
     def _init_selection(self):
         self.picked = []
@@ -102,10 +114,7 @@ class SelectionTools:
         self.paste = None  # {"pose": _Pose of the ghost's own copies, "label": "paste" / "duplicate"}
         self.edit_drag = None  # {"pose", "start", "new", "valid", "moved"}
         self.band = None  # [start wp, current wp, additive]
-
-    def before_world_change(self, label):
-        """Called right before any edit that changes the world (spawn, delete, move, paste, rotate, load...), so a
-        world-level undo can snapshot it. A no-op until that undo exists."""
+        self.end_drag = None  # {"line": see _line, "i": end index, "start", "ends": new ends, "valid", "moved"}
 
     def _editing(self):
         """Selection editing is on while paused with the spawn editor closed."""
@@ -116,7 +125,7 @@ class SelectionTools:
         selection cleared."""
         if self.edit_drag is not None:
             self.edit_drag["pose"].write(self.edit_drag["pose"].original())
-        self.edit_drag = self.band = self.paste = None
+        self.edit_drag = self.band = self.paste = self.end_drag = None
         self.picked = []
 
     # ---------------- Units and what they contain
@@ -168,8 +177,8 @@ class SelectionTools:
         if len(units) > 1:
             return f"{len(units)} items"
         u = units[0]
-        if isinstance(u, tuple):
-            return "chain"
+        if isinstance(u, tuple):  # a rope with beads is a chain of pieces too (see editor.END_OPTIONS)
+            return "rope" if all(getattr(b, "bead", False) for b in self._unit_parts(u)[0]) else "chain"
         if isinstance(u, (Hook, Rope)):
             return type(u).__name__.lower()
         return {SoftBody: "soft", RigidBody: "rigid", FixedBody: "fixed"}.get(type(u), "body")
@@ -439,7 +448,7 @@ class SelectionTools:
             self.paste["pose"] = _Pose(pose.bodies, pose.ropes, pose.hooks)  # the rotated copies are the new original
             return
         units = self._live_picked()
-        if not units or self.edit_drag is not None:
+        if not units or self.edit_drag is not None or self.end_drag is not None:
             return
         pose = _Pose(*self._gather(units), self.world.hooks)
         new = self._rotated(pose, sign * ROTATE_STEP)
@@ -451,7 +460,192 @@ class SelectionTools:
     def _esc_cancels(self):
         """Would Esc cancel something here (a ghost, a move, a box, the selection) instead of quitting?"""
         return self._editing() and (self.paste is not None or self.edit_drag is not None or self.band is not None
-                                    or bool(self._live_picked()))
+                                    or self.end_drag is not None or bool(self._live_picked()))
+
+    # ---------------- Rope and chain ends (exactly one rope or chain selected)
+    def _end_snap(self, body, ref):
+        """A rope end (body, ref) as (position, snap): on a body point the snap is (body, index), on a hook the Hook
+        (its end shares the hook's position array), a free anchor's is None."""
+        if body is not None:
+            return np.array(body.points[:, ref], dtype=float), (body, ref)
+        return ref.copy(), next((h for h in self.world.hooks if h.pos is ref), None)
+
+    def _chain_order(self, bodies, ropes):
+        """A chain's pieces in order from its 1st end to its 2nd, or None if they don't form one line. The ends are
+        the ropes with an end off the chain and the boxes with only one rope; the 1st end is the one the chain was
+        built from (Chain adds its boxes and ropes in that order, and the world keeps it)."""
+        ids, w = {id(b) for b in bodies}, self.world
+        links = {id(b): [r for r in ropes if any(e[0] is b for e in r.ends)] for b in bodies}
+        starts = [r for r in ropes if any(e[0] is None or id(e[0]) not in ids for e in r.ends)]
+        starts += [b for b in bodies if len(links[id(b)]) == 1]
+        if len(starts) != 2:
+            return None
+        seq, seen, cur = [], set(), starts[0]
+        while cur is not None:
+            seq.append(cur)
+            seen.add(id(cur))
+            if isinstance(cur, Rope):
+                nxt = [e[0] for e in cur.ends if e[0] is not None and id(e[0]) in ids]
+            else:
+                nxt = links[id(cur)]
+            cur = next((x for x in nxt if id(x) not in seen), None)
+        if len(seq) != len(bodies) + len(ropes):
+            return None
+        bs = [_index_in(x, w.bodies) for x in seq if not isinstance(x, Rope)]
+        rs = [_index_in(x, w.ropes) for x in seq if isinstance(x, Rope)]
+        if len(bs) > 1 or len(rs) > 1:
+            forward = bs[0] < bs[-1] if len(bs) > 1 else rs[0] < rs[-1]
+        else:  # one rope and one box: only end_modes tells (a box end is always a free one)
+            stored = getattr(seq[0], "end_modes", None)
+            forward = stored is None or stored[1 if isinstance(seq[0], Rope) else 0] == "free"
+        return seq if forward else seq[::-1]
+
+    def _line(self):
+        """The selected rope or chain as a line from its 1st end to its 2nd, or None unless exactly one is selected:
+        {"unit", "kind" ("rope", with or without beads, or "chain"), "bodies", "ropes", "chain_id", "ends":
+        [(position, snap)] for both ends (a loose box's or bead's is its centre and None), "modes": fixed / free per
+        end, "style": colours, stiffness and width, "slack" (a rope's) or "segments" (a chain's setting: its pieces
+        less the extra rope of each free end attached to a body point or hook, see Editor._chain_spec)}. An end's
+        mode: a loose box or bead is free, an anchor is fixed, an attached end has the mode it was spawned with
+        (end_modes; fixed for ropes and chains made elsewhere)."""
+        units = self._live_picked()
+        if len(units) != 1 or not isinstance(units[0], (Rope, tuple)):
+            return None
+        unit = units[0]
+        if isinstance(unit, Rope):
+            bodies, ropes, seq = [], [unit], [unit]
+        else:
+            bodies, ropes, _ = self._unit_parts(unit)
+            seq = self._chain_order(bodies, ropes)
+            if seq is None:
+                return None
+        ids = {id(b) for b in bodies}
+        ends = []
+        for k, piece in enumerate((seq[0], seq[-1])):
+            if isinstance(piece, Rope):
+                outer = [e for e in piece.ends if e[0] is None or id(e[0]) not in ids]  # both, for a lone rope
+                ends.append(self._end_snap(*outer[-1 if k else 0]))
+            else:
+                ends.append((piece.points.mean(axis=1), None))
+        stored = getattr(seq[0], "end_modes", None) or ("fixed", "fixed")
+        modes = ["free" if not isinstance(piece, Rope) else "fixed" if snap is None else stored[k]
+                 for k, (piece, (_, snap)) in enumerate(zip((seq[0], seq[-1]), ends))]
+        rope = ropes[0]
+        line = {"unit": unit, "bodies": bodies, "ropes": ropes, "ends": ends, "modes": modes,
+                "chain_id": getattr(rope, "chain_id", None),
+                "kind": "rope" if all(getattr(b, "bead", False) for b in bodies) else "chain",
+                "style": {"col": rope.col, "box_col": bodies[0].fill_col if bodies else rope.col,
+                          "stiffness": rope.stiffness, "width": rope.width}}
+        if line["kind"] == "rope":
+            line["slack"] = max(rope.rest_length - rope.length(), 0.0)
+        else:
+            line["segments"] = len(seq) - sum(m == "free" and s is not None for m, (_, s) in zip(modes, ends))
+        return line
+
+    @staticmethod
+    def _line_cfg(line, modes):
+        """The spawn settings that build `line` with these end modes: a rope's {"start", "end"}; a chain's also its
+        segment count, fitted to the ends the way the settings panel does it (Editor._set_chain_end)."""
+        from editor import END_PIECE, fit_chain_count
+        cfg = {"start": modes[0], "end": modes[1]}
+        if line["kind"] == "chain":
+            cfg["segments"] = fit_chain_count(line["segments"], END_PIECE[modes[0]], END_PIECE[modes[1]])
+        return cfg
+
+    def _ends_ok(self, line, ends, modes):
+        pts, snaps = [p for p, _ in ends], [s for _, s in ends]
+        return self._valid_chain(pts, snaps, self._line_cfg(line, modes), skip=line["bodies"])
+
+    def _set_ends(self, line, ends, modes, label):
+        """Rebuild `line` with these ends ((position, snap) each) and end modes the way spawning it would build it,
+        as one undoable edit, and select the result. A rejected one changes nothing (and says so); returns whether
+        it was done."""
+        if not self._ends_ok(line, ends, modes):
+            self._say(BAD_MOVE)
+            return False
+        st, w = line["style"], self.world
+        new = self._make_line([p for p, _ in ends], [s for _, s in ends], self._line_cfg(line, modes), st["box_col"],
+                              st["col"], st["stiffness"], st["width"])
+        self.before_world_change(label)
+        w.remove(line["bodies"], line["ropes"])
+        if isinstance(new, Chain):
+            cid = line["chain_id"] if line["chain_id"] is not None else new.chain_id
+            for piece in new.bodies + new.ropes:
+                piece.chain_id = cid
+            w.add_chain(new)
+            unit = ("chain", cid)
+        else:
+            w.add_rope(new)
+            unit = new
+        if line["kind"] == "rope":  # it keeps its slack (a chain starts taut, as spawned)
+            rope = new.ropes[0] if isinstance(new, Chain) else new
+            rope.rest_length = rope.length() + line["slack"]
+        self.picked = [unit]
+        self._fix_order()
+        return True
+
+    def _toggle_end(self, line, i):
+        """End i fixed <-> free, where it is now (a loose box or bead pins at its centre)."""
+        modes = list(line["modes"])
+        modes[i] = "free" if modes[i] == "fixed" else "fixed"
+        return self._set_ends(line, line["ends"], modes, "toggle end")
+
+    def _handle_pos(self, ends, k):
+        """Where end k's handle is: on the end, or for an end attached to a body point or hook HANDLE_OFFSET UI px
+        along the line (at most a third of it), so the hook or body under the end can still be clicked."""
+        p, snap = ends[k]
+        if snap is None:
+            return np.asarray(p, dtype=float)
+        d = np.asarray(ends[1 - k][0], dtype=float) - p
+        n = float(np.hypot(*d))
+        return p + d / n * min(HANDLE_OFFSET / self.zoom, n / 3) if n > 1e-9 else np.asarray(p, dtype=float)
+
+    def _handle_at(self, wp, line):
+        """The end (0 / 1) of `line` whose handle is within HANDLE_UI_PX of wp (the nearer one), or None."""
+        if line is None:
+            return None
+        ends = line["ends"]
+        d = [float(np.hypot(*(self._handle_pos(ends, k) - np.asarray(wp, dtype=float)))) for k in (0, 1)]
+        k = int(np.argmin(d))
+        return k if d[k] <= HANDLE_UI_PX / self.zoom else None
+
+    def _toggle_hovered_end(self):
+        """F while editing: toggle the end handle under the mouse (nothing being dragged or pasted). True if there
+        was one (F then doesn't toggle the Compute card)."""
+        if not self._editing() or any(x is not None for x in (self.paste, self.edit_drag, self.band, self.end_drag)):
+            return False
+        ui_pos = self.to_ui(pygame.mouse.get_pos())
+        line = self._line()
+        k = None if self._over_ui(ui_pos) else self._handle_at(self.to_world(ui_pos), line)
+        if k is None:
+            return False
+        self._toggle_end(line, k)
+        return True
+
+    def _end_drag_to(self, wp):
+        """Move the dragged end to wp: onto a body point or hook within SNAP_UI_PX (not on the line's own boxes), else
+        free space. A press that moves less than BAND_UI_PX is still a click (a toggle)."""
+        d = self.end_drag
+        if not d["moved"] and np.abs(wp - d["start"]).max() * self.zoom < BAND_UI_PX:
+            return
+        line = d["line"]
+        snap = self._snap_target(wp, skip=line["bodies"])
+        ends = list(line["ends"])
+        ends[d["i"]] = (self._snap_pos(snap), snap) if snap is not None else (wp, None)
+        d["moved"], d["ends"], d["valid"] = True, ends, self._ends_ok(line, ends, line["modes"])
+
+    def _end_drag_up(self, wp):
+        self._end_drag_to(wp)
+        d, self.end_drag = self.end_drag, None
+        line = d["line"]
+        if any(_index_in(r, self.world.ropes) is None for r in line["ropes"]):  # deleted meanwhile
+            return
+        if not d["moved"]:
+            self._toggle_end(line, d["i"])
+        elif d["valid"]:
+            self._set_ends(line, d["ends"], line["modes"], "move end")
+        else:
+            self._say(BAD_MOVE)
 
     # ---------------- Input (world coordinates)
     def _edit_key(self, event):
@@ -459,7 +653,7 @@ class SelectionTools:
         cmd = event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)
         k = event.key
         if k == pygame.K_ESCAPE:  # cancel a ghost / move, then clear the selection; with nothing to cancel Esc quits
-            if self.paste is not None or self.edit_drag is not None or self.band is not None:
+            if any(x is not None for x in (self.paste, self.edit_drag, self.band, self.end_drag)):
                 picked = self.picked
                 self._end_edit()
                 self.picked = picked
@@ -495,6 +689,11 @@ class SelectionTools:
                 self._say(BAD_MOVE)
             return
         shift = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+        line = None if shift else self._line()
+        end = self._handle_at(wp, line)
+        if end is not None:  # an end handle of the selected rope / chain: a click toggles it, a drag moves it
+            self.end_drag = {"line": line, "i": end, "start": wp, "ends": line["ends"], "valid": True, "moved": False}
+            return
         unit = self._pick_unit(wp)
         picked = self._live_picked()
         if unit is None:
@@ -515,6 +714,8 @@ class SelectionTools:
         wp = np.asarray(wp, dtype=float)
         if self.band is not None:
             self.band[1] = wp
+        elif self.end_drag is not None:
+            self._end_drag_to(wp)
         elif self.edit_drag is not None:
             d = self.edit_drag
             new, offset = self._translated(d["pose"], wp - d["start"])
@@ -537,6 +738,9 @@ class SelectionTools:
             else:
                 self.picked = found
             return
+        if self.end_drag is not None:
+            self._end_drag_up(np.asarray(wp, dtype=float))
+            return
         if self.edit_drag is None:
             return
         self._edit_motion(wp)
@@ -554,6 +758,11 @@ class SelectionTools:
         """The Controls card's "Select" section while editing: what's selected and what can be done with it."""
         has = bool(self._live_picked())
         n = self._clip_count()
+        line = self._line()
+        # with one rope or chain selected, also its end handles (keys distinct from the View section's F row)
+        ends = [] if line is None else [("click end", "toggle", None, True),
+                                        ("F end", "toggle", None, True),
+                                        ("drag end", "re-attach", None, True)]
         return [("click", "select", self._selection_summary(), True),
                 ("shift", "add / remove", None, True),
                 ("drag", "move" if has else "box select", None, True),
@@ -561,7 +770,7 @@ class SelectionTools:
                 ("DEL", "delete", None, has),
                 ("^C", "copy", None, has),
                 ("^V", "paste", f"{n} copied" if n else None, n > 0),
-                ("^D", "duplicate", None, has)]
+                ("^D", "duplicate", None, has)] + ends
 
     def _edit_hint(self):
         """Is the paste hint box up (a paste ghost follows the mouse)?"""
@@ -582,7 +791,7 @@ class SelectionTools:
             self._draw_ghost(surface, ghost_surface, self.paste["pose"], new, (200, 200, 200) if ok else tuple(pal.debug_red))
             return
         col = pal.yellow
-        if self.edit_drag is not None and self.edit_drag["moved"] and not self.edit_drag["valid"]:
+        if any(d is not None and d["moved"] and not d["valid"] for d in (self.edit_drag, self.end_drag)):
             col = pal.neon_red  # not debug_red: that's also a body colour (the demo square)
         if self.edit_drag is not None:  # what's being moved (the live positions would change what counts as contents)
             pose = self.edit_drag["pose"]
@@ -595,12 +804,16 @@ class SelectionTools:
             pygame.draw.line(surface, col, r.end_pos(0) * z, r.end_pos(1) * z, 3)
         for h in hooks:
             pygame.draw.circle(surface, col, self._peg_px(h.pos), 6, 1)
+        line = None
+        if self.edit_drag is None and self.band is None:
+            line = self.end_drag["line"] if self.end_drag is not None else self._line()
+            self._draw_ends(surface, ghost_surface, line, wp, over_ui)
         if self.band is not None:
             a, b = self.band[0] * z, self.band[1] * z
             rect = pygame.Rect(int(min(a[0], b[0])), int(min(a[1], b[1])), int(abs(b[0] - a[0])) + 1, int(abs(b[1] - a[1])) + 1)
             ghost_surface.fill((200, 200, 200), rect)
             pygame.draw.rect(surface, pal.white, rect, 1)
-        elif self.edit_drag is None and not over_ui:
+        elif self.edit_drag is None and self.end_drag is None and not over_ui and self._handle_at(wp, line) is None:
             unit = self._pick_unit(wp)
             if unit is not None and unit not in self.picked:
                 hb, hr, hh = self._unit_parts(unit)
@@ -610,6 +823,34 @@ class SelectionTools:
                     pygame.draw.line(surface, pal.white, r.end_pos(0) * z, r.end_pos(1) * z, 3)
                 for h in hh:
                     pygame.draw.circle(surface, pal.white, self._peg_px(h.pos), 6, 1)
+
+    def _draw_ends(self, surface, ghost_surface, line, wp, over_ui):
+        """The end handles of the selected rope / chain `line` (if any): a filled square on a fixed end, a hollow one
+        on a free end; white under the mouse or while pressed, red while a drag would be rejected. While one is
+        dragged, the line as it would be rebuilt is a ghost (grey, red if rejected) with a white ring on the body
+        point / hook the end would attach to."""
+        if line is None:
+            return
+        pal, z, d = self.palette, self.zoom, self.end_drag
+        ends = line["ends"]
+        if d is not None and d["moved"]:
+            ends = d["ends"]
+            ghost = (200, 200, 200) if d["valid"] else tuple(pal.debug_red)
+            self._draw_chain_ghost(surface, ghost_surface, [p for p, _ in ends], [s for _, s in ends], ghost,
+                                   self._line_cfg(line, line["modes"]), max(1, line["style"]["width"]))
+            snap = ends[d["i"]][1]
+            if snap is not None:
+                ring = snap.radius + 2 if isinstance(snap, Hook) else 4
+                pygame.draw.circle(surface, pal.white, tuple(self._snap_pos(snap) * z), ring, 1)
+        hover = None if over_ui or d is not None else self._handle_at(wp, line)
+        for k in (0, 1):
+            p = self._handle_pos(ends, k)
+            col = pal.white if k == hover or (d is not None and k == d["i"]) else pal.yellow
+            if d is not None and k == d["i"] and d["moved"] and not d["valid"]:
+                col = pal.neon_red
+            side = 2 * HANDLE_HALF + 1
+            rect = (int(p[0] * z) - HANDLE_HALF, int(p[1] * z) - HANDLE_HALF, side, side)
+            pygame.draw.rect(surface, col, rect, 0 if line["modes"][k] == "fixed" else 1)
 
     def _draw_ghost(self, surface, ghost_surface, pose, new, col):
         z = self.zoom

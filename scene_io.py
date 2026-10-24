@@ -25,8 +25,9 @@ Python's shortest round-trip repr, so save -> load gives bit-identical arrays. A
 bottom wall (or, with "world": {"anchor": "top" | "center"}, its ceiling distance / its centre); the walls themselves
 are rebuilt on the new box. It's refused if it then doesn't fit (never scaled: that would change every rest length).
 
-Optional fields (absent in older files, ignored by builds that lack the feature): a body's "restitution", a chain
-piece's (box or rope) "chain_id" (renumbered on load, so it never clashes with the session's own chains), and a
+Optional fields (absent in older files, ignored by builds that lack the feature): a body's "restitution", a rope /
+chain piece's "chain_id" (renumbered on load, so it never clashes with the session's own chains), "end_modes"
+(["fixed" | "free", ...]) and "bead" (true), and a
 top-level "state" with the world's looping sides, its tagged walls (by body index, or "detached" when a looping side's
 wall is out of the body list), pending walls, bounds and terminal velocity.
 
@@ -99,10 +100,26 @@ def is_wall(body, box):
 
 # ---------------- World -> data
 def _put_chain(d, piece):
-    """A chain piece (box or rope) keeps its chain's id, so the chain still selects as one object."""
+    """What the editor keeps on rope / chain pieces: the chain's id (its pieces select as one object), the fixed /
+    free setting of each end (end_modes) and a rope's beads (bead)."""
     cid = getattr(piece, "chain_id", None)
     if isinstance(cid, int) and not isinstance(cid, bool):
         d["chain_id"] = cid
+    modes = getattr(piece, "end_modes", None)
+    if isinstance(modes, (list, tuple)) and len(modes) == 2 and all(isinstance(m, str) for m in modes):
+        d["end_modes"] = [str(m) for m in modes]
+    if getattr(piece, "bead", False) is True:
+        d["bead"] = True
+
+
+def _get_chain(piece, d, ids, new_chains):
+    if "chain_id" in d:
+        cid = int(d["chain_id"])
+        piece.chain_id = ids.setdefault(cid, new_chain_id()) if new_chains else cid
+    if "end_modes" in d:
+        piece.end_modes = [str(m) for m in d["end_modes"]][:2]
+    if d.get("bead") is True:
+        piece.bead = True
 
 
 def _body_dict(b, arr, col, wall=False):
@@ -285,9 +302,7 @@ def build(data, offset=(0.0, 0.0), new_chains=False):
                               col=tuple(r["col"]), width=r["width"]))
         ids = {}
         for piece, d in zip(bodies + ropes, list(data["bodies"]) + list(data["ropes"])):
-            if "chain_id" in d:
-                cid = int(d["chain_id"])
-                piece.chain_id = ids.setdefault(cid, new_chain_id()) if new_chains else cid
+            _get_chain(piece, d, ids, new_chains)
         state = dict(data.get("state") or {})
         if "walls" not in state and "world" in data:  # an older file: tag its world box walls by where they lie
             sw, sh, si = (float(data["world"][k]) for k in ("width", "height", "inset"))

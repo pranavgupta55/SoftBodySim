@@ -318,7 +318,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     world, editor = session.world, session.editor
     perf_hud = PerfHUD(profiler)
     trails = Trails()  # T: fading paths behind moving bodies, drawn under them
-    gravity_dial = GravityDial()  # the gravity selector card (numpad 1-9 too)
+    gravity_dial = GravityDial()  # the gravity selector card (arrow keys, 0 and numpad too)
     # the sidebar's cards, top to bottom (hud_layer.py describes a card provider; append new cards here)
     # (the Controls card is the active world's editor: the session swaps it in this list when it switches worlds)
     hud.cards = [editor, session, perf_hud, gravity_dial]
@@ -366,7 +366,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
             if editor.scenes.state is None and session.handle_event(event):  # W, the Worlds card and panel
                 world, editor = session.world, session.editor  # (may switch worlds)
                 continue
-            # numpad keys, and clicks on the gravity card (not while the editor's modal save / open dialog is up)
+            # arrow / 0 / numpad keys, and clicks on the gravity card (not while the modal save / open dialog is up)
             if editor.scenes.state is None and gravity_dial.handle_event(event):
                 continue
             if editor.handle_event(event):  # the Controls card, the rest of the sidebar, editor panels and placement
