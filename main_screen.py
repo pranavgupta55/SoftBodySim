@@ -4,6 +4,9 @@ import time
 import random
 from text import drawText
 from fontDict import fonts
+import numpy as np
+from entities import RigidBody, SoftBody, FixedBody, rect_points, polygon_points
+from solver import World
 
 pygame.init()
 
@@ -61,6 +64,19 @@ ShakeCounter = 0
 toggle = True
 click = False
 
+# ---------------- Test scene: ground platform, rigid square, soft pentagon dropped above the square
+world = World()
+ground_top = screen_height - 40
+ground_thickness = 6
+world.add(FixedBody(rect_points(screen_center[0], ground_top + ground_thickness / 2, screen_width * 0.5, ground_thickness),
+                    point_col=Endesga.greyD, stick_col=Endesga.greyL, point_radius=2))
+square_half = 20
+square_y = ground_top - square_half - 40
+world.add(RigidBody(rect_points(screen_center[0], square_y, 2 * square_half, 2 * square_half),
+                    point_col=Endesga.debug_red, stick_col=Endesga.greyL, point_radius=3))
+world.add(SoftBody(polygon_points(screen_center[0] + 4, square_y - square_half - 50, 18, 5),
+                   stiffness=1.0, point_col=Endesga.network_green, stick_col=Endesga.very_light_blue, point_radius=3))
+
 # ---------------- Main Game Loop
 last_time = time.time()
 running = True
@@ -96,6 +112,9 @@ while running:
             pass
 
     # ---------------- Updating Screen
+    world.step(dt / fps)  # dt is in frames here, World wants seconds
+    world.draw(screen2)
+
     if toggle:
         items = {round(clock.get_fps()): None,
                  }
