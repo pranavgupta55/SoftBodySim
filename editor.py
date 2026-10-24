@@ -21,6 +21,7 @@ import pygame
 import ui_style as ui
 from ui_style import HUD
 from peg_layer import PegLayer
+from gravity_dial import direction_name
 from entities import (Chain, EnvConfig, FixedBody, Hook, RigidBody, Rope, SoftBody, chain_box_points, chain_counts,
                       chain_layout, draw_border, polygon_points)
 
@@ -203,6 +204,7 @@ class Editor:
         self.show_card = True  # the main loop mirrors its HUD toggle (SPACE) here: a hidden card takes no clicks
         self.show_compute = True  # F / the card's [f] button: the main loop draws the compute card only while set
         self.compute_card = None  # its rect (real screen px), set by the main loop when drawn: clicks on it are swallowed
+        self.gravity_card = None  # the gravity selector's rect (screen px) while shown, set by the main loop: swallowed too
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
         # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
@@ -857,6 +859,7 @@ class Editor:
                 ("V", "view", look, True),
                 ("F", "compute", "shown" if self.show_compute else "hidden", True),
                 ("SPACE", "HUD", "shown", True),
+                ("KP1-9", "gravity", direction_name(compass=True), True),
                 ("Z", "undo", None, placing and bool(self.undo_stack)),
                 ("X", "redo", None, placing and bool(self.redo_stack)),
                 ("ESC", "back" if self.active else "quit", None, True),
@@ -1009,6 +1012,8 @@ class Editor:
         ws.append((rect, None, ("blocker",)))  # the rest of the card swallows clicks (no grabs / points under it)
         if self.show_compute and self.compute_card is not None:
             ws.append((self.compute_card, None, ("blocker",)))  # and so does the compute card
+        if self.gravity_card is not None:
+            ws.append((self.gravity_card, None, ("blocker",)))  # and the gravity selector (gravity_dial.py)
         return ws
 
     def _panel_widgets(self):
