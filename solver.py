@@ -199,10 +199,24 @@ class World:
             if self.backend is None or not self.backend.pbd_substep(h):  # False: the backend can't run this scene
                 self._pbd_substep(h)
             self.V[:] = (self.P - self.PREV) / h
+            self._limit_speed()  # before CCD, which then checks the (shorter) clamped paths
             with sec("ccd"):
                 self._resolve_ccd(h)
             self.P[:] = self.PREV + self.V * h
             self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
+
+    def _limit_speed(self):
+        """Terminal velocity: scale down any point velocity faster than the limit (direction kept). It runs on V
+        before CCD, so it only shortens the straight-line paths CCD then makes collision-free; it can't cause a
+        crossing. Shared by both backends (the GPU backend only replaces the PBD part of a substep)."""
+        vmax = self.terminal_velocity if self.terminal_velocity is not None else EnvConfig.terminal_velocity
+        if vmax is None:
+            return
+        V = self.V
+        speed2 = V[0] * V[0] + V[1] * V[1]
+        fast = speed2 > vmax * vmax
+        if fast.any():
+            V[:, fast] *= vmax / np.sqrt(speed2[fast])
 
     def _pbd_substep(self, h):
         """Predict, drag, then iterations of body constraints, ropes and soft contacts (moves P, from PREV)."""
