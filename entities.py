@@ -56,7 +56,12 @@ class Body:
         self.stick_width = stick_width
 
         idx = np.arange(n)
-        self.edges = np.array([idx, np.roll(idx, -1)]) if n >= 3 else np.empty((2, 0), dtype=int)
+        if n >= 3:
+            self.edges = np.array([idx, np.roll(idx, -1)])
+        elif n == 2:  # a single segment (e.g. a thin fixed wall): one edge, no interior
+            self.edges = np.array([[0], [1]])
+        else:
+            self.edges = np.empty((2, 0), dtype=int)
         self.draw_edges = self.edges
         # +1 / -1 depending on loop direction, so the solver knows which side of an edge is outside
         x, y = self.points
@@ -72,20 +77,30 @@ class Body:
     def solve_constraints(self):
         pass
 
-    def draw(self, surface):
+    def draw(self, surface, zoom=1.0):
+        """zoom maps world units to surface pixels; radii and line widths stay in pixels."""
         if self.points.shape[1] == 0:
             return
+        pts = self.points * zoom
         for i, j in self.draw_edges.T:
-            pygame.draw.line(surface, self.stick_col, self.points[:, i], self.points[:, j], self.stick_width)
-        for pos in self.points.T:
+            pygame.draw.line(surface, self.stick_col, pts[:, i], pts[:, j], self.stick_width)
+        for pos in pts.T:
             pygame.draw.circle(surface, self.point_col, pos, self.point_radius)
 
-    def draw_filled(self, surface, border_col=(0, 0, 0), border_width=2):
+    def draw_filled(self, surface, border_col=(0, 0, 0), border_width=2, zoom=1.0):
         """Filled view: the perimeter loop as a solid polygon with a border, no points or springs."""
-        if self.edges.shape[1] < 3:  # not a closed polygon (e.g. a rope), nothing to fill
-            self.draw(surface)
+        pts = self.points * zoom
+        if pts.shape[1] == 2:  # a segment: a thick line in the fill colour with a black outline
+            a, b = pts[:, 0], pts[:, 1]
+            pygame.draw.line(surface, border_col, a, b, max(self.stick_width, 1) + 2 * border_width)
+            for end in (a, b):
+                pygame.draw.circle(surface, border_col, end, (max(self.stick_width, 1) + 2 * border_width) / 2)
+            pygame.draw.line(surface, self.fill_col, a, b, max(self.stick_width, 1))
             return
-        loop = np.round(self.points[:, self.edges[0]]).astype(int)  # perimeter in loop order, whole pixels
+        if self.edges.shape[1] < 3:  # not a closed polygon (e.g. a rope), nothing to fill
+            self.draw(surface, zoom)
+            return
+        loop = np.round(pts[:, self.edges[0]]).astype(int)  # perimeter in loop order, whole pixels
         pygame.draw.polygon(surface, self.fill_col, loop.T.tolist())
         # Border: the 1px outline of the perimeter plus copies shifted 1px at a time outward along each edge's minor
         # axis. pygame's own thick lines grow to one side only, and its fill spills up to 1px past the outline on
@@ -213,5 +228,5 @@ class Rope:
             if body is not None and w > 0:
                 body.points[:, ref] += sign * w * corr  # in place, so the World's shared array sees it
 
-    def draw(self, surface):
-        pygame.draw.line(surface, self.col, self.end_pos(0), self.end_pos(1), self.width)
+    def draw(self, surface, zoom=1.0):
+        pygame.draw.line(surface, self.col, self.end_pos(0) * zoom, self.end_pos(1) * zoom, self.width)

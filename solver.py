@@ -96,19 +96,20 @@ class World:
             self.P[:] = self.PREV + self.V * h
             self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
 
-    def draw(self, surface, filled=False):
-        """Bodies in the order they were added (later ones on top). filled: solid polygons instead of points + springs."""
+    def draw(self, surface, filled=False, zoom=1.0):
+        """Bodies in the order they were added (later ones on top). filled: solid polygons instead of points + springs.
+        zoom maps world units to surface pixels."""
         for b in self.bodies:
             if filled:
-                b.draw_filled(surface)
+                b.draw_filled(surface, zoom=zoom)
             else:
-                b.draw(surface)
+                b.draw(surface, zoom)
         for r in self.ropes:
-            r.draw(surface)
+            r.draw(surface, zoom)
         if self.grabbed is not None:
-            pygame.draw.line(surface, (255, 255, 255), self.P[:, self.grabbed], self.grab_target, 1)
+            pygame.draw.line(surface, (255, 255, 255), self.P[:, self.grabbed] * zoom, self.grab_target * zoom, 1)
 
-    def draw_grid(self, surface, line_col=(52, 58, 76), edge_cell_col=(37, 42, 55), point_cell_col=(45, 51, 68)):
+    def draw_grid(self, surface, line_col=(52, 58, 76), edge_cell_col=(37, 42, 55), point_cell_col=(45, 51, 68), zoom=1.0):
         """Debug view of the broad phase grid: cell (i, j) covers [i, i + 1) * cell_size, same as the solver's floor().
 
         Cells an edge is registered in (its AABB padded like _candidates does) get edge_cell_col,
@@ -116,7 +117,8 @@ class World:
         """
         cell = EnvConfig.cell_size
         w, h = surface.get_size()
-        cols, rows = int(np.ceil(w / cell)), int(np.ceil(h / cell))
+        cols, rows = int(np.ceil(w / zoom / cell)), int(np.ceil(h / zoom / cell))
+        cell_px = cell * zoom  # cells are hashed in world units, drawn in surface pixels
         if self.bodies:
             pad = 2 * EnvConfig.contact_radius
             a, b = self.P[:, self.edges[0]], self.P[:, self.edges[1]]
@@ -133,14 +135,14 @@ class World:
             on = (pc[0] >= 0) & (pc[0] < cols) & (pc[1] >= 0) & (pc[1] < rows)
             occupied[pc[0, on], pc[1, on]] = 2
             for (i, j), kind in zip(np.argwhere(occupied).tolist(), occupied[occupied > 0].tolist()):
-                x0, y0 = int(np.floor(i * cell)), int(np.floor(j * cell))
-                rect = (x0, y0, int(np.floor((i + 1) * cell)) - x0, int(np.floor((j + 1) * cell)) - y0)
+                x0, y0 = int(np.floor(i * cell_px)), int(np.floor(j * cell_px))
+                rect = (x0, y0, int(np.floor((i + 1) * cell_px)) - x0, int(np.floor((j + 1) * cell_px)) - y0)
                 surface.fill(point_cell_col if kind == 2 else edge_cell_col, rect)
         for i in range(1, cols):
-            x = int(np.floor(i * cell))
+            x = int(np.floor(i * cell_px))
             pygame.draw.line(surface, line_col, (x, 0), (x, h - 1))
         for j in range(1, rows):
-            y = int(np.floor(j * cell))
+            y = int(np.floor(j * cell_px))
             pygame.draw.line(surface, line_col, (0, y), (w - 1, y))
 
     # ---------------- Broad phase: spatial hash grid

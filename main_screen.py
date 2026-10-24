@@ -7,6 +7,7 @@ from fontDict import fonts
 import numpy as np
 from entities import RigidBody, SoftBody, FixedBody, Rope, rect_points, polygon_points
 from solver import World
+from editor import Editor
 
 pygame.init()
 
@@ -14,7 +15,7 @@ pygame.init()
 screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
 clock = pygame.time.Clock()
 fps = 60
-scaleDownFactor = 3
+scaleDownFactor = 2
 screen_width = int(screen.get_width() / scaleDownFactor)
 screen_height = int(screen.get_height() / scaleDownFactor)
 screen_center = [screen_width / 2, screen_height / 2]
@@ -66,29 +67,34 @@ click = False
 
 
 class ViewConfig:
-    """Debug view toggles (keys G and V)."""
-    show_grid = False  # G: draw the collision spatial hash grid under the bodies
-    filled = False  # V: filled polygons with a black border instead of points + springs
+    """View settings: debug toggles (keys G and V) and the world -> render surface zoom."""
+    show_grid = True  # G: draw the collision spatial hash grid under the bodies
+    filled = True  # V: filled polygons with a black border instead of points + springs
+    zoom = 0.5  # render pixels per world unit: 0.5 shows twice as much world each way
+
+
+# The world is measured in its own units; the render surfaces above are its size times the zoom
+world_width, world_height = screen_width / ViewConfig.zoom, screen_height / ViewConfig.zoom
+world_center = [world_width / 2, world_height / 2]
 
 
 # ---------------- Test scene: ground platform, rigid square, soft pentagon dropped above the square
 world = World()
-# World box: four thin fixed walls whose inner faces sit 5px in from each screen edge
-inset, wall = 5, 6
-for cx, cy, w, h in ((screen_width / 2, inset - wall / 2, screen_width + 2 * wall, wall),  # top
-                     (screen_width / 2, screen_height - inset + wall / 2, screen_width + 2 * wall, wall),  # bottom
-                     (inset - wall / 2, screen_height / 2, wall, screen_height + 2 * wall),  # left
-                     (screen_width - inset + wall / 2, screen_height / 2, wall, screen_height + 2 * wall)):  # right
-    world.add(FixedBody(rect_points(cx, cy, w, h), point_col=Endesga.greyD, stick_col=Endesga.greyD, point_radius=1, fill_col=Endesga.greyD))
-ground_top = screen_height - 40
+# World box: four 2-point fixed walls (segments) sitting 5px in from each screen edge
+inset = 5
+corners = [(inset, inset), (world_width - inset, inset), (world_width - inset, world_height - inset), (inset, world_height - inset)]
+for k in range(4):
+    world.add(FixedBody(np.array([corners[k], corners[(k + 1) % 4]]).T, point_col=Endesga.greyD, stick_col=Endesga.greyD,
+                        point_radius=1, stick_width=2, fill_col=Endesga.greyD))
+ground_top = world_height - 40
 ground_thickness = 6
-world.add(FixedBody(rect_points(screen_center[0], ground_top + ground_thickness / 2, screen_width * 0.5, ground_thickness),
+world.add(FixedBody(rect_points(world_center[0], ground_top + ground_thickness / 2, world_width * 0.5, ground_thickness),
                     point_col=Endesga.greyD, stick_col=Endesga.greyL, point_radius=2, fill_col=Endesga.grey))
 square_half = 20
 square_y = ground_top - square_half - 40
-world.add(RigidBody(rect_points(screen_center[0], square_y, 2 * square_half, 2 * square_half),
+world.add(RigidBody(rect_points(world_center[0], square_y, 2 * square_half, 2 * square_half),
                     point_col=Endesga.debug_red, stick_col=Endesga.greyL, point_radius=3, fill_col=Endesga.debug_red))
-world.add(SoftBody(polygon_points(screen_center[0] + 4, square_y - square_half - 50, 20, 6),
+world.add(SoftBody(polygon_points(world_center[0] + 4, square_y - square_half - 50, 20, 6),
                    stiffness=0.1, point_col=Endesga.network_green, stick_col=Endesga.very_light_blue, point_radius=3,
                    fill_col=Endesga.network_green))
 
@@ -97,12 +103,12 @@ hexagon_stiffness = 0.1
 for x_frac, y, strength, col in ((0.32, ground_top - 100, 1.0, Endesga.cream),
                                  (0.68, ground_top - 100, 0.75, Endesga.sebastian_lague_light_purple),
                                  (0.60, max(ground_top - 180, inset + 25), 0.5, Endesga.lighter_maroon_red)):  # clamp: short screens
-    world.add(SoftBody(polygon_points(screen_width * x_frac, y, 18, 12),
+    world.add(SoftBody(polygon_points(world_width * x_frac, y, 18, 12),
                        stiffness=hexagon_stiffness * strength, skip_sets=2, point_col=col, stick_col=Endesga.very_light_blue, point_radius=3, fill_col=col))
 
 # Ropes: a small rigid box hung from the top wall by two ropes in a V, and a rope from the square to the cream dodecagon
 square, cream_dodecagon = world.bodies[5], world.bodies[7]
-hang_x, box_half = screen_width * 0.88, 8  # right side; the container demo below is on the left
+hang_x, box_half = world_width * 0.62, 8  # clear of the container (left) and the HUD cards (top right)
 anchor = (hang_x, inset)
 hanging_box = RigidBody(rect_points(hang_x, inset + 50 + box_half, 2 * box_half, 2 * box_half),
                         point_col=Endesga.cream, stick_col=Endesga.greyL, point_radius=2)
@@ -113,10 +119,12 @@ world.add_rope(Rope((square, 0), (cream_dodecagon, 3), col=Endesga.light_brown))
 
 # Hollow rigid box near the left wall with a soft dodecagon inside it; drag the box to slosh it around.
 # The container is added first so it draws underneath its contents.
-box_cx, box_cy = inset + 50, screen_height * 0.3
+box_cx, box_cy = inset + 50, world_height * 0.3
 world.add(RigidBody(rect_points(box_cx, box_cy, 90, 70), point_col=Endesga.light_brown, stick_col=Endesga.greyL, point_radius=3))
 world.add(SoftBody(polygon_points(box_cx, box_cy, 20, 12), stiffness=hexagon_stiffness, skip_sets=2,
                    point_col=Endesga.network_red, stick_col=Endesga.very_light_blue, point_radius=3))
+
+editor = Editor(world, Endesga, screen.get_size(), (world_width, world_height), scaleDownFactor, inset, ViewConfig.zoom)
 
 # ---------------- Main Game Loop
 last_time = time.time()
@@ -125,7 +133,8 @@ while running:
 
     # ---------------- Reset Variables and Clear screens
     mx, my = pygame.mouse.get_pos()
-    mx, my = mx / scaleDownFactor, my / scaleDownFactor
+    mx, my = mx / scaleDownFactor, my / scaleDownFactor  # render-surface pixels (cursor, UI)
+    wx, wy = mx / ViewConfig.zoom, my / ViewConfig.zoom  # world units (physics)
     screen.fill(Endesga.my_blue)
     screen2.fill(Endesga.my_blue)
     screenT.fill((0, 0, 0, 0))
@@ -140,9 +149,11 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        if editor.handle_event(event):  # pause button, editor panels and placement come first
+            continue
         if event.type == pygame.MOUSEBUTTONDOWN:
             click = True
-            world.grab((mx, my))
+            world.grab((wx, wy))
         if event.type == pygame.MOUSEBUTTONUP:
             click = False
             world.release()
@@ -159,11 +170,13 @@ while running:
             pass
 
     # ---------------- Updating Screen
-    world.drag_to((mx, my))
-    world.step(dt / fps)  # dt is in frames here, World wants seconds
+    world.drag_to((wx, wy))
+    if not editor.paused:
+        world.step(dt / fps)  # dt is in frames here, World wants seconds
     if ViewConfig.show_grid:
-        world.draw_grid(screen2)
-    world.draw(screen2, filled=ViewConfig.filled)
+        world.draw_grid(screen2, zoom=ViewConfig.zoom)
+    world.draw(screen2, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
+    editor.draw_world(screen2, screenT, pygame.mouse.get_pos())
 
     if toggle:
         items = {round(clock.get_fps()): None,
@@ -180,6 +193,7 @@ while running:
         pygame.draw.circle(screenUI, Endesga.white, (mx, my), 2, 1)
     screen.blit(pygame.transform.scale(screen2, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (shake[0], shake[1]))
     screen.blit(pygame.transform.scale(screenT, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (shake[0], shake[1]))
+    editor.draw_ui(screen, pygame.mouse.get_pos())  # full resolution, under the overlay so the cursor stays on top
     screen.blit(pygame.transform.scale(screenUI, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (0, 0))
     pygame.display.update()
     clock.tick(fps)
