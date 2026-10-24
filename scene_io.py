@@ -50,7 +50,8 @@ DEFAULT_ENV = {"gravity": [float(v) for v in EnvConfig.gravity], "friction": flo
                "damping": float(EnvConfig.damping)}  # applied when a preset (which has no env of its own) is loaded
 _KINDS = ((SoftBody, "soft"), (RigidBody, "rigid"), (FixedBody, "fixed"), (Body, "body"))
 _CLASSES = {"soft": SoftBody, "rigid": RigidBody, "fixed": FixedBody, "body": Body}
-BODY_EXTRAS = ("restitution",)  # optional numeric per-body settings, saved / restored when present
+BODY_EXTRAS = ("restitution", "wall_side")  # optional per-body settings (numbers / strings), saved when present
+SIDES = ("left", "right", "top", "bottom")
 
 
 class SceneError(ValueError):
@@ -90,6 +91,8 @@ def _body_dict(b, arr, col, wall=False):
         v = getattr(b, name, None)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             d[name] = float(v)
+        elif isinstance(v, str):
+            d[name] = v
     return d
 
 
@@ -107,6 +110,9 @@ def _world_state(world, index, arr, col):
         st["pending_walls"] = sorted(str(v) for v in world.pending_walls)
     if getattr(world, "bounds", None) is not None:
         st["bounds"] = [float(v) for v in world.bounds]
+    if isinstance(getattr(world, "env", None), dict) and world.env:  # per-world EnvConfig overrides
+        st["env"] = {str(k): (np.asarray(v, dtype=float).tolist() if isinstance(v, (list, tuple, np.ndarray)) else v)
+                     for k, v in world.env.items() if isinstance(v, (int, float, list, tuple, np.ndarray))}
     tv = getattr(world, "terminal_velocity", None)
     if isinstance(tv, (int, float)) and not isinstance(tv, bool) and math.isfinite(tv):
         st["terminal_velocity"] = float(tv)
@@ -216,7 +222,7 @@ def _build_body(d, k, off, moved):
             raise SceneError(f"body {k}: rest shape size differs from its points")
     for name in BODY_EXTRAS:
         if name in d:
-            setattr(b, name, float(d[name]))
+            setattr(b, name, d[name] if isinstance(d[name], str) else float(d[name]))
     return b
 
 
@@ -246,6 +252,19 @@ def build(data, offset=(0.0, 0.0)):
             ropes.append(Rope(ends[0], ends[1], rest_length=float(r["rest_length"]), stiffness=float(r["stiffness"]),
                               col=tuple(r["col"]), width=r["width"]))
         state = dict(data.get("state") or {})
+        if "walls" not in state and "world" in data:  # an older file: tag its world box walls by where they lie
+            sw, sh, si = (float(data["world"][k]) for k in ("width", "height", "inset"))
+            tagged = {}
+            for k, (b, d) in enumerate(zip(bodies, data["bodies"])):
+                if d.get("wall") and b.points.shape[1] == 2:
+                    (x0, x1), (y0, y1) = np.array(_float_array(d["points"], 2))
+                    side = ("left" if abs(x0 - si) < 1e-6 and abs(x1 - si) < 1e-6 else
+                            "right" if abs(x0 - (sw - si)) < 1e-6 and abs(x1 - (sw - si)) < 1e-6 else
+                            "top" if abs(y0 - si) < 1e-6 and abs(y1 - si) < 1e-6 else "bottom")
+                    if side not in tagged:
+                        tagged[side] = {"body": k}
+                        b.wall_side = side
+            state["walls"] = tagged
         if "walls" in state:
             state["walls"] = {side: bodies[int(w["body"])] if "body" in w else _build_body(w["detached"], f"wall {side}", off, False)
                               for side, w in state["walls"].items()}
@@ -279,7 +298,7 @@ def _fit_walls(bodies, data, box):
             b.prev[:] = b.points
 
 
-def state_problems(bodies, box, min_gap=None, limit=5):
+def state_problems(bodies, box, min_gap=None, limit=5, looping=None):
     """Why this state can't start a simulation (empty list if it can): points outside the world box, edges of
     different bodies (or a self-colliding body's non-neighboring edges) crossing, or a point closer than min_gap
     (default EnvConfig.contact_radius, the placement rule) to another body's edge. Pairs of fixed bodies are exempt,
@@ -299,7 +318,13 @@ def state_problems(bodies, box, min_gap=None, limit=5):
     fixed = np.array([b.fixed for b in bodies])
     selfc = np.array([b.self_collide for b in bodies])
     eps = 1e-6
-    out = (P[0] < inset - eps) | (P[0] > w - inset + eps) | (P[1] < inset - eps) | (P[1] > h - inset + eps)
+    # movable points must be inside the box; fixed bodies (e.g. walls running past the corners) may stick out, and
+    # so may anything along a looping axis (bodies pass through the off-screen bands there)
+    lp = looping or {}
+    movable = ~np.repeat(fixed, counts)
+    out_x = ((P[0] < inset - eps) | (P[0] > w - inset + eps)) & (not (lp.get("left") or lp.get("right")))
+    out_y = ((P[1] < inset - eps) | (P[1] > h - inset + eps)) & (not (lp.get("top") or lp.get("bottom")))
+    out = (out_x | out_y) & movable
     if out.any():
         problems.append(f"{int(out.sum())} point(s) outside the world box (body {int(point_body[np.argmax(out)])})")
     r = EnvConfig.contact_radius if min_gap is None else min_gap
@@ -380,7 +405,7 @@ def parse(data, box):
     bodies, ropes, hooks, state = build(data, offset)
     if not same:
         _fit_walls(bodies, data, box)
-    problems = state_problems(bodies, box, load_gap())
+    problems = state_problems(bodies, box, load_gap(), looping=state.get("looping"))
     if problems:
         raise SceneError("; ".join(problems))
     return bodies, ropes, hooks, state
@@ -392,6 +417,16 @@ def install(world, bodies, ropes, hooks, state=None):
     newer files mix gracefully)."""
     world.bodies, world.ropes, world.hooks = list(bodies), list(ropes), list(hooks)
     world.grabbed = None
+    # settings the state doesn't mention go back to a new World's defaults (nothing of the old scene leaks through)
+    if isinstance(getattr(world, "looping", None), dict):
+        world.looping = {k: False for k in world.looping}
+    for key, empty in (("walls", dict), ("pending_walls", set), ("env", dict)):
+        if isinstance(getattr(world, key, None), empty):
+            setattr(world, key, empty())
+    if hasattr(world, "terminal_velocity"):
+        world.terminal_velocity = None
+    if hasattr(world, "last_wraps"):
+        world.last_wraps = []
     for key, value in (state or {}).items():
         if not hasattr(world, key):
             continue
@@ -403,6 +438,8 @@ def install(world, bodies, ropes, hooks, state=None):
             world.bounds = tuple(float(v) for v in value)
         elif key == "walls":
             world.walls = dict(value)
+        elif key == "env":
+            world.env = {k: (np.array(v, dtype=float) if isinstance(v, list) else v) for k, v in value.items()}
         else:
             setattr(world, key, value)
     world._rebuild()
