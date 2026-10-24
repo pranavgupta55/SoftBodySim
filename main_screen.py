@@ -8,6 +8,9 @@ import numpy as np
 from entities import RigidBody, SoftBody, FixedBody, Rope, rect_points, polygon_points
 from solver import World
 from editor import Editor
+from profiler import Profiler
+from perf_hud import PerfHUD
+import ui_style
 
 pygame.init()
 
@@ -125,11 +128,16 @@ world.add(SoftBody(polygon_points(box_cx, box_cy, 20, 12), stiffness=hexagon_sti
                    point_col=Endesga.network_red, stick_col=Endesga.very_light_blue, point_radius=3))
 
 editor = Editor(world, Endesga, screen.get_size(), (world_width, world_height), scaleDownFactor, inset, ViewConfig.zoom)
+profiler = Profiler()  # frame timings for the compute card (sections below; World.step times its own phases)
+world.profiler = profiler
+perf_hud = PerfHUD(profiler)
 
 # ---------------- Main Game Loop
 last_time = time.time()
 running = True
 while running:
+    profiler.frame()
+    profiler.begin("draw")
 
     # ---------------- Reset Variables and Clear screens
     mx, my = pygame.mouse.get_pos()
@@ -146,6 +154,7 @@ while running:
     shake = [0, 0]
     oscillating_random_thing += math.pi / fps * dt
 
+    profiler.switch("events")
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
@@ -170,15 +179,20 @@ while running:
             pass
 
     # ---------------- Updating Screen
+    profiler.switch("physics")
     world.drag_to((wx, wy))
     if not editor.paused:
         world.step(dt / fps)  # dt is in frames here, World wants seconds
+    profiler.switch("draw")
     if ViewConfig.show_grid:
         world.draw_grid(screen2, zoom=ViewConfig.zoom)
     world.draw(screen2, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
     editor.draw_world(screen2, screenT, pygame.mouse.get_pos())
 
+    profiler.switch("ui")
     if toggle:
+        # TODO(merge): top = info_card_rect.bottom + ui_style.CARD_GAP once the info card lands
+        perf_hud.draw(screenUI, ui_style.CARD_MARGIN)
         items = {round(clock.get_fps()): None,
                  "on" if ViewConfig.show_grid else "off": "G grid",
                  "filled" if ViewConfig.filled else "points": "V view",
@@ -191,9 +205,13 @@ while running:
         pygame.mouse.set_visible(False)
         pygame.draw.circle(screenUI, Endesga.black, (mx + 1, my + 1), 2, 1)
         pygame.draw.circle(screenUI, Endesga.white, (mx, my), 2, 1)
+    profiler.switch("present")
     screen.blit(pygame.transform.scale(screen2, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (shake[0], shake[1]))
     screen.blit(pygame.transform.scale(screenT, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (shake[0], shake[1]))
+    profiler.switch("ui")
     editor.draw_ui(screen, pygame.mouse.get_pos())  # full resolution, under the overlay so the cursor stays on top
+    profiler.switch("present")
     screen.blit(pygame.transform.scale(screenUI, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (0, 0))
     pygame.display.update()
+    profiler.switch("idle", device="idle")  # the frame cap's sleep
     clock.tick(fps)

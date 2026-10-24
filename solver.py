@@ -1,9 +1,12 @@
 from collections import defaultdict
+from contextlib import nullcontext
 
 import numpy as np
 import pygame
 
 from entities import EnvConfig
+
+_NO_SECTION = nullcontext()  # stands in for profiler sections when no profiler is attached
 
 
 class World:
@@ -22,6 +25,7 @@ class World:
         self.grabbed = None  # global index of the point being dragged
         self.grab_target = np.zeros(2)
         self.zone_count = 0  # how many substeps needed the rigid impact zone fallback (for debugging)
+        self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
 
     def add(self, body):
         self.bodies.append(body)
@@ -77,22 +81,32 @@ class World:
             step *= EnvConfig.grab_max_step / length
         self.P[:, self.grabbed] += step
 
+    def _section(self, name):
+        """A profiler timing section, or a shared no-op context when no profiler is attached."""
+        return _NO_SECTION if self.profiler is None else self.profiler.section(name)
+
     def step(self, dt):
         dt = min(dt, EnvConfig.max_dt)
         h = dt / EnvConfig.substeps
+        sec = self._section
         for _ in range(EnvConfig.substeps):
-            for b in self.bodies:
-                b.predict(h)
-            self._apply_grab()
-            pts, edge_ids = self._candidates()
-            for _ in range(EnvConfig.iterations):
+            with sec("predict+grab"):
                 for b in self.bodies:
-                    b.solve_constraints()
-                for r in self.ropes:
-                    r.solve_constraints()
-                self._solve_contacts(pts, edge_ids)
+                    b.predict(h)
+                self._apply_grab()
+            with sec("contacts"):
+                pts, edge_ids = self._candidates()
+            for _ in range(EnvConfig.iterations):
+                with sec("constraints"):
+                    for b in self.bodies:
+                        b.solve_constraints()
+                    for r in self.ropes:
+                        r.solve_constraints()
+                with sec("contacts"):
+                    self._solve_contacts(pts, edge_ids)
             self.V[:] = (self.P - self.PREV) / h
-            self._resolve_ccd(h)
+            with sec("ccd"):
+                self._resolve_ccd(h)
             self.P[:] = self.PREV + self.V * h
             self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
 
@@ -326,46 +340,56 @@ class World:
 
     def _resolve_ccd(self, h):
         """Make the straight-line motion PREV -> PREV + V h collision-free by editing V."""
-        V, W, X0, E = self.V, self.W, self.PREV, self.edges
-        push = EnvConfig.ccd_push
-        pairs = self._ccd_pairs(V * h)
+        V, sec = self.V, self._section
+        with sec("broad"):
+            pairs = self._ccd_pairs(V * h)
         for _ in range(EnvConfig.ccd_passes):
-            pts, eids, ts, ss, sides = self._ccd_detect(V * h, pairs)
+            with sec("narrow+impulses"):
+                pts, eids, ts, ss, sides = self._ccd_detect(V * h, pairs)
             if pts.size == 0:
                 # impulses changed the paths, so confirm with a fresh broad phase before declaring the substep clean
-                pairs = self._ccd_pairs(V * h)
-                pts, eids, ts, ss, sides = self._ccd_detect(V * h, pairs)
+                with sec("broad"):
+                    pairs = self._ccd_pairs(V * h)
+                with sec("narrow+impulses"):
+                    pts, eids, ts, ss, sides = self._ccd_detect(V * h, pairs)
                 if pts.size == 0:
                     return
-            # sequential (Gauss-Seidel) impulses, earliest collision first
-            for k in np.argsort(ts):
-                i, ia, ib, t, s = pts[k], E[0, eids[k]], E[1, eids[k]], ts[k], ss[k]
-                # push direction: from the closest point on the edge to the point, at the start of the substep.
-                # Mid-edge that's the edge normal; near a corner it's corner -> point, which both edges meeting
-                # there agree on (per-edge normals would ping-pong the point between them).
-                e0 = X0[:, ib] - X0[:, ia]
-                u = min(max((X0[:, i] - X0[:, ia]) @ e0 / max(e0 @ e0, 1e-12), 0.0), 1.0)
-                sep = X0[:, i] - (X0[:, ia] + u * e0)
-                if np.hypot(*sep) > 1e-9:
-                    n = sep / np.hypot(*sep)
-                else:
-                    e = (X0[:, ib] + t * h * V[:, ib]) - (X0[:, ia] + t * h * V[:, ia])
-                    n = sides[k] * np.array([-e[1], e[0]]) / max(np.hypot(*e), 1e-12)  # points to the start side
-                v_rel = V[:, i] - ((1 - s) * V[:, ia] + s * V[:, ib])
-                # signed gap at the end of the substep, measured at the contact point
-                end_p = X0[:, i] + h * V[:, i]
-                end_c = (1 - s) * (X0[:, ia] + h * V[:, ia]) + s * (X0[:, ib] + h * V[:, ib])
-                dvn = max((push - (end_p - end_c) @ n) / h, -(v_rel @ n), 0.0)
-                denom = W[i] + W[ia] * (1 - s) ** 2 + W[ib] * s ** 2
-                if dvn == 0.0 or denom < 1e-12:
-                    continue
-                j = dvn / denom * n
-                V[:, i] += W[i] * j
-                V[:, ia] -= W[ia] * (1 - s) * j
-                V[:, ib] -= W[ib] * s * j
+            with sec("narrow+impulses"):
+                self._ccd_impulses(pts, eids, ts, ss, sides, h)
 
         self.zone_count += 1
-        self._impact_zones(h)
+        with sec("impact zones"):
+            self._impact_zones(h)
+
+    def _ccd_impulses(self, pts, eids, ts, ss, sides, h):
+        """One pass of sequential (Gauss-Seidel) impulses over detected collisions, earliest first, editing V."""
+        V, W, X0, E = self.V, self.W, self.PREV, self.edges
+        push = EnvConfig.ccd_push
+        for k in np.argsort(ts):
+            i, ia, ib, t, s = pts[k], E[0, eids[k]], E[1, eids[k]], ts[k], ss[k]
+            # push direction: from the closest point on the edge to the point, at the start of the substep.
+            # Mid-edge that's the edge normal; near a corner it's corner -> point, which both edges meeting
+            # there agree on (per-edge normals would ping-pong the point between them).
+            e0 = X0[:, ib] - X0[:, ia]
+            u = min(max((X0[:, i] - X0[:, ia]) @ e0 / max(e0 @ e0, 1e-12), 0.0), 1.0)
+            sep = X0[:, i] - (X0[:, ia] + u * e0)
+            if np.hypot(*sep) > 1e-9:
+                n = sep / np.hypot(*sep)
+            else:
+                e = (X0[:, ib] + t * h * V[:, ib]) - (X0[:, ia] + t * h * V[:, ia])
+                n = sides[k] * np.array([-e[1], e[0]]) / max(np.hypot(*e), 1e-12)  # points to the start side
+            v_rel = V[:, i] - ((1 - s) * V[:, ia] + s * V[:, ib])
+            # signed gap at the end of the substep, measured at the contact point
+            end_p = X0[:, i] + h * V[:, i]
+            end_c = (1 - s) * (X0[:, ia] + h * V[:, ia]) + s * (X0[:, ib] + h * V[:, ib])
+            dvn = max((push - (end_p - end_c) @ n) / h, -(v_rel @ n), 0.0)
+            denom = W[i] + W[ia] * (1 - s) ** 2 + W[ib] * s ** 2
+            if dvn == 0.0 or denom < 1e-12:
+                continue
+            j = dvn / denom * n
+            V[:, i] += W[i] * j
+            V[:, ia] -= W[ia] * (1 - s) * j
+            V[:, ib] -= W[ib] * s * j
 
     def _impact_zones(self, h):
         """Fail-safe: points that keep colliding are merged into zones that move rigidly for this substep.
