@@ -198,9 +198,16 @@ class World:
         d = p - c
         dist = np.hypot(d[0], d[1])
 
-        # outward normal of the edge (depends on the body's loop direction)
-        n_edge = self.edge_sign[edge_ids] * np.array([e[1], -e[0]]) / np.sqrt(len2)
-        inside = np.sum(d * n_edge, axis=0) < 0  # point already crossed to the inner side of the edge
+        # Edge normal facing the side the point started this substep on. CCD guarantees no point ever crosses an
+        # edge, so that's always the free side: outside for neighboring bodies, inside for a body's contents.
+        # (Only a point exactly on the edge's line at the start falls back to the body's outward side.)
+        pa0 = PREV[:, ia]
+        e0 = PREV[:, ib] - pa0
+        q0 = PREV[:, pts] - pa0
+        cross0 = e0[0] * q0[1] - e0[1] * q0[0]
+        side = np.where(cross0 != 0, np.sign(cross0), -self.edge_sign[edge_ids])
+        n_edge = -side * np.array([e[1], -e[0]]) / np.sqrt(len2)
+        inside = np.sum(d * n_edge, axis=0) < 0  # point has moved past the edge's line since the start of the substep
         use_edge_normal = inside | (dist < 1e-9)
         n = np.where(use_edge_normal, n_edge, d / np.maximum(dist, 1e-9))
         depth = r - np.sum(d * n, axis=0)
