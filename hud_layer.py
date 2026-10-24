@@ -1,4 +1,4 @@
-"""Native-resolution layer for the HUD cards (Controls + Compute), shared by main_screen.py and main_opengl.py.
+"""Native-resolution layer for the HUD cards (Controls + Compute), used by main_opengl.py.
 
 The world and the editor's other UI are drawn on surfaces scaled down by scaleDownFactor and upscaled to the screen;
 the two info cards instead go on this layer at native resolution (ui_style.HUD metrics), so their text and chart are
@@ -10,8 +10,7 @@ A frame:
     card = editor.draw_info_card(hud.surface, mouse, hud.rect.topleft); hud.add(card)
     hud.add(perf_hud.draw(hud.surface, card.bottom + ui_style.HUD.CARD_GAP))
     hud.overlay(draw_top)                         # message + cursor over the cards (see overlay)
-then main_screen.py blits hud.surface (rows [0, used)) at hud.rect after the upscaled layers, and main_opengl.py
-uploads those rows to a texture and draws them as a quad on top of its composite.
+then main_opengl.py uploads those rows to a texture and draws them as a quad on top of its composite.
 """
 import pygame
 
@@ -60,7 +59,3 @@ class HudLayer:
             self.surface.blit(pygame.transform.scale(top, (area.w * s, h * s)), (0, 0))
             self._cleared = min(h * s, self.rect.h)  # may reach a little past `used`: clear those rows too
 
-    def blit_to(self, screen):
-        """CPU present (main_screen.py): the used rows onto the native screen."""
-        if self.used:
-            screen.blit(self.surface, self.rect.topleft, (0, 0, self.rect.w, self.used))

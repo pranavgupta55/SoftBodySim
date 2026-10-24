@@ -1,4 +1,4 @@
-"""OpenGL version of main_screen.py: same scene, physics, editor and HUD, presented through moderngl.
+"""The game: scene, physics, editor and HUD, presented through moderngl.
 
 Ported from Framework/mainScreenOpenGL.py: the game still draws into low-res pygame surfaces, which are uploaded to
 GPU textures every frame and drawn with a fullscreen quad. On top of that port, the three layers (world, translucent
@@ -13,7 +13,7 @@ drawn as a blended quad over the composite (shaders/hud.frag), in both modes.
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
-GLSL 330 shaders. Hotkeys match main_screen.py: SPACE HUD, F compute card, G grid, V filled/points view, P pause, ESC quit.
+GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, P pause, ESC quit.
 
 Timing: the compute card's "present" section is split into upload / render / gpu wait / flip. "gpu wait" is a
 GPU-tagged section around ctx.finish(): the time the CPU blocks until the GPU has finished this frame's texture
@@ -40,8 +40,8 @@ import ui_style
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
 FPS = 60
-SCALE_DOWN = 2  # real screen px per render surface px (as in main_screen.py)
-GHOST_ALPHA = 100  # screenT.set_alpha(100) in main_screen.py
+SCALE_DOWN = 2  # real screen px per render surface px
+GHOST_ALPHA = 100  # opacity of the translucent ghost layer (screenT)
 MEASURE_GPU = True  # ctx.finish() before the flip so the compute card can show GPU time
 
 # ---------------- moderngl plumbing
@@ -205,7 +205,7 @@ class GLPresenter:
         ctx.viewport = (0, 0, fb_w, fb_h)
 
 
-# ---------------- The game (main_screen.py's loop, presented through GLPresenter)
+# ---------------- The game loop, presented through GLPresenter
 def main(argv=None, display=None, max_frames=None, on_frame=None):
     """argv: command line (see the module docstring). display / max_frames / on_frame are test hooks: a Display to
     render into instead of opening a window, a frame limit, and a callback(frame_index, locals) after each frame."""
@@ -229,7 +229,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     screenT = pygame.Surface((screen_width, screen_height), pygame.SRCALPHA)  # its alpha (100) is applied on the GPU
     screenUI = pygame.Surface((screen_width, screen_height), pygame.SRCALPHA)
     if args.basic:
-        screenT.set_alpha(GHOST_ALPHA)  # the CPU composite blits it, so it needs main_screen.py's surface alpha
+        screenT.set_alpha(GHOST_ALPHA)  # the CPU composite blits it, so it needs the surface alpha
     timer = 0
     shake = [0, 0]
     oscillating_random_thing = 0

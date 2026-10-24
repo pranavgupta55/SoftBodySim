@@ -1,5 +1,5 @@
 #version 330 core
-// Composites the three low-res pygame layers and upscales them in one pass (replaces main_screen.py's three
+// Composites the three low-res pygame layers and upscales them in one pass (instead of three
 // pygame.transform.scale calls and blits). Works in framebuffer pixels measured from the top-left, like pygame.
 //
 // Upscaling is nearest-neighbour via texelFetch on integer texel coordinates, so every screen pixel copies exactly
@@ -16,7 +16,7 @@ uniform vec2 u_origin;        // top-left corner of the scaled layers, framebuff
 uniform float u_scale;        // framebuffer px per surface px
 uniform vec2 u_shake;         // screen shake offset of the world layers, framebuffer px
 uniform float u_ghost_alpha;  // screenT's surface alpha (set_alpha(100) -> 100 / 255)
-uniform vec3 u_background;    // shown where no layer covers the screen (main_screen.py's screen.fill)
+uniform vec3 u_background;    // shown where no layer covers the screen (the background colour)
 
 vec4 fetch(sampler2D tex, vec2 p) {
     ivec2 c = ivec2(floor(p / u_scale));
