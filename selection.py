@@ -553,8 +553,10 @@ class SelectionTools:
     def _edit_hotkeys(self):
         """The info card's rows while editing (replacing "drag  grab bodies"): what's selected, then the actions."""
         has = bool(self._live_picked())
-        rows = [("click", "select", self._selection_summary(), True),
-                ("drag", "move" if has else "box select", None, True)]
+        if has:
+            rows = [("click", "select", self._selection_summary(), True), ("drag", "move", None, True)]
+        else:  # one row (the card is as tall as before until something is selected)
+            rows = [("click", "select / drag box", None, True)]
         if has or self.clipboard is not None or self.paste is not None:
             n = self._clip_count()
             rows += [("shift", "add / remove", None, True),
