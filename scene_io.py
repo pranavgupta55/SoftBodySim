@@ -212,6 +212,10 @@ def _with_contents(data, world, box):
     """data plus the world's contents; the world's own friction / damping / terminal velocity (World.env) go in
     data["env"] only (a load puts them back into World.env), so a file states each setting once."""
     data.update(capture(world, box))
+    ids = {}  # chain ids numbered 1, 2, ... in order (a load gives them fresh ones anyway): stable save -> load -> save
+    for d in data["bodies"] + data["ropes"]:
+        if "chain_id" in d:
+            d["chain_id"] = ids.setdefault(d["chain_id"], len(ids) + 1)
     own = data.get("state", {}).get("env")
     if own is not None:
         for name in ENV_SCALARS:
