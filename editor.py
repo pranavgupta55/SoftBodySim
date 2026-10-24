@@ -103,12 +103,15 @@ SECTION_SIZE = 8  # its font size
 class CardLayout(NamedTuple):
     """Editor._card_layout(): the Controls card in the sidebar, in real screen px."""
     card: pygame.Rect
-    pause: pygame.Rect  # its [p] / edit / [f] buttons
+    pause: pygame.Rect  # its pause (icon only) / edit / [f] buttons
     plus: pygame.Rect
     compute: pygame.Rect
     action: pygame.Rect  # the action row: Undo / Finish / Redo, or Done while picking objects to go around
     rows: list  # [(kind, y, data)]: ("section", y, title) or ("key", y, (key, label, state, usable))
     worlds: pygame.Rect = None  # its [w] button (world selector), right of [f]; None without a world selector
+    slower: pygame.Rect = None  # the speed row under the buttons: - / the speed / +
+    speed: pygame.Rect = None
+    faster: pygame.Rect = None
 
 
 def max_skip_sets(n):
@@ -367,7 +370,7 @@ class Editor(SelectionTools):
         self.show_compute = not self.show_compute
 
     def toggle_pause(self):
-        """P / the play button. Outside the editor it pauses and resumes. In the editor it resumes (closing it): a
+        """SPACE / the play button. Outside the editor it pauses and resumes. In the editor it resumes (closing it): a
         complete object that wasn't finished yet is spawned first, a half-placed one blocks resuming with a message."""
         if self.active:
             if self.stage == "place" and self.points:
@@ -388,6 +391,16 @@ class Editor(SelectionTools):
         """N steps one physics frame while paused: with the editor closed or on its spawn menu / settings panel, not
         while picking objects or placing points (those are validated against where the bodies are now)."""
         return self.paused and not (self.active and self.stage in ("select", "place"))
+
+    def open_menu(self):
+        """Right click in the world: pause (if running) and open the spawn menu. Ignored while the editor is open,
+        except to swallow the click. Returns True (the click is used)."""
+        if not self.active:
+            if not self.paused:
+                self.paused = True
+                self.world.release()
+            self.open()
+        return True
 
     def open(self):
         self._end_edit()
@@ -1079,7 +1092,7 @@ class Editor(SelectionTools):
         return sorted(rows, key=lambda e: order.index(e[0]))  # stable: rows keep their order within a section
 
     def _card_layout(self):
-        """The Controls card in real screen px (HUD style), as a CardLayout: the card, its [p] / edit / [f] buttons,
+        """The Controls card in real screen px (HUD style), as a CardLayout: the card, its pause / edit / [f] buttons,
         the action row (Undo / Finish / Redo, or Done while picking objects to go around) and the hotkey rows
         [(kind, y, data)]: a heading per section, then its rows."""
         px, pad = HUD.px, HUD.CARD_PAD
@@ -1087,7 +1100,8 @@ class Editor(SelectionTools):
         x, top = self._card_pos if self._card_pos is not None else (self.sidebar.x + HUD.CARD_MARGIN, HUD.CARD_MARGIN)
         w = self.sidebar.right - HUD.CARD_MARGIN - x
         buttons_y = top + pad + px(CARD_TITLE_H)
-        action_y = buttons_y + bh + gap
+        speed_y = buttons_y + bh + gap
+        action_y = speed_y + bh + gap
         y = action_y + bh + pad
         entries, last = [], None
         for title, row in self._key_rows():
@@ -1102,8 +1116,9 @@ class Editor(SelectionTools):
             bw = (w - 2 * pad - 2 * gap) // 3
             widths = [bw, bw]
         else:  # a fourth button ([w], the world selector): each button its content's width plus an equal share
-            labels = ("[p]", "edit", "[f]", "[w]")  # the last one has no icon
-            content = [HUD.font("bold").size(t)[0] + (px(12) if t != "[w]" else 0) for t in labels]  # icon 8 + gap 4
+            # pause: icon only (8); edit / [f]: icon 8 + gap 4 + label; [w]: label only
+            font = HUD.font("bold")
+            content = [px(8), font.size("edit")[0] + px(12), font.size("[f]")[0] + px(12), font.size("[w]")[0]]
             spare = (w - 2 * pad - 3 * gap - sum(content)) // 4
             widths = [c + spare for c in content[:3]]
         pause = pygame.Rect(x + pad, buttons_y, widths[0], bh)
@@ -1114,7 +1129,10 @@ class Editor(SelectionTools):
         if self.world_selector is not None:
             worlds = pygame.Rect(compute.right + gap, buttons_y, rect.right - pad - compute.right - gap, bh)
         action = pygame.Rect(x + pad, action_y, w - 2 * pad, bh)
-        return CardLayout(rect, pause, plus, compute, action, entries, worlds)
+        slower = pygame.Rect(x + pad, speed_y, bh, bh)  # square - / + either side of the speed readout
+        faster = pygame.Rect(rect.right - pad - bh, speed_y, bh, bh)
+        speed = pygame.Rect(slower.right + gap, speed_y, faster.x - gap - slower.right - gap, bh)
+        return CardLayout(rect, pause, plus, compute, action, entries, worlds, slower, speed, faster)
 
     def _placing(self):
         return self.active and self.stage == "place"
@@ -1142,7 +1160,7 @@ class Editor(SelectionTools):
         trails = None if v is None else ("on" if getattr(v, "trails", False) else "off")
         picking = self._row_shown() and not placing  # Enter is Done while picking objects to go around
         enter = ("done", picking and bool(self.selection)) if picking else ("finish", placing and self._complete())
-        return [("Sim", [("P", "pause", "paused" if self.paused else "running", True),
+        return [("Sim", [("SPACE", "pause", "paused" if self.paused else "running", True),
                          ("[ ]", "speed", None if self.time is None else self.time.label(), True),
                          ("N", "step", None, self.can_frame_step()),
                          ("arrows", "gravity", direction_name(compass=True), True)] + self._world_hotkeys()
@@ -1153,7 +1171,8 @@ class Editor(SelectionTools):
                           ("T", "trails", trails, True),
                           ("F", "compute", "full" if self.show_compute else "short", True),
                           ("1-4", "overlays", None if self.overlays is None else self.overlays.state(), True)]),
-                ("Edit", [("Z", "undo", None, placing and bool(self.undo_stack)),
+                ("Edit", [("R-click", "spawn menu", None, not self.active),
+                          ("Z", "undo", None, placing and bool(self.undo_stack)),
                           ("X", "redo", None, placing and bool(self.redo_stack)),
                           ("ENTER", enter[0], None, enter[1]),
                           ("S", "snap", "on" if self.snap else "off", not placing or self.mode in POLYGON_MODES),
@@ -1316,6 +1335,12 @@ class Editor(SelectionTools):
         can_edit = self.paused and not self.active
         ws = [(lay.pause, self.toggle_pause, ("pause",)), (lay.plus, self.open if can_edit else None, ("plus", not can_edit)),
               (lay.compute, self.toggle_compute, ("compute",))]
+        t = self.time
+        ws += [(lay.slower, t.slower if t is not None and t.can_slower() else None,
+                ("step", "-", t is None or not t.can_slower())),
+               (lay.speed, None, ("speed",)),
+               (lay.faster, t.faster if t is not None and t.can_faster() else None,
+                ("step", "+", t is None or not t.can_faster()))]
         ws += self._place_buttons()
         if lay.worlds is not None:
             ws.append((lay.worlds, self.world_selector.toggle, ("worlds",)))
@@ -1407,7 +1432,7 @@ class Editor(SelectionTools):
     def handle_event(self, event):
         """Returns True if the editor used the event (the main loop should then ignore it)."""
         if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_p:
+            if event.key == pygame.K_SPACE:
                 self.toggle_pause()
                 return True
             if event.key == pygame.K_f:
@@ -1447,6 +1472,8 @@ class Editor(SelectionTools):
         pos = self.to_ui(event.pos)
         wp = self.to_world(pos)
         if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 3 and not self.sidebar.collidepoint(event.pos):  # right click: the spawn menu
+                return self.open_menu()
             if event.button != 1:
                 return self.paused
             hit = self._hit(event.pos)
@@ -1803,11 +1830,16 @@ class Editor(SelectionTools):
         elif kind == "button":
             st.draw_button(surface, area, spec[1], hovered, spec[2], spec[3])
         elif kind == "pause":
-            self._icon_button(surface, st, area, hovered, self._draw_pause_icon, "[p]")
+            self._icon_button(surface, st, area, hovered, self._draw_pause_icon, "")  # SPACE: listed in Sim
         elif kind == "plus":
             self._icon_button(surface, st, area, hovered, self._draw_plus_icon, "edit", disabled=spec[1])
         elif kind == "compute":  # selected (lit) while the compute card is shown
             self._icon_button(surface, st, area, hovered, self._draw_chart_icon, "[f]", selected=self.show_compute)
+        elif kind == "step":  # the speed row's - / + (disabled at 1% / 10000%)
+            st.draw_button(surface, area, spec[1], hovered, False, spec[2])
+        elif kind == "speed":  # the physics speed readout between the - / + buttons (no clicks)
+            label = "speed" if self.time is None else f"speed {self.time.label()}"
+            st.text(surface, label, area.center, ui.WHITE, "bold", align="center", valign="middle")
         elif kind == "worlds":  # selected (lit) while the world selector panel is open
             st.draw_button(surface, area, "[w]", hovered, self.world_selector.open)
         elif kind == "kind":
@@ -1820,7 +1852,7 @@ class Editor(SelectionTools):
         """A button with an icon (8 base px wide, drawn by icon(surface, st, cx, cy, col)) and a bold label, centered."""
         st.draw_button(surface, area, None, hovered, selected, disabled)
         col = ui.TEXT_DIM if disabled else ui.WHITE
-        icon_w, gap = st.px(8), st.px(4)
+        icon_w, gap = st.px(8), st.px(4) if label else 0
         x = area.centerx - (icon_w + gap + st.font("bold").size(label)[0]) // 2
         icon(surface, st, x + icon_w // 2, area.centery, col)
         st.text(surface, label, (x + icon_w + gap, area.centery), col, "bold", valign="middle")

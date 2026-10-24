@@ -1,4 +1,4 @@
-"""Slow motion and frame stepping for main_opengl.py (keys [ / ] and N).
+"""Slow motion / fast forward and frame stepping for main_opengl.py (keys [ / ], the Controls card's - / + buttons, N).
 
 The time scale multiplies the physics dt only; rendering, the editor and the profiler keep running at the display
 rate. To keep slow motion smooth and the physics the same, the substep length h stays what it is at 1x: World.step(dt,
@@ -9,13 +9,17 @@ the same way (substeps / max_dt are the world's own: EnvConfig or its env overri
     0.5x    2 substeps of 1/240 s per frame
     1x      4 substeps of 1/240 s per frame   (exactly World.step's defaults)
     2x      8 substeps of 1/240 s per frame   (twice the physics cost per frame)
+    100x    400 substeps of 1/240 s per frame (100 times the cost: the frame rate drops if the machine can't keep up)
+
+Below 1/substeps (0.25x at 4 substeps) the single substep shrinks instead: 0.01x runs 1 substep of 1/6000 s per frame.
 
 Frame stepping (N, while paused) advances one display frame's worth of physics at the current scale: 1/60 s x scale,
 with the same substeps as a running frame, so 0.25x + N steps a single 1/240 s substep at a time.
 """
 from entities import EnvConfig
 
-SCALES = (0.25, 0.5, 1.0, 2.0)
+# 1% .. 10,000% in 1-2-5 steps (plus 25%, the old slowest)
+SCALES = (0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 
 
 class TimeControl:
@@ -34,9 +38,15 @@ class TimeControl:
     def faster(self):
         self.index = min(self.index + 1, len(self.scales) - 1)
 
+    def can_slower(self):
+        return self.index > 0
+
+    def can_faster(self):
+        return self.index < len(self.scales) - 1
+
     def label(self):
-        """The scale as shown on the info card, e.g. "0.25x", "1x"."""
-        return f"{self.scale:g}x"
+        """The scale as a percentage, as shown on the Controls card, e.g. "1%", "25%", "100%", "10000%"."""
+        return f"{self.scale * 100:g}%"
 
     def request_step(self):
         self.pending += 1
