@@ -12,7 +12,8 @@ drawn last with the HUD shader and uploaded only when it changes.
 
     python3 main_opengl.py                      fullscreen, GPU compositing
     python3 main_opengl.py --window 1280x800    windowed
-    python3 main_opengl.py --scene diamonds     start in a preset world (scene.PRESETS; W switches)
+    python3 main_opengl.py --scene diamonds     start in a preset world (scene.PRESETS; W switches worlds),
+    python3 main_opengl.py --scene "newtons cradle"    e.g. this one (quote names with spaces)
     python3 main_opengl.py --basic              the Framework pipeline as-is: layers composited on the CPU into one
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
 
@@ -356,6 +357,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     frame_index = 0
     while running:
         profiler.frame()
+        world, editor = session.world, session.editor  # the active world (anything may have switched / replaced it)
         profiler.begin("draw")
 
         # ---------------- Reset Variables and Clear screens

@@ -40,7 +40,7 @@ PAD = 8
 HEADER_H = 30
 ROW_H = 18
 ROW_GAP = 3
-NAME_W = 132
+NAME_W = 160
 TOGGLE_W = 18
 RESET_W = 46
 COL_GAP = 8
@@ -204,6 +204,22 @@ class WorldSession:
         self._attach(slot)
         self.confirm_until = 0.0
 
+    def replace_world(self, world, env=None):
+        """Put a loaded world (e.g. a scene file opened with Ctrl/Cmd+O) into the active slot, opened paused with a
+        fresh editor; env: its GLOBAL_ENV values (default: keep the current ones). The slot keeps its name, and its
+        Reset still rebuilds it from its builder. The main loop must rebind world / editor afterwards."""
+        slot = self.slot
+        old_editor = slot.editor
+        self._detach(slot)
+        slot.world = world
+        slot.editor = self.make_editor(world)
+        self._share_ui(slot.editor)
+        self._carry_ui(old_editor, slot.editor)
+        slot.editor.paused = True
+        if env is not None:
+            slot.env = {name: np.array(value, copy=True) for name, value in env.items()}
+        self._attach(slot)
+
     def toggle_looping(self, index, side):
         """Flip a world's looping on one side (building the world first if it's new)."""
         slot = self.slots[index]
@@ -338,6 +354,10 @@ class WorldSession:
         slot = self.slots[i]
         active = i == self.active
         ui.draw_button(surface, rect, None, hovered, active, False)
-        ui.text(surface, slot.name, (rect.x + 5, rect.centery), ui.WHITE, "bold", valign="middle")
         state = "new" if not slot.built else "paused" if slot.editor.paused else "running"
+        room = rect.w - 15 - ui.font().size(state)[0]
+        name = slot.name
+        while len(name) > 1 and ui.font("bold").size(name)[0] > room:  # cut long names to fit before the state
+            name = name.rstrip(".")[:-1].rstrip() + ".."
+        ui.text(surface, name, (rect.x + 5, rect.centery), ui.WHITE, "bold", valign="middle")
         ui.text(surface, state, (rect.right - 5, rect.centery), ui.WHITE if active else ui.TEXT_DIM, align="right", valign="middle")
