@@ -38,6 +38,7 @@ class SceneMenus:
 
     def open_save(self):
         self.ed.world.release()
+        self.ed.message = None  # an earlier message would cover the dialog's name field
         self.pending = scene_io.scene_data(self.ed.world, self.box(), self.ed.view)
         self.name, self.state = scene_io.auto_name(self.folder), "save"
 
@@ -47,6 +48,7 @@ class SceneMenus:
             ed._say("finish or undo the new object first")
             return
         ed.world.release()
+        ed.message = None  # an earlier message would cover the list
         self.scroll, self.state = 0, "load"
 
     def cancel(self):
