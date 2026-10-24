@@ -8,6 +8,7 @@ import numpy as np
 from entities import RigidBody, SoftBody, FixedBody, Rope, rect_points, polygon_points
 from solver import World
 from editor import Editor
+import ui_style
 
 pygame.init()
 
@@ -124,7 +125,9 @@ world.add(RigidBody(rect_points(box_cx, box_cy, 90, 70), point_col=Endesga.light
 world.add(SoftBody(polygon_points(box_cx, box_cy, 20, 12), stiffness=hexagon_stiffness, skip_sets=2,
                    point_col=Endesga.network_red, stick_col=Endesga.very_light_blue, point_radius=3))
 
-editor = Editor(world, Endesga, screen.get_size(), (world_width, world_height), scaleDownFactor, inset, ViewConfig.zoom)
+# The editor's UI lives on screenUI; it reads the G / V states from ViewConfig for the info card
+editor = Editor(world, Endesga, (screen_width, screen_height), (world_width, world_height), scaleDownFactor, inset,
+                ViewConfig.zoom, view=ViewConfig)
 
 # ---------------- Main Game Loop
 last_time = time.time()
@@ -146,10 +149,11 @@ while running:
     shake = [0, 0]
     oscillating_random_thing += math.pi / fps * dt
 
+    editor.show_card = toggle  # the info card (and its buttons) only exists while the HUD is shown
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
-        if editor.handle_event(event):  # pause button, editor panels and placement come first
+        if editor.handle_event(event):  # info card buttons, editor panels and placement come first
             continue
         if event.type == pygame.MOUSEBUTTONDOWN:
             click = True
@@ -162,6 +166,7 @@ while running:
                 running = False
             if event.key == pygame.K_SPACE:
                 toggle = not toggle
+                editor.show_card = toggle
             if event.key == pygame.K_g:
                 ViewConfig.show_grid = not ViewConfig.show_grid
             if event.key == pygame.K_v:
@@ -176,24 +181,19 @@ while running:
     if ViewConfig.show_grid:
         world.draw_grid(screen2, zoom=ViewConfig.zoom)
     world.draw(screen2, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
-    editor.draw_world(screen2, screenT, pygame.mouse.get_pos())
+    editor.draw_world(screen2, screenT, (mx, my))
+    editor.draw_ui(screenUI, (mx, my))  # panels, buttons and hints, under the HUD cards
 
     if toggle:
-        items = {round(clock.get_fps()): None,
-                 "on" if ViewConfig.show_grid else "off": "G grid",
-                 "filled" if ViewConfig.filled else "points": "V view",
-                 }
-        for i, label in enumerate(items.keys()):
-            string = str(label)
-            if items[label] is not None:
-                string = f"{items[label]}: " + string
-            drawText(screenUI, Endesga.debug_red, montserratRegularAdaptive, 5, screen_height - (30 + 25 * i) / (scaleDownFactor ** (1 / 1.8)), string, Endesga.black, int(3 / scaleDownFactor) + int(3 / scaleDownFactor) < 1, antiAliasing=False)
+        info_card = editor.draw_info_card(screenUI, (mx, my))  # first card of the top-right column
+        # the next card goes at info_card.bottom + ui_style.CARD_GAP
+    editor.draw_message(screenUI)  # over the cards
+    if toggle:
         pygame.mouse.set_visible(False)
         pygame.draw.circle(screenUI, Endesga.black, (mx + 1, my + 1), 2, 1)
         pygame.draw.circle(screenUI, Endesga.white, (mx, my), 2, 1)
     screen.blit(pygame.transform.scale(screen2, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (shake[0], shake[1]))
     screen.blit(pygame.transform.scale(screenT, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (shake[0], shake[1]))
-    editor.draw_ui(screen, pygame.mouse.get_pos())  # full resolution, under the overlay so the cursor stays on top
     screen.blit(pygame.transform.scale(screenUI, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (0, 0))
     pygame.display.update()
     clock.tick(fps)
