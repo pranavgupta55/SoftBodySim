@@ -244,6 +244,10 @@ class Editor:
         self.slider_drag = False
         self.message, self.message_until = None, 0.0
         self.show_compute = True  # F / the card's [f] button: the Compute card in full (else its one-line summary)
+        # set by the main loop, for the Controls card's states: debug_overlay.DebugOverlays (keys 1-4) and
+        # timectl.TimeControl ([ / ] speed, N frame step); None leaves those rows without a state
+        self.overlays = None
+        self.time = None
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
         # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
@@ -368,6 +372,11 @@ class Editor:
             self.paused = not self.paused
             if self.paused:
                 self.world.release()
+
+    def can_frame_step(self):
+        """N steps one physics frame while paused: with the editor closed or on its spawn menu / settings panel, not
+        while picking objects or placing points (those are validated against where the bodies are now)."""
+        return self.paused and not (self.active and self.stage in ("select", "place"))
 
     def open(self):
         self.active, self.stage = True, "menu"
@@ -1076,13 +1085,16 @@ class Editor:
         picking = self._row_shown() and not placing  # Enter is Done while picking objects to go around
         enter = ("done", picking and bool(self.selection)) if picking else ("finish", placing and self._complete())
         return [("Sim", [("P", "pause", "paused" if self.paused else "running", True),
+                         ("[ ]", "speed", None if self.time is None else self.time.label(), True),
+                         ("N", "step", None, self.can_frame_step()),
                          ("KP1-9", "gravity", direction_name(compass=True), True),
                          ("drag", "grab bodies", None, not self.paused),
                          ("ESC", "back" if self.active else "quit", None, True)]),
                 ("View", [("G", "grid", grid, True),
                           ("V", "view", look, True),
                           ("T", "trails", trails, True),
-                          ("F", "compute", "full" if self.show_compute else "summary", True)]),
+                          ("F", "compute", "full" if self.show_compute else "summary", True),
+                          ("1-4", "overlays", None if self.overlays is None else self.overlays.state(), True)]),
                 ("Edit", [("Z", "undo", None, placing and bool(self.undo_stack)),
                           ("X", "redo", None, placing and bool(self.redo_stack)),
                           ("ENTER", enter[0], None, enter[1]),
