@@ -90,11 +90,50 @@ class World:
             self.P[:] = self.PREV + self.V * h
             self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
 
-    def draw(self, surface):
+    def draw(self, surface, filled=False):
+        """Bodies in the order they were added (later ones on top). filled: solid polygons instead of points + springs."""
         for b in self.bodies:
-            b.draw(surface)
+            if filled:
+                b.draw_filled(surface)
+            else:
+                b.draw(surface)
         if self.grabbed is not None:
             pygame.draw.line(surface, (255, 255, 255), self.P[:, self.grabbed], self.grab_target, 1)
+
+    def draw_grid(self, surface, line_col=(52, 58, 76), edge_cell_col=(37, 42, 55), point_cell_col=(45, 51, 68)):
+        """Debug view of the broad phase grid: cell (i, j) covers [i, i + 1) * cell_size, same as the solver's floor().
+
+        Cells an edge is registered in (its AABB padded like _candidates does) get edge_cell_col,
+        cells holding a point get point_cell_col (drawn over), then the grid lines on top.
+        """
+        cell = EnvConfig.cell_size
+        w, h = surface.get_size()
+        cols, rows = int(np.ceil(w / cell)), int(np.ceil(h / cell))
+        if self.bodies:
+            pad = 2 * EnvConfig.contact_radius
+            a, b = self.P[:, self.edges[0]], self.P[:, self.edges[1]]
+            lo = np.clip(np.floor((np.minimum(a, b) - pad) / cell).astype(int), 0, [[cols], [rows]])
+            hi = np.clip(np.floor((np.maximum(a, b) + pad) / cell).astype(int), -1, [[cols - 1], [rows - 1]])
+            span = np.maximum(hi - lo + 1, 0)  # visible cells per axis per edge (0 if fully off screen)
+            counts = span[0] * span[1]
+            # expand every edge into its covered cells without a Python loop
+            e = np.repeat(np.arange(counts.size), counts)
+            k = np.arange(counts.sum()) - np.repeat(np.cumsum(counts) - counts, counts)
+            occupied = np.zeros((cols, rows), dtype=np.int8)
+            occupied[lo[0, e] + k % span[0, e], lo[1, e] + k // span[0, e]] = 1
+            pc = np.floor(self.P / cell).astype(int)
+            on = (pc[0] >= 0) & (pc[0] < cols) & (pc[1] >= 0) & (pc[1] < rows)
+            occupied[pc[0, on], pc[1, on]] = 2
+            for (i, j), kind in zip(np.argwhere(occupied).tolist(), occupied[occupied > 0].tolist()):
+                x0, y0 = int(np.floor(i * cell)), int(np.floor(j * cell))
+                rect = (x0, y0, int(np.floor((i + 1) * cell)) - x0, int(np.floor((j + 1) * cell)) - y0)
+                surface.fill(point_cell_col if kind == 2 else edge_cell_col, rect)
+        for i in range(1, cols):
+            x = int(np.floor(i * cell))
+            pygame.draw.line(surface, line_col, (x, 0), (x, h - 1))
+        for j in range(1, rows):
+            y = int(np.floor(j * cell))
+            pygame.draw.line(surface, line_col, (0, y), (w - 1, y))
 
     # ---------------- Broad phase: spatial hash grid
     def _edge_grid(self, pad):

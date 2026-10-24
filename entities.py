@@ -40,7 +40,8 @@ class Body:
     fixed = False
     self_collide = False  # whether a point can hit this body's own non-neighboring edges
 
-    def __init__(self, points=None, vels=None, mass=1.0, point_col=None, stick_col=None, point_radius=2, stick_width=1):
+    def __init__(self, points=None, vels=None, mass=1.0, point_col=None, stick_col=None, point_radius=2, stick_width=1,
+                 fill_col=None):
         # shape (2, n): row 0 = x, row 1 = y, one column per point
         # NOTE: World rebinds these arrays to views of its own big arrays, so only ever modify them in place
         self.points = np.empty((2, 0), dtype=float) if points is None else np.array(points, dtype=float)
@@ -50,6 +51,7 @@ class Body:
         self.inv_mass = np.full(n, 1.0 / mass)
         self.point_col = DEFAULT_COL if point_col is None else point_col
         self.stick_col = DEFAULT_COL if stick_col is None else stick_col
+        self.fill_col = self.point_col if fill_col is None else fill_col  # used by the filled shape view
         self.point_radius = point_radius
         self.stick_width = stick_width
 
@@ -77,6 +79,26 @@ class Body:
             pygame.draw.line(surface, self.stick_col, self.points[:, i], self.points[:, j], self.stick_width)
         for pos in self.points.T:
             pygame.draw.circle(surface, self.point_col, pos, self.point_radius)
+
+    def draw_filled(self, surface, border_col=(0, 0, 0), border_width=2):
+        """Filled view: the perimeter loop as a solid polygon with a border, no points or springs."""
+        if self.edges.shape[1] < 3:  # not a closed polygon (e.g. a rope), nothing to fill
+            self.draw(surface)
+            return
+        loop = np.round(self.points[:, self.edges[0]]).astype(int)  # perimeter in loop order, whole pixels
+        pygame.draw.polygon(surface, self.fill_col, loop.T.tolist())
+        # Border: the 1px outline of the perimeter plus copies shifted 1px at a time outward along each edge's minor
+        # axis. pygame's own thick lines grow to one side only, and its fill spills up to 1px past the outline on
+        # some edges, so a stroke on (and just outside) the outline is what fully covers the fill's rim.
+        d = np.roll(loop, -1, axis=1) - loop
+        steep = np.abs(d[1]) >= np.abs(d[0])
+        outward = self.winding * np.array([d[1], -d[0]])  # interior is left of each edge for positive shoelace area
+        shift = np.where(steep, [np.sign(outward[0]), np.zeros_like(d[0])], [np.zeros_like(d[0]), np.sign(outward[1])])
+        a, b = loop.T.tolist(), np.roll(loop, -1, axis=1).T.tolist()
+        for k in range(border_width):
+            offs = (shift * k).T.tolist()
+            for (ax, ay), (bx, by), (sx, sy) in zip(a, b, offs):
+                pygame.draw.line(surface, border_col, (ax + sx, ay + sy), (bx + sx, by + sy))
 
 
 class FixedBody(Body):
