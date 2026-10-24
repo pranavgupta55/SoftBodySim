@@ -48,7 +48,11 @@ slower than a P-core, so only ratios within one table are meaningful. "P" rows a
      | diamonds | 0.73x | 0.98x |
      | 60-body 900 px/s impact | 0.62x | 0.90x |
 
-   - Overlaps, from the brute-force checker: **0** in every run. Impact-zone fallbacks: 0.
+   - Overlaps, from the brute-force checker: **0** in every run, including whip drags.
+   - Impact-zone fallbacks:
+     - 0 in all non-drag scenes;
+     - demo whip 81 (stock) -> 0;
+     - pile whip at 16x1: 1 -> 14, most likely the substep-coupled grab (F7); this needs a fix before 16x1 ships.
    - CCD-edited points per frame fell 2-8x, because PBD gets the whole frame to resolve contacts before anything is
      checked.
    - Accuracy at 16x1 vs stock 4x4: chain stretch 1.0% -> 0.3%, pendulum energy kept over 4 s 90.5% -> 97.3%,
@@ -265,9 +269,22 @@ These change behaviour when S changes, so they need per-second forms before any 
 - Rigid `stiffness` < 1 and SoftBody `stiffness` are per pass (F2).
 
 Whip-drag stress (grab a random point every 45 frames and whip it on a 180 px circle at 2 Hz; brute-force check every
-frame): see the table below, filled in from `stress3.jsonl`.
+frame), 400 frames. Zone counts are per CCD call: one per substep for stock, one per frame for frame-level CCD, so a
+frame-level zone freezes 4x more motion.
 
-WHIP_TABLE
+| scene | stock 4x4 | frame-level 8x1 | frame-level 16x1 |
+|---|---|---|---|
+| demo whip: overlaps / zone calls / CCD-edited pts per frame / rel. cost | 0 / **81** / 5.5 / 1 | 0 / **0** / 2.2 / 0.52 | 0 / **0** / 2.3 / 0.80 |
+| 60-body pile whip: overlaps / zone calls / CCD-edited pts per frame / rel. cost | 0 / 1 / 8.1 / 1 | 0 / 1 / 6.4 / 0.83 | 0 / **14** / 7.2 / 1.07 |
+
+- Zero overlaps in every whip run.
+- On the demo, frame-level CCD removes all 81 zone fallbacks: PBD gets the whole frame to undo the hand's
+  proposal. Research 10 saw the same 47 -> 0 effect from 8x2 / 16x1.
+- **Pile whip at 16x1 is the one regression: 14 frame-level zone fallbacks.** The likely cause is F7's
+  substep-coupled grab. At 16 substeps the hand pulls ~4x harder (the pile moved at 254 vs 104 px/s mean), and it
+  crushes bodies into the GS ping-pong of 02 F4.
+  - This was not separated out within budget. The fix order: per-second grab parameters first, then 02's projection
+  fallback or an adaptive `ccd_stride` (redo the frame with per-substep CCD when the frame CCD needs a zone).
 
 ## Applicability to this codebase
 
@@ -375,7 +392,8 @@ Ranked. Each item is independent enough for its own worktree. All are gated by r
    - Success: research 10 F8 metrics at 16x1 levels (pendulum ≤ 1%/period, chain m100 drop ≤ 2 px, 0 zone
      fallbacks) at ≤ 1.0x of main's cost.
    - Expected: F3 accuracy at today's cost (16x1) or half today's cost (8x1).
-   - Risk: low once 1 + 2 are in. Effort: XS plus a tuning pass.
+   - Risk: low for 8x1. For 16x1 it is medium until the pile-whip zone regression (F7) is fixed by per-second grab
+     parameters plus an adaptive `ccd_stride` or 02's projection fallback. Effort: XS plus a tuning pass.
 4. **GPU: all substeps in one command buffer (with research 04).**
    - Change: `GpuBackend.pbd_substep` -> `pbd_frame`: predict + I iterations x S on the GPU, one `mx.eval`; frame
      CCD on CPU float64. Needs per-body float32 origins (04 F6).
