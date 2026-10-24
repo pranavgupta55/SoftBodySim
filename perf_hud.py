@@ -2,7 +2,7 @@
 
 A card in the right-hand sidebar (hud_layer.py: it implements the sidebar's card-provider methods), drawn at native
 resolution with ui_style.HUD metrics (every length below is in base px, times HUD.scale). F (or the Controls card's
-[f] button) collapses it to a one-line summary (title, newest frame time, fps), as does the sidebar when its cards
+[f] button) collapses it to a short summary (title and fps, then the frame times), as does the sidebar when its cards
 don't fit otherwise. Timings come from a profiler.Profiler; see
 that module for the timing and GPU-reporting API.
 
@@ -48,10 +48,10 @@ def ms(v, unit=True):
 
 
 def card_height(summary=False):
-    """The card's height in native px at the current HUD scale: the full card, or the one-line summary."""
+    """The card's height in native px at the current HUD scale: the full card, or the summary (its first two rows)."""
     px, pad, line = H.px, H.CARD_PAD, H.font().get_linesize()
     if summary:
-        return pad + line + pad - px(2)
+        return pad + line + px(1) + line + pad - px(2)
     small_line = H.font(size=px(SMALL)).get_linesize()
     return pad + line + px(1) + line + 3 * line + px(3) + small_line + px(GRAPH_H) + px(1) + small_line + pad - px(2)
 
@@ -101,8 +101,8 @@ class PerfHUD:
 
     # ---------------- card
     def draw(self, surface, rect, summary=False):
-        """Draw the card at `rect` (its height: card_height(summary)) on `surface`; summary: just the title row with
-        the newest frame time and fps. Sizes follow ui_style.HUD (native-resolution px). Returns the rect."""
+        """Draw the card at `rect` (its height: card_height(summary)) on `surface`; summary: just the title row (fps)
+        and the frame times. Sizes follow ui_style.HUD (native-resolution px). Returns the rect."""
         prof, px = self.prof, H.px
         st = prof.stats()
         small = px(SMALL)
@@ -117,19 +117,18 @@ class PerfHUD:
 
         # title + fps
         self._text(surface, "Compute", (x0, y), style="bold", size=H.TITLE_SIZE)
-        fps = self._text(surface, f"{st['fps']:.0f} fps", (x1, y), color=ui.ACCENT, style="bold", size=H.TITLE_SIZE, align="right")
-        last = prof.last.wall * 1e3 if prof.last else 0.0
-        if summary:  # the newest frame time beside the fps (the title font is a little taller: nudged to its baseline)
-            self._text(surface, ms(last), (fps.left - px(4), y + px(1)), color=ui.TEXT_DIM, align="right")
-            return rect
+        self._text(surface, f"{st['fps']:.0f} fps", (x1, y), color=ui.ACCENT, style="bold", size=H.TITLE_SIZE, align="right")
         y += line + px(1)
 
         # time between frames: newest frame, then the window's mean and worst
+        last = prof.last.wall * 1e3 if prof.last else 0.0
         self._text(surface, ms(last), (x0, y))
         worst = st["frame_max"] * 1e3
         avg, worst = ms(st["frame"] * 1e3, False), (f"{worst:.0f}" if worst < 999.5 else ms(worst, False))
         self._text(surface, f"avg {avg}  max {worst}", (x1, y), color=ui.TEXT_DIM, align="right")
         y += line
+        if summary:
+            return rect
 
         # CPU / GPU / idle per frame (3 s means)
         frame = st["frame"] or 1.0
@@ -142,7 +141,8 @@ class PerfHUD:
                 self._text(surface, "no GPU backend", (x1, y), color=ui.TEXT_DIM, align="right")
             else:
                 self._text(surface, f"{st[key] / frame * 100:.0f}%", (x1, y), color=ui.TEXT_DIM, align="right")
-                self._text(surface, ms(st[key] * 1e3), (x1 - px(30), y), align="right")  # room for "100%"
+                pct_w = H.font().size("100%")[0] + px(4)  # room for "100%" and a gap
+                self._text(surface, ms(st[key] * 1e3), (x1 - pct_w, y), align="right")
             y += line
         y += px(3)
 

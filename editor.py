@@ -243,7 +243,7 @@ class Editor:
         self.reg_start = None  # press position while dragging out a regular polygon
         self.slider_drag = False
         self.message, self.message_until = None, 0.0
-        self.show_compute = True  # F / the card's [f] button: the Compute card in full (else its one-line summary)
+        self.show_compute = True  # F / the card's [f] button: the Compute card in full (else its short summary)
         # set by the main loop, for the Controls card's states: debug_overlay.DebugOverlays (keys 1-4) and
         # timectl.TimeControl ([ / ] speed, N frame step); None leaves those rows without a state
         self.overlays = None
@@ -1093,7 +1093,7 @@ class Editor:
                 ("View", [("G", "grid", grid, True),
                           ("V", "view", look, True),
                           ("T", "trails", trails, True),
-                          ("F", "compute", "full" if self.show_compute else "summary", True),
+                          ("F", "compute", "full" if self.show_compute else "short", True),
                           ("1-4", "overlays", None if self.overlays is None else self.overlays.state(), True)]),
                 ("Edit", [("Z", "undo", None, placing and bool(self.undo_stack)),
                           ("X", "redo", None, placing and bool(self.redo_stack)),

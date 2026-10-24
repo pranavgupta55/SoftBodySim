@@ -63,7 +63,7 @@ class HudLayer:
     def _scales(self, lo):
         """Candidate HUD scales, largest first: the width's scale, then each 1 px smaller text size down to `lo`."""
         top = min(self.rect.w / (ui.CARD_WIDTH_BASE + 8), ui.HUD_MAX_SCALE)
-        out = [top] + [n / 11 for n in range(int(11 * top), 0, -1) if lo - 1e-9 <= n / 11 < top]
+        out = [top] + [n / 11 for n in range(int(11 * top), 0, -1) if lo - 1e-9 <= n / 11 < top] + ([lo] if lo < top else [])
         return out if top >= lo else [lo]
 
     def fit(self):
