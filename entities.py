@@ -163,3 +163,55 @@ class SoftBody(Body):
             np.add.at(acc[k], i, wi * corr[k])
             np.add.at(acc[k], j, -wj * corr[k])
         self.points += acc / self.spring_count  # Jacobi: average the corrections hitting each point
+
+
+class Rope:
+    """A tension-only spring between two ends: pulls them together when stretched past rest_length, never pushes.
+
+    Each end is either (body, point_index) to attach to a body's point, or (x, y) for a fixed world anchor.
+    It's a constraint, not a body: it has no points of its own and doesn't collide with anything.
+    rest_length defaults to the starting distance between the ends. stiffness is the fraction of the stretch
+    removed per solver pass (1.0 = inextensible).
+    """
+
+    def __init__(self, end_a, end_b, rest_length=None, stiffness=1.0, col=None, width=1):
+        self.ends = [self._parse_end(end_a), self._parse_end(end_b)]
+        self.stiffness = stiffness
+        self.col = DEFAULT_COL if col is None else col
+        self.width = width
+        self.rest_length = float(np.hypot(*(self.end_pos(1) - self.end_pos(0)))) if rest_length is None else float(rest_length)
+
+    @staticmethod
+    def _parse_end(end):
+        if isinstance(end[0], Body):
+            body, idx = end
+            return body, int(idx)
+        return None, np.array(end, dtype=float)  # fixed world anchor
+
+    def end_pos(self, k):
+        body, ref = self.ends[k]
+        # read body.points at call time: World rebinds it to a view of its shared array
+        return body.points[:, ref].copy() if body is not None else ref.copy()
+
+    def end_inv_mass(self, k):
+        body, ref = self.ends[k]
+        return float(body.inv_mass[ref]) if body is not None else 0.0
+
+    def length(self):
+        return float(np.hypot(*(self.end_pos(1) - self.end_pos(0))))
+
+    def solve_constraints(self):
+        pa, pb = self.end_pos(0), self.end_pos(1)
+        wa, wb = self.end_inv_mass(0), self.end_inv_mass(1)
+        d = pb - pa
+        dist = float(np.hypot(*d))
+        if dist <= self.rest_length or dist < 1e-9 or wa + wb <= 0:
+            return  # slack (or nothing can move): no force at all
+        corr = self.stiffness * (dist - self.rest_length) / (dist * (wa + wb)) * d
+        for k, w, sign in ((0, wa, 1.0), (1, wb, -1.0)):
+            body, ref = self.ends[k]
+            if body is not None and w > 0:
+                body.points[:, ref] += sign * w * corr  # in place, so the World's shared array sees it
+
+    def draw(self, surface):
+        pygame.draw.line(surface, self.col, self.end_pos(0), self.end_pos(1), self.width)
