@@ -42,6 +42,10 @@ CHAIN_MAX = 50  # chain segments (ropes + boxes)
 # the click (a rope needs something to hold its end; the box is that weight). So the setting also decides what the end
 # piece is (END_PIECE), which is why it replaced the old Rope-rope / Rope-box / Box-box choice. Clicking a free end on a
 # body point or hook still attaches it: its box gets one more rope, tied there (see Editor._chain_spec).
+# Ropes have the same per-end setting. A rope is massless (a constraint with no points of its own), so a free end left
+# in free space gets a "bead": a chain box (Chain.BOX_SIZE) centred at the click, the rope tied to its near side. A
+# rope with beads is built as a Chain of that one rope and its beads (the boxes carry bead = True, see
+# Editor._make_line); a free end clicked on a body point or hook attaches there, like a fixed one.
 END_OPTIONS = ("fixed", "free")
 END_PIECE = {"fixed": "rope", "free": "box"}
 END_LABELS = ("1st end", "2nd end")
@@ -219,7 +223,8 @@ class Editor(SelectionTools):
         self.settings = {"soft": {"n": 6, "sets": 1, "strength": 0.1, "color": "network_green"},  # the hexagon
                          "rigid": {"n": 4, "color": "debug_red"},  # the square
                          "fixed": {"n": 4, "color": "grey"},
-                         "rope": {"n": 2, "stiffness": 1.0, "width": 1, "color": "light_brown"},  # like the demo ropes
+                         "rope": {"n": 2, "stiffness": 1.0, "width": 1, "color": "light_brown",  # like the demo ropes
+                                  "start": "fixed", "end": "fixed"},  # each end fixed or free (END_OPTIONS)
                          "hook": {"n": 1},  # one hook per Finish, like the other kinds; no settings panel
                          # two ends to place, each fixed or free (END_OPTIONS); segments = ropes + boxes, odd when
                          # both ends are alike (see chain_range)
@@ -447,14 +452,11 @@ class Editor(SelectionTools):
             return
         col = self._color(cfg["color"])
         if self.kind == "rope":  # rest length = the ends' current distance, so it starts exactly taut
-            ends = [snap if snap is not None else tuple(p) for p, snap in zip(self.points, self.snaps)]
-            self.world.add_rope(Rope(ends[0], ends[1], stiffness=cfg["stiffness"], col=col, width=cfg["width"]))
+            line = self._make_line(self.points, self.snaps, cfg, col, col, cfg["stiffness"], cfg["width"])
+            self.world.add_chain(line) if isinstance(line, Chain) else self.world.add_rope(line)
             return
         if self.kind == "chain":  # boxes and ropes laid out between the ends; every rope starts exactly taut
-            ends = [snap if snap is not None else tuple(p) for p, snap in zip(self.points, self.snaps)]
-            segments, start, end = self._chain_spec(self.snaps)
-            self.world.add_chain(Chain(ends[0], ends[1], segments, start, end, box_col=col,
-                                       rope_col=self._color(cfg["rope_color"])))
+            self.world.add_chain(self._make_line(self.points, self.snaps, cfg, col, self._color(cfg["rope_color"])))
             return
         pts = np.array(self._shape_points(), dtype=float).T
         style = dict(point_col=col, stick_col=col, fill_col=col)
@@ -558,13 +560,14 @@ class Editor(SelectionTools):
             return self._parents()[self.selection[0]], frozenset(self._with_contents(self.selection))
         return None, frozenset()
 
-    def _region_ok(self, new):
+    def _region_ok(self, new, skip=()):
         """Are all the points (2, k) in the new object's region: inside its container and that one's containers, and
-        inside no other body (a sibling, or anything else)? With no container that's simply "inside no body"."""
+        inside no other body (a sibling, or anything else)? With no container that's simply "inside no body". The
+        bodies in `skip` (an object's own pieces while it's rebuilt) don't count."""
         must = set(self._ancestors(self._target()[0]))
         lo, hi = new.min(axis=1), new.max(axis=1)
         for c in self.world.bodies:
-            if not closed(c):
+            if not closed(c) or any(c is x for x in skip):
                 continue
             if c not in must and ((c.points.max(axis=1) < lo).any() or (c.points.min(axis=1) > hi).any()):
                 continue  # bounding boxes apart: no point can be inside
@@ -679,11 +682,13 @@ class Editor(SelectionTools):
             return not complete  # "around" needs a closed polygon
         return True
 
-    def _valid_rope(self, pts, snaps):
-        """Rope ends: inside the world box, a free anchor not inside a body (attach to its point instead), and the
-        two ends not the same point. Ropes don't collide, so the line itself may cross bodies."""
+    def _valid_rope(self, pts, snaps, skip=()):
+        """Rope ends: inside the world box, a free anchor not inside a body (attach to its point instead; the bodies
+        in `skip` don't count), and the two ends not the same point. Ropes don't collide, so the line itself may
+        cross bodies."""
         lo, hi_x, hi_y = self.inset, self.world_w - self.inset, self.world_h - self.inset
-        polygons = [body.points for body in self.world.bodies if body.edges.shape[1] >= 3]
+        polygons = [body.points for body in self.world.bodies
+                    if body.edges.shape[1] >= 3 and not any(body is x for x in skip)]
         for p, snap in zip(pts, snaps):
             if not (lo < p[0] < hi_x and lo < p[1] < hi_y):
                 return False
@@ -706,10 +711,13 @@ class Editor(SelectionTools):
         """World position of a rope snap: a Hook or a (body, point_index)."""
         return snap.pos.copy() if isinstance(snap, Hook) else np.array(snap[0].points[:, snap[1]], dtype=float)
 
-    def _snap_target(self, wp):
-        """The nearest hook or (body, point_index) body point within SNAP_UI_PX of wp, or None."""
+    def _snap_target(self, wp, skip=()):
+        """The nearest hook or (body, point_index) body point within SNAP_UI_PX of wp (not on a body in `skip`), or
+        None."""
         best, best_d = None, SNAP_UI_PX / self.zoom
         for body in self.world.bodies:
+            if any(body is x for x in skip):
+                continue
             d = np.hypot(*(body.points - np.reshape(wp, (2, 1))))
             i = int(np.argmin(d))
             if d[i] <= best_d:
@@ -726,42 +734,69 @@ class Editor(SelectionTools):
         return (self._snap_pos(snap), snap) if snap is not None else (np.asarray(wp, dtype=float), None)
 
     # ---------------- Chains (world units)
-    def _end_setting(self, i):
-        """The chosen setting of chain end i (0 = 1st click, 1 = 2nd): "fixed" or "free"."""
-        return self._cfg()["start" if i == 0 else "end"]
+    def _end_setting(self, i, cfg=None):
+        """The chosen setting of chain (or rope) end i (0 = 1st click, 1 = 2nd): "fixed" or "free". cfg: settings
+        to read instead of the current kind's (an existing rope's or chain's, see selection.py)."""
+        return (self._cfg() if cfg is None else cfg)["start" if i == 0 else "end"]
 
-    def _end_piece(self, i, snap=None):
+    def _end_piece(self, i, snap=None, cfg=None):
         """What chain end i is made of: "rope" (fixed, or attached to the body point / hook `snap`) or "box" (a free
-        end left loose)."""
-        return "rope" if snap is not None else END_PIECE[self._end_setting(i)]
+        end left loose; a rope's bead)."""
+        return "rope" if snap is not None else END_PIECE[self._end_setting(i, cfg)]
 
-    def _chain_spec(self, snaps):
+    def _chain_spec(self, snaps, cfg=None):
         """(segments, start piece, end piece) of the chain with these end snaps (ends not placed yet count as
         unattached). The segment count is the chosen one, plus one rope per free end attached to a body point or
-        hook: that end's box is tied there by an extra rope."""
+        hook: that end's box is tied there by an extra rope. A rope's settings (no "segments") give its one rope plus
+        a bead (box) per free end left loose: segments 1 is a plain rope."""
+        cfg = self._cfg() if cfg is None else cfg
         snaps = list(snaps) + [None] * (2 - len(snaps))
-        extra = sum(snap is not None and self._end_setting(i) == "free" for i, snap in enumerate(snaps))
-        return self._cfg()["segments"] + extra, self._end_piece(0, snaps[0]), self._end_piece(1, snaps[1])
+        start, end = self._end_piece(0, snaps[0], cfg), self._end_piece(1, snaps[1], cfg)
+        if "segments" not in cfg:
+            return 1 + (start == "box") + (end == "box"), start, end
+        extra = sum(snap is not None and self._end_setting(i, cfg) == "free" for i, snap in enumerate(snaps))
+        return cfg["segments"] + extra, start, end
+
+    def _make_line(self, pts, snaps, cfg, col, rope_col, stiffness=1.0, width=1):
+        """What spawning a rope (cfg without "segments") or a chain with these ends builds: a Rope, or a Chain (boxes
+        in `col`). A rope with beads is a Chain of the rope and its beads, which carry bead = True. Every piece gets
+        end_modes = [1st end's setting, 2nd end's], so editing the ends later (selection.py) knows them."""
+        ends = [snap if snap is not None else tuple(p) for p, snap in zip(pts, snaps)]
+        segments, start, end = self._chain_spec(snaps, cfg)
+        modes = [cfg["start"], cfg["end"]]
+        if segments == 1:
+            line = Rope(ends[0], ends[1], stiffness=stiffness, col=rope_col, width=width)
+            line.end_modes = modes
+            return line
+        line = Chain(ends[0], ends[1], segments, start, end, box_col=col, rope_col=rope_col, stiffness=stiffness,
+                     rope_width=width)
+        for piece in line.bodies + line.ropes:
+            piece.end_modes = modes
+        for bead in line.bodies if "segments" not in cfg else ():
+            bead.bead = True
+        return line
 
     def _end_at(self, i, wp):
         """(position, snap) for end i of a rope or chain at wp: on a body point or hook it attaches there (fixed or
         free alike); elsewhere it's placed at wp: a rope's or fixed chain end's anchor, or a free end's box centre."""
         return self._rope_end(wp)
 
-    def _chain_boxes(self, pts, snaps):
+    def _chain_boxes(self, pts, snaps, cfg=None):
         """The boxes ((2, 6) each) and the rope length of the chain over the ends so far. With one end placed only a
-        free end has a box (axis-aligned until the other end sets the direction) and the rope length is None."""
-        segments, start, end = self._chain_spec(snaps)
-        if len(pts) < 2:
+        free end has a box (axis-aligned until the other end sets the direction) and the rope length is None. A
+        plain rope (no beads) has no boxes and no rope length either."""
+        segments, start, end = self._chain_spec(snaps, cfg)
+        if len(pts) < 2 or segments == 1:
             if pts and start == "box":
                 return [chain_box_points(pts[0], (1.0, 0.0), Chain.BOX_SIZE)], None
             return [], None
         centers, u, rope = chain_layout(pts[0], pts[1], segments, start, end, Chain.BOX_SIZE)
         return [chain_box_points(c, u, Chain.BOX_SIZE) for c in centers], rope
 
-    def _boxes_clear(self, boxes):
+    def _boxes_clear(self, boxes, skip=()):
         """The rigid placement clearance rules for a chain's boxes, vectorized: inside the world box, no box point or
-        edge within contact_radius of an existing edge, no box point inside a body and no body point inside a box."""
+        edge within contact_radius of an existing edge, no box point inside a body and no body point inside a box.
+        The bodies in `skip` (a chain's own boxes while it's rebuilt) aren't obstacles."""
         if not boxes:
             return True
         r = EnvConfig.contact_radius
@@ -772,7 +807,10 @@ class Editor(SelectionTools):
         world = self.world
         if not world.bodies or world.edges.shape[1] == 0:
             return True
-        a, b = world.P[:, world.edges[0]], world.P[:, world.edges[1]]
+        gone = [k for k, body in enumerate(world.bodies) if any(body is x for x in skip)]
+        keep = ~np.isin(world.edge_body, gone)
+        a, b = world.P[:, world.edges[0, keep]], world.P[:, world.edges[1, keep]]
+        others = world.P[:, ~np.isin(world.point_body, gone)]
         ends = np.concatenate([np.roll(box, -1, axis=1) for box in boxes], axis=1)
         # only world edges whose bounding box comes within r of some box's bounding box can be that close
         box_lo = np.array([box.min(axis=1) for box in boxes]).T - r  # (2, n_boxes)
@@ -781,30 +819,35 @@ class Editor(SelectionTools):
         near = ((e_lo[:, :, None] <= box_hi[:, None, :]) & (e_hi[:, :, None] >= box_lo[:, None, :])).all(axis=0).any(axis=1)
         if near.any() and segs_dist(pts, ends, a[:, near], b[:, near]).min() < r:  # also covers the box points
             return False
-        if not self._region_ok(pts):  # no box point inside a body (or outside the container, for "inside")
+        if not self._region_ok(pts, skip):  # no box point inside a body (or outside the container, for "inside")
             return False
         for box in boxes:  # boxes are convex: a world point is inside when it's left of (or right of) every edge
-            e, rel = np.roll(box, -1, axis=1) - box, world.P[:, None, :] - box[:, :, None]
+            e, rel = np.roll(box, -1, axis=1) - box, others[:, None, :] - box[:, :, None]
             side = e[0][:, None] * rel[1] - e[1][:, None] * rel[0]
             if ((side > 0).all(axis=0) | (side < 0).all(axis=0)).any():
                 return False
         return True
 
-    def _valid_chain(self, pts, snaps):
+    def _valid_chain(self, pts, snaps, cfg=None, skip=()):
         """Rope ends follow the rope rules (in the box, a free anchor not inside a body, not both on one point), every
         box (end boxes too) follows the rigid clearance rules, and once both ends are down the line is long enough
-        for every rope to be at least CHAIN_MIN_ROPE. The ropes themselves may cross bodies."""
+        for every rope to be at least CHAIN_MIN_ROPE. The ropes themselves may cross bodies. Ropes (cfg without
+        "segments") are checked the same way: the rope rules for both ends, and a bead is a box. cfg: settings
+        instead of the current kind's; skip: bodies that aren't obstacles (the object's own, while it's rebuilt)."""
+        cfg = self._cfg() if cfg is None else cfg
+        if "segments" not in cfg and not self._valid_rope(pts, snaps, skip):
+            return False
         for i, (p, snap) in enumerate(zip(pts, snaps)):
-            if self._end_piece(i, snap) == "rope" and not self._valid_rope([p], [snap]):
+            if self._end_piece(i, snap, cfg) == "rope" and not self._valid_rope([p], [snap], skip):
                 return False
         if len(pts) == 2:
             (sa, sb) = snaps
             if sa is not None and sb is not None and self._same_snap(sa, sb):
                 return False
-        boxes, rope = self._chain_boxes(pts, snaps)
+        boxes, rope = self._chain_boxes(pts, snaps, cfg)
         if rope is not None and rope < CHAIN_MIN_ROPE:
             return False
-        return self._boxes_clear(boxes)
+        return self._boxes_clear(boxes, skip)
 
     # ---------------- Hooks and the peg grid (world units)
     def _pegs(self):
@@ -853,9 +896,7 @@ class Editor(SelectionTools):
 
     def _valid_now(self):
         """Is the object as placed so far valid?"""
-        if self.mode == "rope":
-            return self._valid_rope(self.points, self.snaps)
-        if self.mode == "chain":
+        if self.mode in ("rope", "chain"):  # a rope's beads are checked like chain boxes
             return self._valid_chain(self.points, self.snaps)
         if self.mode == "hook":
             return all(self._valid_hook(p) for p in self.points)
@@ -898,8 +939,7 @@ class Editor(SelectionTools):
             return
         if self.mode in ("rope", "chain"):
             pos, snap = self._end_at(len(self.points), wp)
-            valid = self._valid_rope if self.mode == "rope" else self._valid_chain
-            if valid(self.points + [pos], self.snaps + [snap]):
+            if self._valid_chain(self.points + [pos], self.snaps + [snap]):  # ropes too (see _valid_chain)
                 self.points.append(pos)
                 self.snaps.append(snap)
                 self._push(("add", pos, snap))
@@ -1138,21 +1178,13 @@ class Editor(SelectionTools):
             y += LABEL_H
             lay["widths"] = [(pygame.Rect(x0 + i * (30 + BTN_GAP), y, 30, BTN_H), w) for i, w in enumerate(ROPE_WIDTHS)]
             y += BTN_H + ROW_GAP
+            y = self._ends_row(lay, x0, y)
         elif self.kind == "chain":
             lay["rows"].append(("Segments", (x0, y)))
             y += LABEL_H
             lay["slider"] = pygame.Rect(x0 + 4, y + 4, 150, 6)
             y += 14 + ROW_GAP
-            # 1st end [Fixed][Free]   2nd end [Fixed][Free]: two groups side by side in the settings column
-            group_gap = 10
-            bw = (COL_W - group_gap - 2 * BTN_GAP) // 4
-            lay["ends"] = []
-            for i, label in enumerate(END_LABELS):
-                gx = x0 + i * (2 * bw + BTN_GAP + group_gap)
-                lay["rows"].append((label, (gx, y)))
-                lay["ends"] += [(pygame.Rect(gx + j * (bw + BTN_GAP), y + LABEL_H, bw, BTN_H), i, opt)
-                                for j, opt in enumerate(END_OPTIONS)]
-            y += LABEL_H + BTN_H + ROW_GAP
+            y = self._ends_row(lay, x0, y)
         else:
             counts = POINT_COUNTS[self.kind]
             cols = 4 if len(counts) == 8 else 3
@@ -1223,6 +1255,20 @@ class Editor(SelectionTools):
             if key in lay:
                 lay[key] = lay[key].move(dx, dy)
         return lay
+
+    @staticmethod
+    def _ends_row(lay, x0, y):
+        """A rope's or chain's end settings at row y: 1st end [Fixed][Free]   2nd end [Fixed][Free], two groups side
+        by side in the settings column (lay["ends"]: (rect, end, option)). Returns the next row's y."""
+        group_gap = 10
+        bw = (COL_W - group_gap - 2 * BTN_GAP) // 4
+        lay["ends"] = []
+        for i, label in enumerate(END_LABELS):
+            gx = x0 + i * (2 * bw + BTN_GAP + group_gap)
+            lay["rows"].append((label, (gx, y)))
+            lay["ends"] += [(pygame.Rect(gx + j * (bw + BTN_GAP), y + LABEL_H, bw, BTN_H), i, opt)
+                            for j, opt in enumerate(END_OPTIONS)]
+        return y + LABEL_H + BTN_H + ROW_GAP
 
     def _header_buttons(self, panel, back=True):
         ws = [(pygame.Rect(panel.right - 6 - BTN_H, panel.y + 6, BTN_H, BTN_H), self.close, ("button", "x", False, False))]
@@ -1315,10 +1361,12 @@ class Editor(SelectionTools):
         return END_PIECE[cfg["start"]], END_PIECE[cfg["end"]]
 
     def _set_chain_end(self, i, option):
-        """Make chain end i fixed or free; the segment count moves to the nearest count that fits the ends."""
+        """Make chain (or rope) end i fixed or free; a chain's segment count moves to the nearest count that fits the
+        ends."""
         cfg = self._cfg()
         cfg["start" if i == 0 else "end"] = option
-        cfg["segments"] = fit_chain_count(cfg["segments"], *self._chain_pieces())
+        if "segments" in cfg:
+            cfg["segments"] = fit_chain_count(cfg["segments"], *self._chain_pieces())
 
     def _set_strength(self, x):
         """Slider drag at UI x: strength / stiffness in 0.1 steps, or a chain's segment count in steps of 2."""
@@ -1344,7 +1392,8 @@ class Editor(SelectionTools):
                 self.toggle_pause()
                 return True
             if event.key == pygame.K_f:
-                self.toggle_compute()
+                if not self._toggle_hovered_end():  # F over a rope / chain end handle toggles it (selection.py)
+                    self.toggle_compute()
                 return True
             if not event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META):  # Ctrl/Cmd+S is save
                 if event.key == pygame.K_s:
@@ -1527,11 +1576,13 @@ class Editor(SelectionTools):
             elif not self._complete() and self._near_point(wp) is None:
                 pos, target = self._end_at(len(pts), wp)
                 pts, snaps = pts + [pos], snaps + [target]
-        chain = self.mode == "chain"
-        valid = self._valid_chain(pts, snaps) if chain else self._valid_rope(pts, snaps)
+        # a rope with a free end is drawn like a chain: its beads are boxes, and its end markers say what each end is
+        chain = self.mode == "chain" or "free" in (self._end_setting(0), self._end_setting(1))
+        valid = self._valid_chain(pts, snaps)
         ghost = (200, 200, 200) if valid else tuple(pal.debug_red)
         if chain:
-            self._draw_chain_ghost(surface, ghost_surface, pts, snaps, ghost)
+            width = self._cfg()["width"] if self.mode == "rope" else 1
+            self._draw_chain_ghost(surface, ghost_surface, pts, snaps, ghost, width=width)
         elif len(pts) == 2:
             pygame.draw.line(ghost_surface, ghost, tuple(pts[0] * z), tuple(pts[1] * z), max(1, self._cfg()["width"]))
         if target is not None:
@@ -1563,19 +1614,20 @@ class Editor(SelectionTools):
             else:
                 pygame.draw.rect(surface, col, (int(p[0] * z) - 2, int(p[1] * z) - 2, 5, 5))
 
-    def _draw_chain_ghost(self, surface, ghost_surface, pts, snaps, ghost):
-        """The chain over the ends `pts` on the translucent layer: ropes as lines, boxes as filled squares."""
+    def _draw_chain_ghost(self, surface, ghost_surface, pts, snaps, ghost, cfg=None, width=1):
+        """The chain over the ends `pts` on the translucent layer: ropes as lines (`width` px), boxes as filled
+        squares. A rope's settings draw the rope and its beads. cfg: settings instead of the current kind's."""
         z = self.zoom
-        boxes, _ = self._chain_boxes(pts, snaps)
+        boxes, _ = self._chain_boxes(pts, snaps, cfg)
         if len(pts) == 2:
-            _, start, end = self._chain_spec(snaps)
+            _, start, end = self._chain_spec(snaps, cfg)
             # consecutive pairs of joints are the ropes: each runs from the chain's start (or a box's front midpoint)
             # to the next box's back midpoint (or the chain's end); end boxes have no rope on their outer side
             joints = [p for box in boxes for p in (box[:, 0], box[:, 3])]
             joints = joints[1:] if start == "box" else [pts[0]] + joints
             joints = joints[:-1] if end == "box" else joints + [pts[1]]
             for a, b in zip(joints[0::2], joints[1::2]):
-                pygame.draw.line(ghost_surface, ghost, tuple(np.asarray(a) * z), tuple(np.asarray(b) * z), 1)
+                pygame.draw.line(ghost_surface, ghost, tuple(np.asarray(a) * z), tuple(np.asarray(b) * z), width)
         for box in boxes:
             pygame.draw.polygon(ghost_surface, ghost, (box * z).T.tolist())
 
@@ -1671,7 +1723,8 @@ class Editor(SelectionTools):
                     "click again to unpick  ·  then Done or Enter  ·  Esc back"]
         n = self._cfg()["n"]
         segment = self.kind == "fixed" and n == 2
-        if self.mode == "chain":
+        if self.mode == "chain" or (self.mode == "rope" and not self._complete()
+                                    and self._end_setting(len(self.points)) == "free"):
             first = self._chain_hint()
         else:
             first = {"custom": "Click both ends of the segment" if segment else "Click to place points in order",
@@ -1691,13 +1744,14 @@ class Editor(SelectionTools):
         return [f"{first}  ({count})", f"drag {what} to move it  ·  Z undo  ·  X redo  ·  Enter finish  ·  Esc back"]
 
     def _chain_hint(self):
-        """What clicking the next chain end does, for its fixed / free setting (the first hint line)."""
+        """What clicking the next chain (or free rope) end does, for its fixed / free setting (the first hint line)."""
         if self._complete():
             return "Both ends placed: Enter or Finish adds the chain"
         i = len(self.points)
         if self._end_setting(i) == "fixed":
             return f"{END_LABELS[i].capitalize()} (fixed): click a body point or hook to attach, elsewhere to pin"
-        return f"{END_LABELS[i].capitalize()} (free): click to leave a loose box, or a point / hook to attach"
+        weight = "box" if self.mode == "chain" else "bead"
+        return f"{END_LABELS[i].capitalize()} (free): click to leave a loose {weight}, or a point / hook to attach"
 
     def _hint_box(self):
         w = max(ui.font().size(line)[0] for line in self._hint_lines()) + 2 * ui.CARD_PAD
@@ -1782,11 +1836,13 @@ class Editor(SelectionTools):
             pygame.draw.line(surface, ui.BLACK, pts[i], pts[j], 1)
         draw_border(surface, np.array(pts).T, ui.BLACK, ui.BORDER)
 
-    def _draw_chain_icon(self, surface, box, segments, start, end, box_col, rope_col, max_box=12, rope_width=1):
+    def _draw_chain_icon(self, surface, box, segments, start, end, box_col, rope_col, max_box=12, rope_width=1,
+                         max_rope=None):
         """A chain inside the rect `box`, posed the way it would settle: hanging in a sag between two fixed (rope)
         ends, hanging straight down from its one fixed end (the rest lying on the floor if it's long), or lying on
         the floor with no fixed end. Ropes as lines, boxes as bordered squares turned along the chain, a fixed end as
-        a black anchor block. Pieces shrink to fit long chains."""
+        a black anchor block. Pieces shrink to fit long chains. max_rope: the longest rope (default max_box; a rope
+        with beads is mostly rope)."""
         if start == "box" and end == "rope":  # hang it from the anchor: the same chain read from its other end
             start, end = end, start
         ropes, boxes = chain_counts(segments, start, end)
@@ -1815,7 +1871,7 @@ class Editor(SelectionTools):
             room = (floor - top) + (right - left)
         else:
             room = length(floor_rows(max(1, (floor - top) // ROW)))
-        size, rope = max_box, max_box
+        size, rope = max_box, max_box if max_rope is None else max_rope
         while boxes * size + ropes * rope - halves * size / 2 > room and (rope > 3 or size > 7):
             if rope > 3:
                 rope -= 1
@@ -1936,7 +1992,11 @@ class Editor(SelectionTools):
         ui.draw_frame(surface, box)
         n, col = cfg["n"], self._color(cfg["color"])
         r = min(box.w, box.h) * 0.34
-        if self.kind == "rope":
+        if self.kind == "rope" and "free" in (cfg["start"], cfg["end"]):  # its beads: drawn as a one-rope chain
+            segments, start, end = self._chain_spec([])
+            self._draw_chain_icon(surface, box.inflate(-8, -8), segments, start, end, col, col, rope_width=cfg["width"],
+                                  max_rope=int(r * 1.5))
+        elif self.kind == "rope":
             self._draw_rope_icon(surface, box.centerx, box.centery, int(r), col, cfg["width"])
         elif self.kind == "chain":
             self._draw_chain_icon(surface, box.inflate(-8, -8), cfg["segments"], *self._chain_pieces(), col,
