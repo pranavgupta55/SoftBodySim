@@ -3,7 +3,7 @@
 File format (FORMAT, VERSION 1), one JSON object:
 
     {"format": "softbodysim-scene", "version": 1, "name": "...",
-     "world": {"width": W, "height": H, "inset": INSET},      # world units; the box the scene was made in
+     "world": {"width": W, "height": H, "inset": INSET},      # world units; the box it was made in (+ "anchor")
      "env": {"gravity": [gx, gy], "friction": f, "damping": d},
      "view": {"filled": bool, "show_grid": bool, "zoom": z},
      "bodies": [{"type": "soft" | "rigid" | "fixed" | "body", "wall": bool,
@@ -20,17 +20,23 @@ File format (FORMAT, VERSION 1), one JSON object:
 
 Chains are saved as their pieces (rigid boxes + ropes), which is all the World keeps of them. Floats are written with
 Python's shortest round-trip repr, so save -> load gives bit-identical arrays. A scene made in a different world box
-(another screen size) is moved to the new box: centred horizontally, its floor kept at the same distance from the
-bottom wall, the walls themselves rebuilt on the new box; it's refused if it then doesn't fit.
+(another screen size) is moved to the new box: centred horizontally, and its floor kept at the same distance from the
+bottom wall (or, with "world": {"anchor": "top" | "center"}, its ceiling distance / its centre); the walls themselves
+are rebuilt on the new box. It's refused if it then doesn't fit (never scaled: that would change every rest length).
+
+Optional fields (absent in older files, ignored by builds that lack the feature): a body's "restitution", and a
+top-level "state" with the world's looping sides, its tagged walls (by body index, or "detached" when a looping side's
+wall is out of the body list), pending walls, bounds and terminal velocity.
 
 Every loaded state is validated (state_problems) before it replaces the world: the collision system assumes it starts
-from an intersection-free state, so no crossing edges and every point at least EnvConfig.contact_radius from other
-bodies' edges (containment is fine).
+from an intersection-free state, so no crossing edges and every point at least load_gap() from other bodies' edges
+(containment is fine). The editor's placement rule (contact_radius) is stricter; the shipped examples meet it.
 """
 import json
 import math
 import os
 import re
+import weakref
 
 import numpy as np
 
@@ -44,6 +50,7 @@ DEFAULT_ENV = {"gravity": [float(v) for v in EnvConfig.gravity], "friction": flo
                "damping": float(EnvConfig.damping)}  # applied when a preset (which has no env of its own) is loaded
 _KINDS = ((SoftBody, "soft"), (RigidBody, "rigid"), (FixedBody, "fixed"), (Body, "body"))
 _CLASSES = {"soft": SoftBody, "rigid": RigidBody, "fixed": FixedBody, "body": Body}
+BODY_EXTRAS = ("restitution",)  # optional numeric per-body settings, saved / restored when present
 
 
 class SceneError(ValueError):
@@ -68,26 +75,54 @@ def is_wall(body, box):
 
 
 # ---------------- World -> data
+def _body_dict(b, arr, col, wall=False):
+    d = {"type": _kind(b), "wall": bool(wall),
+         "points": arr(b.points), "prev": arr(b.prev), "vels": arr(b.vels), "inv_mass": arr(b.inv_mass),
+         "edges": arr(b.edges), "winding": float(b.winding),
+         "point_col": col(b.point_col), "stick_col": col(b.stick_col), "fill_col": col(b.fill_col),
+         "point_radius": b.point_radius, "stick_width": b.stick_width}
+    if isinstance(b, SoftBody):
+        d.update(stiffness=float(b.stiffness), skip_sets=int(b.skip_sets), springs=arr(b.springs),
+                 rest_len=arr(b.rest_len))
+    elif isinstance(b, RigidBody):
+        d.update(stiffness=float(b.stiffness), rest=arr(b.rest))
+    for name in BODY_EXTRAS:  # optional per-body settings, saved when the body class has them
+        v = getattr(b, name, None)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            d[name] = float(v)
+    return d
+
+
+def _world_state(world, index, arr, col):
+    """Optional per-world settings, saved when this World has them (absent in older files / builds): looping sides,
+    their walls (a side whose wall was taken out keeps it outside the body list), pending walls, bounds, terminal
+    velocity."""
+    st = {}
+    if isinstance(getattr(world, "looping", None), dict):
+        st["looping"] = {str(k): bool(v) for k, v in world.looping.items()}
+    if isinstance(getattr(world, "walls", None), dict):
+        st["walls"] = {str(side): ({"body": index[id(w)]} if id(w) in index else {"detached": _body_dict(w, arr, col, True)})
+                       for side, w in world.walls.items() if w is not None}
+    if isinstance(getattr(world, "pending_walls", None), (set, list, tuple)):
+        st["pending_walls"] = sorted(str(v) for v in world.pending_walls)
+    if getattr(world, "bounds", None) is not None:
+        st["bounds"] = [float(v) for v in world.bounds]
+    tv = getattr(world, "terminal_velocity", None)
+    if isinstance(tv, (int, float)) and not isinstance(tv, bool) and math.isfinite(tv):
+        st["terminal_velocity"] = float(tv)
+    return st
+
+
 def capture(world, box=None, as_json=True):
-    """The world's bodies, hooks and ropes as a dict. as_json: plain lists (for json.dump); False keeps numpy copies
-    (the cheaper in-memory undo snapshot). box (width, height, inset) marks the walls."""
+    """The world's bodies, hooks and ropes (and optional world settings, "state") as a dict. as_json: plain lists
+    (for json.dump); False keeps numpy copies (the cheaper in-memory undo snapshot). box (width, height, inset)
+    marks the walls (also any body in world.walls)."""
     arr = (lambda a: np.asarray(a).tolist()) if as_json else (lambda a: np.array(a))
     col = (lambda c: [int(v) for v in c]) if as_json else tuple
     index = {id(b): k for k, b in enumerate(world.bodies)}
     hook_index = {id(hk.pos): k for k, hk in enumerate(world.hooks)}
-    bodies = []
-    for b in world.bodies:
-        d = {"type": _kind(b), "wall": bool(box is not None and is_wall(b, box)),
-             "points": arr(b.points), "prev": arr(b.prev), "vels": arr(b.vels), "inv_mass": arr(b.inv_mass),
-             "edges": arr(b.edges), "winding": float(b.winding),
-             "point_col": col(b.point_col), "stick_col": col(b.stick_col), "fill_col": col(b.fill_col),
-             "point_radius": b.point_radius, "stick_width": b.stick_width}
-        if isinstance(b, SoftBody):
-            d.update(stiffness=float(b.stiffness), skip_sets=int(b.skip_sets), springs=arr(b.springs),
-                     rest_len=arr(b.rest_len))
-        elif isinstance(b, RigidBody):
-            d.update(stiffness=float(b.stiffness), rest=arr(b.rest))
-        bodies.append(d)
+    tagged = {id(w) for w in (getattr(world, "walls", None) or {}).values()} if isinstance(getattr(world, "walls", None), dict) else set()
+    bodies = [_body_dict(b, arr, col, id(b) in tagged or (box is not None and is_wall(b, box))) for b in world.bodies]
     ropes = []
     for r in world.ropes:
         ends = []
@@ -103,7 +138,11 @@ def capture(world, box=None, as_json=True):
         ropes.append({"ends": ends, "rest_length": float(r.rest_length), "stiffness": float(r.stiffness),
                       "col": col(r.col), "width": r.width})
     hooks = [{"pos": arr(hk.pos), "col": col(hk.col), "radius": hk.radius} for hk in world.hooks]
-    return {"bodies": bodies, "hooks": hooks, "ropes": ropes}
+    out = {"bodies": bodies, "hooks": hooks, "ropes": ropes}
+    state = _world_state(world, index, arr, col)
+    if state:
+        out["state"] = state
+    return out
 
 
 def scene_data(world, box, view=None, name=""):
@@ -137,51 +176,58 @@ def _float_array(value, shape_rows=None, what="array"):
     return a
 
 
+def _build_body(d, k, off, moved):
+    cls = _CLASSES.get(d["type"])
+    if cls is None:
+        raise SceneError(f"body {k}: unknown type {d['type']!r}")
+    pts = _float_array(d["points"], 2, f"body {k} points")
+    n = pts.shape[1]
+    style = dict(point_col=tuple(d["point_col"]), stick_col=tuple(d["stick_col"]), fill_col=tuple(d["fill_col"]),
+                 point_radius=d["point_radius"], stick_width=d["stick_width"])
+    if cls is SoftBody:
+        b = SoftBody(pts, stiffness=float(d["stiffness"]), skip_sets=int(d["skip_sets"]), **style)
+    elif cls is RigidBody:
+        b = RigidBody(pts, stiffness=float(d["stiffness"]), **style)
+    else:
+        b = cls(pts, **style)
+    shift = moved and not d.get("wall")
+    if shift:
+        b.points += off
+    b.prev[:] = _float_array(d["prev"], 2, f"body {k} prev") + (off if shift else 0.0)
+    b.vels[:] = _float_array(d["vels"], 2, f"body {k} vels")
+    b.inv_mass[:] = _float_array(d["inv_mass"], None, f"body {k} inv_mass")
+    edges = np.array(d["edges"], dtype=int).reshape(2, -1)
+    if edges.size and (edges.min() < 0 or edges.max() >= n):
+        raise SceneError(f"body {k}: edge index out of range")
+    b.edges = b.draw_edges = edges
+    b.winding = float(d["winding"])
+    if cls is SoftBody:
+        springs = np.array(d["springs"], dtype=int).reshape(2, -1)
+        if springs.size and (springs.min() < 0 or springs.max() >= n):
+            raise SceneError(f"body {k}: spring index out of range")
+        b.springs = b.draw_edges = springs
+        b.rest_len = _float_array(d["rest_len"], None, f"body {k} rest_len")
+        if b.rest_len.shape != (springs.shape[1],):
+            raise SceneError(f"body {k}: one rest length per spring expected")
+        b.spring_count = np.maximum(np.bincount(springs.ravel(), minlength=n), 1)
+    elif cls is RigidBody:
+        b.rest = _float_array(d["rest"], 2, f"body {k} rest")
+        if b.rest.shape != pts.shape:
+            raise SceneError(f"body {k}: rest shape size differs from its points")
+    for name in BODY_EXTRAS:
+        if name in d:
+            setattr(b, name, float(d[name]))
+    return b
+
+
 def build(data, offset=(0.0, 0.0)):
-    """(bodies, ropes, hooks) from capture() / scene_data() output, everything moved by offset (world units; walls
-    are handled by the caller). Raises SceneError on malformed data."""
+    """(bodies, ropes, hooks, state) from capture() / scene_data() output, everything moved by offset (world units;
+    walls are handled by the caller). state: the optional world settings (see _world_state) with its walls as body
+    objects, {} if none. Raises SceneError on malformed data."""
     off = np.asarray(offset, dtype=float).reshape(2, 1)
     moved = bool(off.any())
-    bodies = []
     try:
-        for k, d in enumerate(data["bodies"]):
-            cls = _CLASSES.get(d["type"])
-            if cls is None:
-                raise SceneError(f"body {k}: unknown type {d['type']!r}")
-            pts = _float_array(d["points"], 2, f"body {k} points")
-            n = pts.shape[1]
-            style = dict(point_col=tuple(d["point_col"]), stick_col=tuple(d["stick_col"]), fill_col=tuple(d["fill_col"]),
-                         point_radius=d["point_radius"], stick_width=d["stick_width"])
-            if cls is SoftBody:
-                b = SoftBody(pts, stiffness=float(d["stiffness"]), skip_sets=int(d["skip_sets"]), **style)
-            elif cls is RigidBody:
-                b = RigidBody(pts, stiffness=float(d["stiffness"]), **style)
-            else:
-                b = cls(pts, **style)
-            if moved and not d.get("wall"):
-                b.points += off
-            b.prev[:] = _float_array(d["prev"], 2, f"body {k} prev") + (off if moved and not d.get("wall") else 0.0)
-            b.vels[:] = _float_array(d["vels"], 2, f"body {k} vels")
-            b.inv_mass[:] = _float_array(d["inv_mass"], None, f"body {k} inv_mass")
-            edges = np.array(d["edges"], dtype=int).reshape(2, -1)
-            if edges.size and (edges.min() < 0 or edges.max() >= n):
-                raise SceneError(f"body {k}: edge index out of range")
-            b.edges = b.draw_edges = edges
-            b.winding = float(d["winding"])
-            if cls is SoftBody:
-                springs = np.array(d["springs"], dtype=int).reshape(2, -1)
-                if springs.size and (springs.min() < 0 or springs.max() >= n):
-                    raise SceneError(f"body {k}: spring index out of range")
-                b.springs = b.draw_edges = springs
-                b.rest_len = _float_array(d["rest_len"], None, f"body {k} rest_len")
-                if b.rest_len.shape != (springs.shape[1],):
-                    raise SceneError(f"body {k}: one rest length per spring expected")
-                b.spring_count = np.maximum(np.bincount(springs.ravel(), minlength=n), 1)
-            elif cls is RigidBody:
-                b.rest = _float_array(d["rest"], 2, f"body {k} rest")
-                if b.rest.shape != pts.shape:
-                    raise SceneError(f"body {k}: rest shape size differs from its points")
-            bodies.append(b)
+        bodies = [_build_body(d, k, off, moved) for k, d in enumerate(data["bodies"])]
         hooks = [Hook(_float_array(h["pos"], None, "hook pos") + off[:, 0], col=tuple(h["col"]), radius=h["radius"])
                  for h in data["hooks"]]
         ropes = []
@@ -199,11 +245,17 @@ def build(data, offset=(0.0, 0.0)):
                     ends.append(tuple(_float_array(e["anchor"], None, f"rope {k} anchor") + off[:, 0]))
             ropes.append(Rope(ends[0], ends[1], rest_length=float(r["rest_length"]), stiffness=float(r["stiffness"]),
                               col=tuple(r["col"]), width=r["width"]))
+        state = dict(data.get("state") or {})
+        if "walls" in state:
+            state["walls"] = {side: bodies[int(w["body"])] if "body" in w else _build_body(w["detached"], f"wall {side}", off, False)
+                              for side, w in state["walls"].items()}
+        if moved:
+            state.pop("bounds", None)  # another world box: keep the current world's own bounds
     except SceneError:
         raise
-    except (KeyError, IndexError, TypeError, ValueError) as e:
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as e:
         raise SceneError(f"malformed scene ({type(e).__name__}: {e})") from None
-    return bodies, ropes, hooks
+    return bodies, ropes, hooks, state
 
 
 def _fit_walls(bodies, data, box):
@@ -320,26 +372,47 @@ def parse(data, box):
         raise SceneError("malformed scene (world box)") from None
     w, h, inset = box
     same = abs(sw - w) < 1e-9 and abs(sh - h) < 1e-9 and abs(si - inset) < 1e-9
-    # another box: centre horizontally, keep the distance to the floor
-    offset = (0.0, 0.0) if same else ((w - sw) / 2, (h - inset) - (sh - si))
-    bodies, ropes, hooks = build(data, offset)
+    # another box: centre horizontally; vertically keep the distance to the floor (anchor "bottom", the default), to
+    # the ceiling ("top", e.g. things hanging from hooks) or centre ("center")
+    anchor = data["world"].get("anchor", "bottom")
+    dy = {"top": inset - si, "center": (h - sh) / 2}.get(anchor, (h - inset) - (sh - si))
+    offset = (0.0, 0.0) if same else ((w - sw) / 2, dy)
+    bodies, ropes, hooks, state = build(data, offset)
     if not same:
         _fit_walls(bodies, data, box)
     problems = state_problems(bodies, box, load_gap())
     if problems:
         raise SceneError("; ".join(problems))
-    return bodies, ropes, hooks
+    return bodies, ropes, hooks, state
 
 
-def install(world, bodies, ropes, hooks):
-    """Replace the world's contents in place (same World object, so every reference to it stays valid)."""
+def install(world, bodies, ropes, hooks, state=None):
+    """Replace the world's contents in place (same World object, so every reference to it stays valid). state: the
+    optional world settings from build(); each is applied only if this World has that attribute (older builds and
+    newer files mix gracefully)."""
     world.bodies, world.ropes, world.hooks = list(bodies), list(ropes), list(hooks)
     world.grabbed = None
+    for key, value in (state or {}).items():
+        if not hasattr(world, key):
+            continue
+        if key == "looping" and isinstance(world.looping, dict):
+            world.looping = {**{k: False for k in world.looping}, **{k: bool(v) for k, v in value.items()}}
+        elif key == "pending_walls":
+            world.pending_walls = type(world.pending_walls)(value) if isinstance(world.pending_walls, (set, list)) else set(value)
+        elif key == "bounds":
+            world.bounds = tuple(float(v) for v in value)
+        elif key == "walls":
+            world.walls = dict(value)
+        else:
+            setattr(world, key, value)
     world._rebuild()
 
 
 def apply_env(env):
-    EnvConfig.gravity = np.array(env["gravity"], dtype=float)
+    g = np.array(env["gravity"], dtype=float)
+    if g.shape != (2,) or not np.isfinite(g).all():
+        raise SceneError("malformed scene (gravity)")
+    EnvConfig.gravity[:] = g  # in place: the gravity selector (gravity_dial.py) edits this same array
     EnvConfig.friction = float(env["friction"])
     EnvConfig.damping = float(env["damping"])
 
@@ -454,13 +527,17 @@ class WorldHistory:
     def __init__(self, limit=HISTORY_LIMIT):
         self.limit = limit
         self.undo_stack, self.redo_stack = [], []  # (label, snapshot)
-        self.world = None  # the World the snapshots belong to (a different one clears them)
+        self._world = None  # weakref to the World the snapshots belong to (a different one clears them)
+
+    @property
+    def world(self):
+        return self._world() if self._world is not None else None
 
     def _bind(self, world):
         if world is not self.world:
             self.undo_stack.clear()
             self.redo_stack.clear()
-            self.world = world
+            self._world = weakref.ref(world)
 
     def _snap(self, world, env):
         snap = capture(world, as_json=False)
