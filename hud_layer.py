@@ -14,7 +14,8 @@ object with:
     draw_card(surface, origin, mouse_px, compact)
                                          draw it at its placed rect minus origin (the layer's top-left)
 
-and optionally `compactable = True` if card_height(True) is shorter. To add a card (e.g. a world selector), give it
+and optionally `compactable = True` if card_height(True) is shorter, and `collapsed` (the user chose the short form,
+e.g. F for the Compute card; ignored when fitting, so it never changes the scale). To add a card (e.g. a world selector), give it
 those methods and add it to the list in main_opengl.py; route its clicks there too. Clicks anywhere else in the
 sidebar are swallowed by the editor (it never passes them to the world).
 
@@ -69,23 +70,31 @@ class HudLayer:
         """Choose the HUD scale and compact flag (see the module docstring). Cheap when nothing changed."""
         hud = ui.HUD
         saved = hud.scale
-        hud.set_scale(ui.HUD_MIN_SCALE)
-        key = (self.rect.size, tuple(c.card_height(False) for c in self.cards),
-               tuple(c.card_height(True) for c in self.cards))
-        if key == self._fit_key:
-            hud.set_scale(saved)
-            return
-        self._fit_key = key
-        compactable = any(getattr(c, "compactable", False) for c in self.cards)
-        passes = [(False, ui.HUD_MIN_SCALE)] + ([(True, ui.HUD_MIN_SCALE)] if compactable else [])
-        passes.append((compactable, ui.HUD_FLOOR_SCALE))
-        for compact, lo in passes:
-            for s in self._scales(lo):
-                hud.set_scale(s)
-                if self._stack_height(compact) <= self.rect.h:
-                    self.compact = compact
-                    return
-        self.compact = compactable  # nothing fits (an absurd number of rows): smallest scale, cards run off the bottom
+        # sized for the cards' full forms: a card the user collapsed (e.g. F) must not change the scale
+        collapsed = [(c, c.collapsed) for c in self.cards if getattr(c, "collapsed", False)]
+        for c, _ in collapsed:
+            c.collapsed = False
+        try:
+            hud.set_scale(ui.HUD_MIN_SCALE)
+            key = (self.rect.size, tuple(c.card_height(False) for c in self.cards),
+                   tuple(c.card_height(True) for c in self.cards))
+            if key == self._fit_key:
+                hud.set_scale(saved)
+                return
+            self._fit_key = key
+            compactable = any(getattr(c, "compactable", False) for c in self.cards)
+            passes = [(False, ui.HUD_MIN_SCALE)] + ([(True, ui.HUD_MIN_SCALE)] if compactable else [])
+            passes.append((compactable, ui.HUD_FLOOR_SCALE))
+            for compact, lo in passes:
+                for s in self._scales(lo):
+                    hud.set_scale(s)
+                    if self._stack_height(compact) <= self.rect.h:
+                        self.compact = compact
+                        return
+            self.compact = compactable  # nothing fits (an absurd number of rows): smallest scale, runs off the bottom
+        finally:
+            for c, v in collapsed:
+                c.collapsed = v
 
     def layout(self):
         """Place every card (native screen px), top to bottom; returns [(card, rect)]."""
