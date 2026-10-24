@@ -59,6 +59,7 @@ class World:
         self.pending_walls = set()  # sides whose looping was turned off, waiting for room to re-add the wall
         self.last_wraps = []  # [(body, (dx, dy))] moved by looping in the last step(), e.g. to break motion trails
         self.env = {}  # per-world EnvConfig overrides (attribute name -> value), in effect only during step()
+        self.background = None  # per-world background color (rgb), None for the default (main_opengl.py)
         self.bounce_bodies = []  # indices of bodies with restitution > 0 (see _bounce)
         # Optional debug recorder (debug_overlay.StepRecorder), set only while an overlay needs solver data. It is
         # told about each step's CCD hits and impact zone points; None (the default) costs one attribute check
@@ -398,7 +399,7 @@ class World:
         Cells an edge is registered in (its AABB padded like _candidates does) get edge_cell_col,
         cells holding a point get point_cell_col (drawn over), then the grid lines on top.
         """
-        cell = EnvConfig.cell_size
+        cell = self.env.get("cell_size", EnvConfig.cell_size)  # this world's own grid size, if it has one
         w, h = surface.get_size()
         cols, rows = int(np.ceil(w / zoom / cell)), int(np.ceil(h / zoom / cell))
         cell_px = cell * zoom  # cells are hashed in world units, drawn in surface pixels

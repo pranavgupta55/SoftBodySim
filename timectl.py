@@ -18,8 +18,8 @@ with the same substeps as a running frame, so 0.25x + N steps a single 1/240 s s
 """
 from entities import EnvConfig
 
-# 1% .. 10,000% in 1-2-5 steps (plus 25%, the old slowest)
-SCALES = (0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
+# 1% .. 10,000%: 1-2-5 steps below 100%, finer ones just above it (where speeding up is still cheap)
+SCALES = (0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 
 
 class TimeControl:

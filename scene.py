@@ -142,6 +142,11 @@ ENDESGA_32 = [Endesga.rust_red, Endesga.burnt_orange, Endesga.sand, Endesga.tan,
 BRIGHT_ENDESGA_32 = [c for c in ENDESGA_32 if sum(c) > 230]
 
 DIAMONDS_HEXAGONS = 140  # falling hexagons in the "diamonds" preset
+# its palette (a dusk mountain range): background, walls, diamonds (the cool tones) and hexagons (the reds)
+DUSK_BACKGROUND = [38, 37, 62]  # 26253e
+DUSK_WALL = [66, 79, 106]  # 424f6a
+DUSK_DIAMONDS = [[152, 146, 163], [66, 79, 106], [60, 33, 52]]  # 9892a3 424f6a 3c2134
+DUSK_HEXAGONS = [[107, 27, 43], [119, 45, 56], [131, 47, 68]]  # 6b1b2b 772d38 832f44
 DIAMOND_SIDE = 32.0  # edge length of its diamonds (world units)
 DIAMOND_CHAIN_WIDTH = 120.0  # a cluster of touching diamonds is at most this wide (tall is fine): no long ledges
 DIAMOND_MARGIN = 30.0  # diamonds stay this far in from the side walls
@@ -150,18 +155,18 @@ CUP_GAP = 40.0  # diamonds whose corners are closer than this (the widest hexago
 
 def build_diamonds_scene(world_width, world_height, seed=7, fraction=0.09, hexagons=DIAMONDS_HEXAGONS, inset=INSET):
     """"diamonds" preset: a seeded random `fraction` of the rhombi of a tumbling-blocks tiling (edge DIAMOND_SIDE,
-    covering the world; never two that form a cup, diamonds_map.forms_cup) as fixed diamonds in the colors of
-    maps/diamonds.json, and `hexagons` soft hexagons of random sizes
-    (8-20) and ENDESGA 32 colors that fall through them. Looping is on: there is no floor or ceiling, so what falls
+    covering the world; never two that form a cup, diamonds_map.forms_cup) as fixed diamonds, and `hexagons` soft
+    hexagons of random sizes (8-20) that fall through them, all in the DUSK_ palette (its own background too). Looping is on: there is no floor or ceiling, so what falls
     off the bottom comes back in at the top, same x and velocity (looping.py). The side walls run a world size past
     the screen at both ends, so bodies passing through the off-screen bands above and below stay between them."""
     from diamonds_map import lattice_diamonds, pick_diamonds, place_hexagons
 
     world = World()
-    add_world_box(world, world_width, world_height, inset, col=Endesga.greyD)
+    world.background = DUSK_BACKGROUND
+    add_world_box(world, world_width, world_height, inset, col=DUSK_WALL)
     world.set_looping("top", True)  # no ceiling: what loops off the bottom comes in from above the screen
     world.set_looping("bottom", True)  # no floor
-    tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed)
+    tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed, palette=DUSK_DIAMONDS)
     diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, fraction=fraction, side=inset,
                              margin=DIAMOND_MARGIN, size=DIAMOND_SIDE, gap=CUP_GAP, max_width=DIAMOND_CHAIN_WIDTH)
     for corners, col in diamonds:
@@ -169,9 +174,9 @@ def build_diamonds_scene(world_width, world_height, seed=7, fraction=0.09, hexag
     rng = np.random.default_rng(seed + 2)
     for cx, cy, r, angle in place_hexagons([c for c, _ in diamonds], world_width, world_height, hexagons, seed=seed,
                                            side=inset):
-        col = BRIGHT_ENDESGA_32[int(rng.integers(len(BRIGHT_ENDESGA_32)))]
+        col = DUSK_HEXAGONS[int(rng.integers(len(DUSK_HEXAGONS)))]
         world.add(SoftBody(polygon_points(cx, cy, r, 6, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
-                           point_col=col, stick_col=Endesga.very_light_blue, point_radius=2, fill_col=col))
+                           point_col=col, stick_col=col, point_radius=2, fill_col=col))
     return world
 
 

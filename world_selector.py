@@ -38,6 +38,7 @@ from editor import BTN_GAP, CARD_BTN_H, CARD_TITLE_H
 
 SIDES = ("left", "right", "top", "bottom")
 SIDE_LABELS = {"left": "L", "right": "R", "top": "T", "bottom": "B"}
+GRID_SIZES = (8, 24, 96)  # broad phase cell sizes a world can pick (World.env["cell_size"]; default EnvConfig's)
 GLOBAL_ENV = ("gravity",)  # EnvConfig attributes saved / restored per world
 CUSTOM = "Custom"
 CONFIRM_SECONDS = 3.0  # the Custom world's Reset asks for a second click within this long
@@ -50,6 +51,7 @@ ROW_GAP = 3
 NAME_W = 160
 TOGGLE_W = 18
 RESET_W = 46
+GRID_W = 22
 COL_GAP = 8
 LINE_H = 13
 # UI attributes the main loop / keys set on the active editor, carried to the next one on a switch
@@ -78,6 +80,11 @@ def looping_of(world):
     if isinstance(lp, dict):
         return {s: bool(lp.get(s, False)) for s in SIDES}
     return {s: False for s in SIDES}
+
+
+def grid_of(world):
+    """The world's broad phase cell size: its own (World.env) or EnvConfig's."""
+    return int(round(float(world.env.get("cell_size", EnvConfig.cell_size))))
 
 
 def looping_pending(world, side):
@@ -251,6 +258,21 @@ class WorldSession:
             env_restore(env)  # building restored the defaults; the active world keeps its own
         slot.world.set_looping(side, not looping_of(slot.world)[side])  # off may stay pending (pending_walls)
 
+    def set_grid(self, index, size):
+        """A world's broad phase cell size (building the world first if it's new). Results don't depend on it, only
+        speed: small cells suit small bodies, big ones sparse scenes."""
+        slot = self.slots[index]
+        if not slot.built:
+            env = env_snapshot()
+            self._build(slot)
+            env_restore(env)
+        slot.world.env["cell_size"] = float(size)
+
+    @staticmethod
+    def grid_shown(slot):
+        """The grid size buttons' state: the world's cell size (EnvConfig's default for an unbuilt world)."""
+        return grid_of(slot.world) if slot.built else int(EnvConfig.cell_size)
+
     @staticmethod
     def looping_shown(slot):
         """The toggles' states: World.looping (a pending side already reads off), all off for an unbuilt world."""
@@ -269,9 +291,11 @@ class WorldSession:
 
     # ---------------- Layout (UI px)
     def _layout(self):
-        """{"panel", "close", "rows": [(slot index, name rect, [(side, toggle rect)], reset rect)], "head_y",
-        "foot_y"}, centered in the editor's free area (left of the HUD cards)."""
-        w = PAD + NAME_W + COL_GAP + 4 * TOGGLE_W + 3 * ROW_GAP + COL_GAP + RESET_W + PAD
+        """{"panel", "close", "rows": [(slot index, name rect, [(side, toggle rect)], reset rect, [(size, grid rect)])],
+        "head_y", "foot_y"}, centered in the editor's free area (left of the HUD cards)."""
+        nk = len(GRID_SIZES)
+        w = (PAD + NAME_W + COL_GAP + 4 * TOGGLE_W + 3 * ROW_GAP + COL_GAP + nk * GRID_W + (nk - 1) * ROW_GAP + COL_GAP
+             + RESET_W + PAD)
         n = len(self.slots)
         h = HEADER_H + LINE_H + n * (ROW_H + ROW_GAP) - ROW_GAP + PAD + 2 * LINE_H + PAD // 2
         area = self.editor._area()
@@ -284,8 +308,10 @@ class WorldSession:
             name = pygame.Rect(panel.x + PAD, y, NAME_W, ROW_H)
             x = name.right + COL_GAP
             toggles = [(side, pygame.Rect(x + k * (TOGGLE_W + ROW_GAP), y, TOGGLE_W, ROW_H)) for k, side in enumerate(SIDES)]
-            reset = pygame.Rect(toggles[-1][1].right + COL_GAP, y, RESET_W, ROW_H)
-            rows.append((i, name, toggles, reset))
+            gx = toggles[-1][1].right + COL_GAP
+            grids = [(size, pygame.Rect(gx + k * (GRID_W + ROW_GAP), y, GRID_W, ROW_H)) for k, size in enumerate(GRID_SIZES)]
+            reset = pygame.Rect(grids[-1][1].right + COL_GAP, y, RESET_W, ROW_H)
+            rows.append((i, name, toggles, reset, grids))
         close = pygame.Rect(panel.right - 6 - ROW_H, panel.y + 6, ROW_H, ROW_H)
         return {"panel": panel, "close": close, "rows": rows, "head_y": head_y,
                 "foot_y": y0 + n * (ROW_H + ROW_GAP) - ROW_GAP + PAD}
@@ -295,12 +321,15 @@ class WorldSession:
         lay = self._layout()
         ws = [(lay["close"], self.toggle, ("button", "x", False, False))]
         confirming = time.time() <= self.confirm_until
-        for i, name, toggles, reset in lay["rows"]:
+        for i, name, toggles, reset, grids in lay["rows"]:
             slot = self.slots[i]
             ws.append((name, lambda i=i: self.switch(i), ("world", i)))
             shown = self.looping_shown(slot)
             for side, rect in toggles:
                 ws.append((rect, lambda i=i, s=side: self.toggle_looping(i, s), ("loop", i, side, shown[side])))
+            grid = self.grid_shown(slot)
+            for size, rect in grids:
+                ws.append((rect, lambda i=i, z=size: self.set_grid(i, z), ("button", str(size), size == grid, False)))
             label = "Sure?" if slot.custom and confirming else "Reset"
             ws.append((reset, (lambda i=i: self.ask_reset(i)) if slot.built else None,
                        ("button", label, slot.custom and confirming, not slot.built)))
@@ -352,10 +381,11 @@ class WorldSession:
         ui.draw_frame(surface, panel, ui.PANEL_BG)
         ui.text(surface, "Worlds", (panel.centerx, panel.y + 6 + ROW_H // 2), ui.WHITE, "bold", ui.TITLE_SIZE, "center", "middle")
         rows = lay["rows"]
-        _, name0, toggles0, reset0 = rows[0]
+        _, name0, toggles0, reset0, grids0 = rows[0]
         hy = lay["head_y"] + LINE_H // 2 - 1
         ui.text(surface, "world", (name0.x + 2, hy), ui.TEXT_DIM, valign="middle")
         ui.text(surface, "looping", ((toggles0[0][1].x + toggles0[-1][1].right) // 2, hy), ui.TEXT_DIM, align="center", valign="middle")
+        ui.text(surface, "grid", ((grids0[0][1].x + grids0[-1][1].right) // 2, hy), ui.TEXT_DIM, align="center", valign="middle")
         for rect, _, spec in self._widgets():
             hovered = rect.collidepoint(mouse_ui)
             kind = spec[0]
@@ -373,7 +403,8 @@ class WorldSession:
         fy = lay["foot_y"]
         pending = any(s.pending(side) for s in self.slots for side in SIDES)
         lines = ["click a world to open it (paused)  ·  W / Esc close"]
-        lines.append("pink: wall returns once the edge is clear" if pending else "L R T B: loop out one side, in the other")
+        lines.append("pink: wall returns once the edge is clear" if pending
+                     else "L R T B: loop out one side, in the other  ·  grid: collision cell size")
         for k, line in enumerate(lines):
             ui.text(surface, line, (panel.centerx, fy + k * LINE_H + LINE_H // 2), ui.ACCENT if (k and pending) else ui.TEXT_DIM,
                     align="center", valign="middle")
@@ -396,28 +427,37 @@ class WorldSession:
 
     @staticmethod
     def card_height(compact=False):
-        """Title, the active world's button, and (not compact) its looping toggles. Independent of the state."""
+        """Title, the active world's button, and (not compact) its looping toggles and grid sizes. Independent of the
+        state."""
         px, pad = HUD.px, HUD.CARD_PAD
         h = pad + px(CARD_TITLE_H) + px(CARD_BTN_H) + pad - px(1)
-        return h if compact else h + px(BTN_GAP) + px(CARD_BTN_H)
+        return h if compact else h + 2 * (px(BTN_GAP) + px(CARD_BTN_H))
 
     def place(self, rect):
         self.card_rect = pygame.Rect(rect)
 
     def _card_layout(self):
-        """{"name": the active world's button, "toggles": [(side, rect)] (empty when compact)}, native screen px."""
+        """{"name": the active world's button, "toggles": [(side, rect)], "grids": [(size, rect)] (both empty when
+        compact), "loop_y" / "grid_y": their label rows}, native screen px."""
         r, px, pad = self.card_rect, HUD.px, HUD.CARD_PAD
         gap, bh = px(BTN_GAP), px(CARD_BTN_H)
         y = r.y + pad + px(CARD_TITLE_H)
-        lay = {"name": pygame.Rect(r.x + pad, y, r.w - 2 * pad, bh), "toggles": [], "loop_y": None}
+        lay = {"name": pygame.Rect(r.x + pad, y, r.w - 2 * pad, bh), "toggles": [], "loop_y": None, "grids": [],
+               "grid_y": None}
         if r.h >= self.card_height(False):
             y += bh + gap
-            label_w = HUD.font().size("loop")[0] + px(6)
+            label_w = max(HUD.font().size(t)[0] for t in ("loop", "grid")) + px(6)
             x0 = r.x + pad + label_w
             tw = (r.right - pad - x0 - 3 * gap) // 4
             lay["toggles"] = [(side, pygame.Rect(x0 + k * (tw + gap), y, tw if k < 3 else r.right - pad - x0 - 3 * (tw + gap), bh))
                               for k, side in enumerate(SIDES)]
             lay["loop_y"] = y + bh // 2
+            y += bh + gap
+            n = len(GRID_SIZES)
+            gw = (r.right - pad - x0 - (n - 1) * gap) // n
+            lay["grids"] = [(size, pygame.Rect(x0 + k * (gw + gap), y, gw if k < n - 1 else r.right - pad - x0 - (n - 1) * (gw + gap), bh))
+                            for k, size in enumerate(GRID_SIZES)]
+            lay["grid_y"] = y + bh // 2
         return lay
 
     def _card_widgets(self):
@@ -425,6 +465,8 @@ class WorldSession:
         ws = [(lay["name"], self.toggle, ("name",))]
         lp = looping_of(self.world)
         ws += [(rect, lambda s=side: self.toggle_looping(self.active, s), ("loop", side, lp[side])) for side, rect in lay["toggles"]]
+        grid = grid_of(self.world)
+        ws += [(rect, lambda z=size: self.set_grid(self.active, z), ("grid", size, size == grid)) for size, rect in lay["grids"]]
         return ws
 
     def draw_card(self, surface, origin, mouse_px, compact=False):
@@ -449,6 +491,11 @@ class WorldSession:
                 HUD.text(surface, name, (local.x + px(5), local.centery), ui.WHITE, "bold", valign="middle")
                 HUD.text(surface, "[w]", (local.right - px(5), local.centery), ui.TEXT_DIM if not self.open else ui.WHITE,
                          align="right", valign="middle")
+            elif spec[0] == "grid":
+                _, size, on = spec
+                HUD.draw_button(surface, local, None, hovered, on)
+                HUD.text(surface, str(size), local.center, ui.WHITE if on else ui.TEXT_DIM, "bold", align="center",
+                         valign="middle")
             else:
                 _, side, on = spec
                 pending = slot.pending(side)
@@ -457,3 +504,4 @@ class WorldSession:
                 HUD.text(surface, SIDE_LABELS[side], local.center, col, "bold", align="center", valign="middle")
         if lay["loop_y"] is not None:
             HUD.text(surface, "loop", (r.x + pad, lay["loop_y"] - oy), ui.TEXT, valign="middle")
+            HUD.text(surface, "grid", (r.x + pad, lay["grid_y"] - oy), ui.TEXT, valign="middle")

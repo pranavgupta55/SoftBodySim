@@ -151,6 +151,45 @@ def build_looping(world_width, world_height):
     return world
 
 
+FLUID_COUNT = 450  # hexagons in the "fluid" preset
+FLUID_DEPTH = 0.4  # the share of the world's height they fill, from the bottom
+FLUID_BLUES = ([18, 60, 130], [90, 200, 240])  # darkest and lightest shade: each hexagon is a random mix
+FLUID_FRICTION = 0.05  # slippery, so the pile flows (this world's own setting, World.env)
+
+
+def build_fluid(world_width, world_height, count=FLUID_COUNT, seed=0):
+    """A few hundred small soft hexagons in shades of blue, packed into the bottom FLUID_DEPTH of the world, with low
+    friction so they slosh around like a fluid. Left / right looping is on (no side walls): what flows out one side
+    comes in the other."""
+    from scene import Endesga, INSET, add_world_box
+    world = World()
+    add_world_box(world, world_width, world_height, INSET, col=Endesga.greyD)
+    _set_looping(world, ("left", "right"))
+    world.env["friction"] = FLUID_FRICTION
+    rng = np.random.default_rng(seed)
+    x0, x1 = INSET, world_width - INSET
+    y1 = world_height - INSET
+    depth = FLUID_DEPTH * world_height
+    # hex packing of circles (radius R, one per hexagon) that fits `count` in the box: rows sqrt(3) R apart
+    R = math.sqrt((x1 - x0) * depth / (2 * math.sqrt(3) * count))
+    r = R - 3.0  # each hexagon's circumradius: a 6 unit gap to its neighbours and the walls (> contact_radius)
+    lo, hi = np.array(FLUID_BLUES[0], dtype=float), np.array(FLUID_BLUES[1], dtype=float)
+    cols = int((x1 - x0) // (2 * R))
+    left = x0 + ((x1 - x0) - cols * 2 * R) / 2  # center the rows (looping sides: no walls to touch)
+    row = 0
+    while y1 - R - row * math.sqrt(3) * R > y1 - depth + R:
+        cy = y1 - R - row * math.sqrt(3) * R
+        shift = R if row % 2 else 0.0
+        for k in range(cols - (1 if row % 2 else 0)):
+            cx = left + R + shift + k * 2 * R
+            col = [int(c) for c in lo + rng.uniform() * (hi - lo)]
+            size = r * rng.uniform(0.85, 1.0)  # not all the same size, so they don't lock into a crystal
+            world.add(SoftBody(polygon_points(cx, cy, size, 6, angle=rng.uniform(0, math.pi / 3)), stiffness=0.1,
+                               skip_sets=2, point_radius=2, **_style(col)))
+        row += 1
+    return world
+
+
 def validate_layout(world):
     """Raise ValueError unless the world is intersection-free: no movable body's edge crosses another body's edge
     (or its own non-neighbouring edges), no movable body sits inside another, and no point of a movable body is
@@ -198,4 +237,5 @@ PRESETS = {
     "blank": build_blank,
     "random walls": build_random_walls,
     "looping": build_looping,
+    "fluid": build_fluid,
 }

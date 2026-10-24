@@ -180,6 +180,14 @@ class GLPresenter:
             for tex, surface in zip(self.textures, self.layers):
                 self._write(tex, surface)
 
+    def set_background(self, rgb):
+        """The color behind the game layer (the active world's background)."""
+        background = tuple(c / 255 for c in rgb)
+        if background != self.background:
+            self.background = background
+            if not self.basic:
+                self.prog["u_background"].value = background
+
     def render(self, shake=(0, 0)):
         ctx, (fb_w, fb_h) = self.ctx, self.fb_size
         w, h = self.layers[0].get_size()
@@ -349,7 +357,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         mx, my = pygame.mouse.get_pos()
         mx, my = mx / scaleDownFactor, my / scaleDownFactor  # render-surface pixels (cursor, UI)
         wx, wy = mx / ViewConfig.zoom, my / ViewConfig.zoom  # world units (physics)
-        screen2.fill(Endesga.my_blue)
+        background = world.background or Endesga.my_blue  # presets may have their own (World.background)
+        screen2.fill(background)
+        presenter.set_background(background)
         screenT.fill((0, 0, 0, 0))
         screenUI.fill((0, 0, 0, 0))
         dt = time.time() - last_time

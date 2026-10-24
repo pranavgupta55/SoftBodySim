@@ -160,6 +160,8 @@ def _world_state(world, index, arr, col):
     if isinstance(getattr(world, "env", None), dict) and world.env:  # per-world EnvConfig overrides
         st["env"] = {str(k): (np.asarray(v, dtype=float).tolist() if isinstance(v, (list, tuple, np.ndarray)) else v)
                      for k, v in world.env.items() if v is None or isinstance(v, (int, float, list, tuple, np.ndarray))}
+    if getattr(world, "background", None) is not None:
+        st["background"] = [int(c) for c in world.background]
     tv = getattr(world, "terminal_velocity", None)
     if isinstance(tv, (int, float)) and not isinstance(tv, bool) and math.isfinite(tv):
         st["terminal_velocity"] = float(tv)
@@ -495,6 +497,8 @@ def install(world, bodies, ropes, hooks, state=None):
             setattr(world, key, empty())
     if hasattr(world, "terminal_velocity"):
         world.terminal_velocity = None
+    if hasattr(world, "background"):
+        world.background = None
     if hasattr(world, "last_wraps"):
         world.last_wraps = []
     for key, value in (state or {}).items():
