@@ -5,7 +5,9 @@ GPU textures every frame and drawn with a fullscreen quad. On top of that port, 
 editor ghost, UI) are composited and nearest-neighbour upscaled in one fragment shader (shaders/composite.frag)
 instead of three pygame.transform.scale calls and blits on the CPU. The HUD cards are drawn at native resolution on a
 small layer covering just the card column (hud_layer.py); only its used rows are uploaded, to their own texture, and
-drawn as a blended quad over the composite (shaders/hud.frag), in both modes.
+drawn as a blended quad over the composite (shaders/hud.frag), in both modes. While the editor places a hook, its peg
+grid overlay (peg_layer.py, native resolution) is drawn the same way between the two (shaders/pegs.frag); it's
+uploaded only when it changes.
 
     python3 main_opengl.py                      fullscreen, GPU compositing
     python3 main_opengl.py --window 1280x800    windowed
@@ -32,7 +34,7 @@ import moderngl
 import pygame
 
 from scene import Endesga, ViewConfig, INSET, build_scene
-from editor import Editor
+from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
 from perf_hud import PerfHUD
 from hud_layer import HudLayer
@@ -131,6 +133,17 @@ class GLPresenter:
             self.hud_prog["u_fb_height"].value = fb_size[1]
             self.hud_prog["u_origin"].value = (hud.rect.x * hud_scale, hud.rect.y * hud_scale)
             self.hud_rows = 0  # rows uploaded this frame
+        self.peg_tex, self.peg_version = None, None  # the peg overlay's texture (made on first use) and its version
+        self.peg_prog = load_shader(ctx, "basic.vert", "pegs.frag")
+        self.peg_vao = ctx.vertex_array(self.peg_prog, [(self.quad, "2f 8x", "in_vert")])
+        self.peg_prog["u_pegs"].value = 0
+        self.peg_prog["u_scale"].value = hud_scale
+        self.peg_prog["u_ui_scale"].value = scale
+        self.peg_prog["u_fb_height"].value = fb_size[1]
+        self.peg_prog["u_ui_mask"].value = not basic  # basic mode has no separate UI texture to mask with
+        self.peg_prog["u_color"].value = tuple(c / 255 for c in PEG_COL) + (PEG_ALPHA / 255,)
+        if not basic:
+            self.peg_prog["u_ui"].value = 1
 
     @staticmethod
     def _write(tex, surface):
@@ -173,6 +186,28 @@ class GLPresenter:
         prog["u_scale"].value = self.scale
         prog["u_shake"].value = (shake[0] * self.scale / SCALE_DOWN, shake[1] * self.scale / SCALE_DOWN)
         self.vao.render(mode=moderngl.TRIANGLE_STRIP)
+
+    def render_pegs(self, layer):
+        """Blend the editor's peg overlay (a peg_layer.PegLayer, or None when not placing a hook) over the frame. Its
+        mask is uploaded to an R8 texture only when the layer was rebuilt (layer.version changed)."""
+        if layer is None:
+            return
+        if self.peg_tex is None or self.peg_tex.size != (layer.w, layer.h):
+            self.peg_tex = self.ctx.texture((layer.w, layer.h), 1, dtype="f1")
+            self.peg_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self.peg_version = None
+        if layer.version != self.peg_version:
+            self.peg_tex.write(layer.mask.tobytes())  # row 0 = the top row, like the other layers
+            self.peg_version = layer.version
+        ctx = self.ctx
+        ctx.viewport = (0, 0, *self.fb_size)
+        ctx.enable(moderngl.BLEND)
+        ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        self.peg_tex.use(location=0)
+        if not self.basic:
+            self.textures[2].use(location=1)  # the UI layer
+        self.peg_vao.render(mode=moderngl.TRIANGLE_STRIP)
+        ctx.disable(moderngl.BLEND)
 
     def upload_hud(self):
         """Upload the HUD layer's used rows (the top `hud.used` rows; texture row 0 is the surface's top row)."""
@@ -340,6 +375,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 presenter.upload_hud()
         with profiler.section("render"):
             presenter.render(shake)
+            presenter.render_pegs(editor.peg_layer())  # native-res peg grid while placing a hook
             with profiler.section("hud"):
                 presenter.render_hud()
         if MEASURE_GPU:

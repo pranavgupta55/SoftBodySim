@@ -40,8 +40,14 @@ class World:
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
         self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend)
 
-    def add(self, body):
-        self.bodies.append(body)
+    def add(self, body, index=None):
+        """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
+        before what it holds). Repacks the arrays, so global point indices (e.g. a held grab) shift."""
+        if index is None:
+            self.bodies.append(body)
+        else:
+            self.bodies.insert(index, body)
+            self.grabbed = None
         self._rebuild()
 
     def add_rope(self, rope):

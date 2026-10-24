@@ -1,5 +1,9 @@
 """In-game editor: pause/play, a spawn menu with per-body settings, and point placement with validation.
 
+Several objects can be spawned in one pause: Finish adds the object and goes back to the spawn menu, still paused;
+P / the play button resumes. Colliding kinds can be placed free, inside an existing object or around existing objects
+(picked by clicking them first); validation then follows a containment hierarchy of the bodies (see _parents).
+
 The panels, buttons, hints and messages are drawn on the scaled-down UI surface in the shared ui_style (Endesga
 colors, solid black 2px borders, non-antialiased text), so they have the same pixel look as the world. Their positions
 are UI-surface pixels: mouse events arrive in real screen pixels and are divided by the scale-down factor; world units
@@ -16,6 +20,7 @@ import pygame
 
 import ui_style as ui
 from ui_style import HUD
+from peg_layer import PegLayer
 from entities import (Chain, EnvConfig, FixedBody, Hook, RigidBody, Rope, SoftBody, chain_box_points, chain_counts,
                       chain_layout, draw_border, polygon_points)
 
@@ -26,14 +31,28 @@ POINT_COUNTS = {"soft": (3, 4, 5, 6, 7, 8, 12, 20), "rigid": (3, 4, 5, 6, 7, 8, 
 STRENGTH_RANGE = (0.1, 1.0)  # soft body spring strength and rope stiffness
 ROPE_WIDTHS = (1, 2)
 CHAIN_MAX = 50  # chain segments (ropes + boxes)
-CHAIN_ENDS = ("rope", "box")
+# what a chain starts and ends with: rope...box and box...rope are mirror images (click the ends the other way round),
+# so only three combinations are offered
+CHAIN_ENDS = (("rope", "rope", "Rope-rope"), ("rope", "box", "Rope-box"), ("box", "box", "Box-box"))
 CHAIN_MIN_ROPE = 2 * EnvConfig.contact_radius + 2  # world units: shortest rope a placed chain may have between pieces
 SNAP_UI_PX = 5  # a rope end clicked this close (UI px) to a body point or hook attaches to it
-PEG_COL = (255, 255, 255)  # peg grid overlay shown while placing a hook (one pixel per peg, drawn over the scene)
-PEG_ALPHA = 100
+PICK_UI_PX = 4  # an object clicked this close (UI px) to its outline is picked (inside / around selection)
+HOOK_COLOR = "greyL"  # hooks have no settings panel: a 3 px marker in the demo's colour
+PEG_COL = (255, 255, 255)  # peg grid overlay shown while placing a hook (see peg_layer.py), drawn over the scene
+PEG_ALPHA = 150
+PEG_DOT = 1  # peg dot size in native screen px (1 or 3)
+# placement relations: free (top level, like before), inside one container, or around one or more objects. Only
+# colliding kinds have them (ropes and hooks never collide); a chain is open, so it can't go around anything, and
+# neither can a 2-point fixed segment
+RELATIONS = {"soft": ("free", "inside", "around"), "rigid": ("free", "inside", "around"),
+             "fixed": ("free", "inside", "around"), "chain": ("free", "inside")}
+RELATION_HINTS = {"free": "on its own", "inside": "inside one object", "around": "around objects"}
+HINT_FADE = 64  # opacity of the hint box while the mouse is over it
 MESSAGE_SECONDS = 1.6
 BAD_SPOT = "you cannot spawn a point there"
 INCOMPLETE = "complete the new object to resume the sim"
+FINISH_FIRST = "complete the new object first"
+DIFFERENT_CONTAINERS = "pick objects in the same container"
 MESSAGE_SIZE = 20  # bold, shrunk to fit narrow surfaces
 
 # layout, in UI-surface pixels (the info card uses the CARD_* / LINE_H / BTN_GAP / KEY_COL_W ones times HUD_SCALE)
@@ -119,6 +138,16 @@ def point_in_poly(pt, poly):
     return np.count_nonzero(straddle & (x < x_cross)) % 2 == 1
 
 
+def poly_area(poly):
+    x, y = poly
+    return abs(0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def closed(body):
+    """Does the body have an interior (a polygon, not a 2-point segment)? Only those can contain things."""
+    return body.edges.shape[1] >= 3
+
+
 def skip_springs(n, sets):
     """Spring index pairs a SoftBody with n points and `sets` skip sets would get (for previews)."""
     pairs = set()
@@ -152,15 +181,18 @@ class Editor:
                          "rigid": {"n": 4, "color": "debug_red"},  # the square
                          "fixed": {"n": 4, "color": "grey"},
                          "rope": {"n": 2, "stiffness": 1.0, "width": 1, "color": "light_brown"},  # like the demo ropes
-                         "hook": {"n": 1, "color": "greyL"},  # one hook per Finish, like the other kinds
+                         "hook": {"n": 1},  # one hook per Finish, like the other kinds; no settings panel
                          # two ends to place; segments = ropes + boxes, odd for rope...rope (see chain_range)
                          "chain": {"n": 2, "segments": 3, "start": "rope", "end": "rope", "color": "grey",
                                    "rope_color": "light_brown"}}
         self.paused = False
         self.active = False  # editor mode
-        self.stage = None  # "menu" -> "config" -> "place"
+        self.stage = None  # "menu" -> "config" -> ("select" ->) "place"; Finish goes back to "menu"
         self.kind = None
-        self.mode = None  # "regular", "custom" or "rope"
+        self.mode = None  # "regular", "custom", "rope", "hook" or "chain"
+        self.relation = "free"  # "free", "inside" or "around" (chosen on the settings panel, reset per kind)
+        self.selection = []  # the container (inside) or the objects to enclose (around), picked in the "select" stage
+        self._tree_key, self._tree = None, None  # cached containment hierarchy (see _parents)
         self.points = []  # placed points (world coords) of the object being built
         self.snaps = []  # per point: (body, point_index) a rope end is attached to, or None (free point / anchor)
         self.undo_stack, self.redo_stack = [], []
@@ -173,7 +205,8 @@ class Editor:
         self.compute_card = None  # its rect (real screen px), set by the main loop when drawn: clicks on it are swallowed
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
-        self._peg_layer, self._peg_key = None, None  # cached peg grid overlay and what it was built for
+        # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
+        self.pegs = PegLayer((self.screen_w, self.screen_h), PEG_DOT)
 
     # ---------------- Small utilities
     def _color(self, name):
@@ -201,12 +234,16 @@ class Editor:
         self.show_compute = not self.show_compute
 
     def toggle_pause(self):
+        """P / the play button. Outside the editor it pauses and resumes. In the editor it resumes (closing it): a
+        complete object that wasn't finished yet is spawned first, a half-placed one blocks resuming with a message."""
         if self.active:
-            if self.stage == "place":
-                self.finish()
-            else:
-                self.close()
-                self.paused = False
+            if self.stage == "place" and self.points:
+                if not self._complete():
+                    self._say(INCOMPLETE)
+                    return
+                self._spawn()
+            self.close()
+            self.paused = False
         else:
             self.paused = not self.paused
             if self.paused:
@@ -217,12 +254,17 @@ class Editor:
 
     def close(self):
         self.active, self.stage, self.kind, self.mode = False, None, None, None
+        self.relation, self.selection = "free", []
         self._reset_object()
 
     def back(self):
+        """Esc / < Back: place -> select (inside / around) -> settings -> menu -> closed. A hook has no settings
+        panel, so its placement goes straight back to the menu."""
         if self.stage == "place":
             self._reset_object()
-            self.stage = "config"
+            self.stage = "menu" if self.kind == "hook" else "select" if self.relation != "free" else "config"
+        elif self.stage == "select":
+            self.selection, self.stage = [], "config"
         elif self.stage == "config":
             self.stage = "menu"
         else:
@@ -233,34 +275,50 @@ class Editor:
         self.drag_idx = self.drag_from = self.reg_start = None
 
     def choose_kind(self, kind):
-        self.kind, self.stage = kind, "config"
+        self.kind, self.stage, self.relation, self.selection = kind, "config", "free", []
+        if kind == "hook":  # nothing to set: straight to placement
+            self.start_place("hook")
+
+    def set_relation(self, relation):
+        self.relation, self.selection = relation, []
 
     def start_place(self, mode):
+        """Start placing in `mode`; with an inside / around relation, the object(s) are picked first."""
         self._reset_object()
-        self.mode, self.stage = mode, "place"
+        self.mode = mode
+        self.stage = "place" if self.relation == "free" else "select"
+
+    def done_selecting(self):
+        if not self.selection:
+            self._say("click an object first")
+            return
+        self._reset_object()
+        self.stage = "place"
 
     def finish(self):
+        """Finish: spawn the object and go back to the spawn menu, still paused (P / the play button resumes)."""
         if not self.points or not self._complete():
-            self._say(INCOMPLETE)
+            self._say(FINISH_FIRST)
             return
-        cfg, col = self._cfg(), self._color(self._cfg()["color"])
+        self._spawn()
+        self._reset_object()
+        self.kind, self.mode, self.stage, self.relation, self.selection = None, None, "menu", "free", []
+
+    def _spawn(self):
+        """Add the complete object being placed to the world."""
+        cfg = self._cfg()
         if self.kind == "hook":
-            self.world.add_hook(Hook(self.points[0], col=col))
-            self.close()
-            self.paused = False
+            self.world.add_hook(Hook(self.points[0], col=self._color(HOOK_COLOR)))
             return
+        col = self._color(cfg["color"])
         if self.kind == "rope":  # rest length = the ends' current distance, so it starts exactly taut
             ends = [snap if snap is not None else tuple(p) for p, snap in zip(self.points, self.snaps)]
             self.world.add_rope(Rope(ends[0], ends[1], stiffness=cfg["stiffness"], col=col, width=cfg["width"]))
-            self.close()
-            self.paused = False
             return
         if self.kind == "chain":  # boxes and ropes laid out between the ends; every rope starts exactly taut
             ends = [snap if snap is not None else tuple(p) for p, snap in zip(self.points, self.snaps)]
             self.world.add_chain(Chain(ends[0], ends[1], cfg["segments"], cfg["start"], cfg["end"], box_col=col,
                                        rope_col=self._color(cfg["rope_color"])))
-            self.close()
-            self.paused = False
             return
         pts = np.array(self.points, dtype=float).T
         style = dict(point_col=col, stick_col=col, fill_col=col)
@@ -270,9 +328,11 @@ class Editor:
             body = RigidBody(pts, point_radius=3, **style)
         else:
             body = FixedBody(pts, point_radius=2, stick_width=2 if pts.shape[1] == 2 else 1, **style)
-        self.world.add(body)
-        self.close()
-        self.paused = False
+        index = None
+        if self.relation == "around":  # drawn under what it encloses: just before the first of those bodies
+            enclosed = self._target()[1]
+            index = min(self.world.bodies.index(b) for b in enclosed)
+        self.world.add(body, index)
 
     # ---------------- Undo / redo
     def _push(self, action):
@@ -305,9 +365,137 @@ class Editor:
             self.points[action[1]], self.snaps[action[1]] = action[3], action[5]
         self.undo_stack.append(action)
 
+    # ---------------- Containment hierarchy (inside / around), world units
+    def _is_wall(self, body):
+        """One of the world box's walls: a fixed segment lying on the box outline (never picked or enclosed)."""
+        if not body.fixed or body.points.shape[1] != 2:
+            return False
+        (x0, x1), (y0, y1) = body.points
+        lo, hx, hy = self.inset, self.world_w - self.inset, self.world_h - self.inset
+        return any(abs(a - v) < 1e-6 and abs(b - v) < 1e-6 for a, b, v in ((x0, x1, lo), (x0, x1, hx), (y0, y1, lo), (y0, y1, hy)))
+
+    def _parents(self):
+        """{body: the innermost closed body it lies inside, or None at the top level}. Point-in-polygon on whole
+        bodies: B is inside C when every point of B is inside C's polygon; the state is intersection-free, so the
+        bodies containing B are nested and the innermost is the one with the smallest area. Cached until a body is
+        added or a point moves (the editor works while paused)."""
+        world = self.world
+        key = (tuple(map(id, world.bodies)), world.P.tobytes() if world.bodies else b"")
+        if key != self._tree_key:
+            polys = [c for c in world.bodies if closed(c)]
+            lo = {id(b): b.points.min(axis=1) for b in world.bodies}
+            hi = {id(b): b.points.max(axis=1) for b in world.bodies}
+            area = {id(c): poly_area(c.points) for c in polys}
+            tree = {}
+            for b in world.bodies:
+                best = None
+                for c in polys:
+                    if c is b or (lo[id(b)] < lo[id(c)]).any() or (hi[id(b)] > hi[id(c)]).any():
+                        continue  # C's bounding box doesn't hold B's
+                    if points_in_poly(b.points, c.points).all() and (best is None or area[id(c)] < area[id(best)]):
+                        best = c
+                tree[b] = best
+            self._tree_key, self._tree = key, tree
+        return self._tree
+
+    def _ancestors(self, body):
+        """body, its container, that one's container, ... (empty for None)."""
+        if body is None:
+            return []
+        parents, out = self._parents(), []
+        while body is not None:
+            out.append(body)
+            body = parents.get(body)
+        return out
+
+    def _with_contents(self, bodies):
+        """The bodies plus everything nested inside them (at any depth)."""
+        chosen = set(bodies)
+        return {b for b in self.world.bodies if chosen.intersection(self._ancestors(b))}
+
+    def _target(self):
+        """(where the new object goes: its container or None for the top level, the bodies it must enclose)."""
+        if self.relation == "inside" and self.selection:
+            return self.selection[0], frozenset()
+        if self.relation == "around" and self.selection:
+            return self._parents()[self.selection[0]], frozenset(self._with_contents(self.selection))
+        return None, frozenset()
+
+    def _region_ok(self, new):
+        """Are all the points (2, k) in the new object's region: inside its container and that one's containers, and
+        inside no other body (a sibling, or anything else)? With no container that's simply "inside no body"."""
+        must = set(self._ancestors(self._target()[0]))
+        lo, hi = new.min(axis=1), new.max(axis=1)
+        for c in self.world.bodies:
+            if not closed(c):
+                continue
+            if c not in must and ((c.points.max(axis=1) < lo).any() or (c.points.min(axis=1) > hi).any()):
+                continue  # bounding boxes apart: no point can be inside
+            inside = points_in_poly(new, c.points)
+            if (not inside.all()) if c in must else inside.any():
+                return False
+        return True
+
+    def _encloses_ok(self, new):
+        """The finished polygon (2, k) encloses exactly the bodies it must (the picked objects and their contents for
+        "around", nothing otherwise) and cuts through none: an unpicked object that would end up inside is rejected,
+        not added, so the result is always what was picked."""
+        must = self._target()[1]
+        lo, hi = new.min(axis=1), new.max(axis=1)
+        for b in self.world.bodies:
+            if b not in must and ((b.points.max(axis=1) < lo).any() or (b.points.min(axis=1) > hi).any()):
+                continue
+            inside = points_in_poly(b.points, new)
+            if not (inside.all() if b in must else not inside.any()):
+                return False
+        return True
+
+    def _pick(self, wp):
+        """The object a click at wp picks for the current relation: the innermost one whose polygon holds wp, or one
+        whose outline is within PICK_UI_PX (segments and chain boxes too). Walls, and for "inside" bodies without an
+        interior, can't be picked. None if nothing is there."""
+        reach = PICK_UI_PX / self.zoom
+        best, best_area = None, math.inf
+        p = np.asarray(wp, dtype=float).reshape(2, 1)
+        for b in self.world.bodies:
+            if self._is_wall(b) or (self.relation == "inside" and not closed(b)):
+                continue
+            a, c = b.points[:, b.edges[0]], b.points[:, b.edges[1]]
+            hit = (closed(b) and point_in_poly(p[:, 0], b.points)) or point_seg_dist(p, a, c).min() <= reach
+            area = poly_area(b.points) if closed(b) else 0.0
+            if hit and area < best_area:
+                best, best_area = b, area
+        return best
+
+    def _select(self, wp):
+        """A click while picking: "inside" takes the container and moves on to placement; "around" toggles the object
+        (picking a container of picked objects replaces them; they're enclosed with it anyway). Every picked object
+        must be in the same container, or the new object couldn't reach around all of them without crossing it."""
+        body = self._pick(wp)
+        if body is None:
+            self._say("click an object")
+            return
+        if self.relation == "inside":
+            self.selection = [body]
+            self.done_selecting()
+            return
+        if body in self.selection:
+            self.selection.remove(body)
+            return
+        if any(s in self.selection for s in self._ancestors(body)[1:]):
+            self._say("that is already inside a picked object")
+            return
+        keep = [s for s in self.selection if body not in self._ancestors(s)]
+        parents = self._parents()
+        if keep and parents[keep[0]] is not parents[body]:
+            self._say(DIFFERENT_CONTAINERS)
+            return
+        self.selection = keep + [body]
+
     # ---------------- Placement validation
     def _valid(self, pts, complete):
-        """Can these points (the object so far) exist without touching the world or themselves?"""
+        """Can these points (the object so far) exist without touching the world or themselves, in the region the
+        relation puts them (top level / inside the container / around the picked objects)?"""
         r = EnvConfig.contact_radius
         new = np.array(pts, dtype=float).T
         k = new.shape[1]
@@ -319,20 +507,18 @@ class Editor:
         has_edges = bool(world.bodies) and world.edges.shape[1] > 0
         if has_edges:
             a, b = world.P[:, world.edges[0]], world.P[:, world.edges[1]]
-        polygons = [body.points for body in world.bodies if body.edges.shape[1] >= 3]
-        for i in range(k):
-            p = new[:, i:i + 1]
-            if has_edges and point_seg_dist(p, a, b).min() < r:
-                return False
-            if any(point_in_poly(new[:, i], poly) for poly in polygons):
-                return False
+            if point_seg_dist(new[:, :, None], a[:, None, :], b[:, None, :]).min() < r:
+                return False  # a point too close to an edge
+        if not self._region_ok(new):
+            return False
 
         edges = [(i, i + 1) for i in range(k - 1)]
         if complete and k >= 3:
             edges.append((k - 1, 0))
-        for i, j in edges:
-            if has_edges and seg_seg_dist(new[:, i], new[:, j], a, b).min() < r:
-                return False
+        if has_edges and edges:
+            i, j = np.array(edges).T
+            if segs_dist(new[:, i], new[:, j], a, b).min() < r:
+                return False  # an edge too close to (or crossing) an existing edge
 
         # the object itself: points spread out, edges not crossing each other
         for i in range(k):
@@ -345,11 +531,12 @@ class Editor:
                     return False
 
         if complete and k >= 3:
-            x, y = new
-            if abs(0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)) < r * r:
+            if poly_area(new) < r * r:
                 return False  # degenerate sliver
-            if world.bodies and any(point_in_poly(world.P[:, c], new) for c in range(world.P.shape[1])):
-                return False  # would swallow an existing body
+            if not self._encloses_ok(new):
+                return False  # would swallow (or cut into) the wrong bodies
+        elif self._target()[1]:
+            return not complete  # "around" needs a closed polygon
         return True
 
     def _valid_rope(self, pts, snaps):
@@ -443,9 +630,8 @@ class Editor:
         near = ((e_lo[:, :, None] <= box_hi[:, None, :]) & (e_hi[:, :, None] >= box_lo[:, None, :])).all(axis=0).any(axis=1)
         if near.any() and segs_dist(pts, ends, a[:, near], b[:, near]).min() < r:  # also covers the box points
             return False
-        for body in world.bodies:
-            if body.edges.shape[1] >= 3 and points_in_poly(pts, body.points).any():
-                return False
+        if not self._region_ok(pts):  # no box point inside a body (or outside the container, for "inside")
+            return False
         for box in boxes:  # boxes are convex: a world point is inside when it's left of (or right of) every edge
             e, rel = np.roll(box, -1, axis=1) - box, world.P[:, None, :] - box[:, :, None]
             side = e[0][:, None] * rel[1] - e[1][:, None] * rel[0]
@@ -495,24 +681,23 @@ class Editor:
         return self._in_box(p) and not any(np.hypot(*(hook.pos - p)) < half for hook in self.world.hooks)
 
     def _peg_px(self, p):
-        """The surface pixel a peg (or hook) at world position p lands on (the overlay uses the same rounding)."""
+        """The world-surface pixel a peg (or hook) at world position p lands on (for the target / hover rings)."""
         return int(math.floor(p[0] * self.zoom)), int(math.floor(p[1] * self.zoom))
 
-    def _peg_overlay(self):
-        """Translucent surface with one pixel per peg. Pre-rendered with a surfarray write and cached, so drawing it is
-        one alpha blit; rebuilt only when the surface size, zoom, peg spacing or world box changes."""
-        key = (self.W, self.H, self.zoom, EnvConfig.peg_spacing, self.inset, self.world_w, self.world_h)
-        if key != self._peg_key:
-            layer = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
-            layer.fill((*PEG_COL, 0))
-            xs, ys = self._pegs()
-            px, py = np.unique(np.floor(xs * self.zoom).astype(int)), np.unique(np.floor(ys * self.zoom).astype(int))
-            px, py = px[(px >= 0) & (px < self.W)], py[(py >= 0) & (py < self.H)]
-            alpha = pygame.surfarray.pixels_alpha(layer)  # indexed [x, y]
-            alpha[np.ix_(px, py)] = PEG_ALPHA
-            del alpha  # unlocks the surface
-            self._peg_layer, self._peg_key = layer, key
-        return self._peg_layer
+    def peg_screen_px(self, coords):
+        """Native screen pixel (column or row index) of each peg coordinate (world units): the pixel holding the
+        point world * zoom * scale, the same mapping as everything else on screen, so a dot sits on its peg."""
+        return np.floor(np.asarray(coords, dtype=float) * self.zoom * self.scale + 1e-6).astype(int)
+
+    def peg_layer(self):
+        """The native-res peg overlay (peg_layer.PegLayer) while a hook is being placed, else None. Its dots are at
+        the very pegs _hook_spot snaps to (_pegs, mapped by peg_screen_px); it's rebuilt only when the screen size,
+        zoom, peg spacing or world box changes (layer.version then changes, so the main loop re-uploads it)."""
+        if not (self.active and self.stage == "place" and self.mode == "hook"):
+            return None
+        key = (self.screen_w, self.screen_h, self.zoom, self.scale, EnvConfig.peg_spacing, self.inset, self.world_w, self.world_h)
+        self.pegs.update(key, lambda: tuple(self.peg_screen_px(c) for c in self._pegs()))
+        return self.pegs
 
     def _valid_now(self):
         """Is the object as placed so far valid?"""
@@ -637,7 +822,7 @@ class Editor:
         top = HUD.CARD_MARGIN
         buttons_y = top + pad + px(CARD_TITLE_H)
         lines_y = buttons_y + bh + pad
-        if self._placing():  # Undo / Finish / Redo row under the pause / edit / compute buttons
+        if self._row_shown():  # Undo / Finish / Redo (or Done) row under the pause / edit / compute buttons
             lines_y += bh + gap
         rect = HUD.card_rect(self.screen_w, top, lines_y + len(self._hotkeys()) * px(LINE_H) + pad - px(1) - top)
         bw = (rect.w - 2 * pad - 2 * gap) // 3
@@ -648,6 +833,18 @@ class Editor:
 
     def _placing(self):
         return self.active and self.stage == "place"
+
+    def _row_shown(self):
+        """Is there a row of action buttons (Undo / Finish / Redo while placing, Done while picking objects to go
+        around)?"""
+        return self._placing() or (self.active and self.stage == "select" and self.relation == "around")
+
+    def _relations(self):
+        """The placement relations the current kind offers (none for ropes and hooks: they never collide)."""
+        options = RELATIONS.get(self.kind, ())
+        if self.kind == "fixed" and self._cfg()["n"] == 2:  # a segment has no inside to put anything in
+            options = tuple(r for r in options if r != "around")
+        return options
 
     def _hotkeys(self):
         """(key, what it does, current state or None, usable now) for every hotkey, as listed on the info card."""
@@ -691,18 +888,16 @@ class Editor:
             y += LABEL_H
             lay["widths"] = [(pygame.Rect(x0 + i * (30 + BTN_GAP), y, 30, BTN_H), w) for i, w in enumerate(ROPE_WIDTHS)]
             y += BTN_H + ROW_GAP
-        elif self.kind == "hook":
-            pass  # just a color: a hook is a single fixed point
         elif self.kind == "chain":
             lay["rows"].append(("Segments", (x0, y)))
             y += LABEL_H
             lay["slider"] = pygame.Rect(x0 + 4, y + 4, 150, 6)
             y += 14 + ROW_GAP
-            bw, col2 = 40, x0 + 2 * 40 + BTN_GAP + 3 * PAD  # "Starts with" and "Ends with" side by side
-            lay["rows"] += [("Starts with", (x0, y)), ("Ends with", (col2, y))]
+            bw = 64
+            lay["rows"].append(("Ends", (x0, y)))
             y += LABEL_H
-            lay["ends"] = [(pygame.Rect(x + i * (bw + BTN_GAP), y, bw, BTN_H), which, kind)
-                           for x, which in ((x0, "start"), (col2, "end")) for i, kind in enumerate(CHAIN_ENDS)]
+            lay["ends"] = [(pygame.Rect(x0 + i * (bw + BTN_GAP), y, bw, BTN_H), start, end, label)
+                           for i, (start, end, label) in enumerate(CHAIN_ENDS)]
             y += BTN_H + ROW_GAP
         else:
             counts = POINT_COUNTS[self.kind]
@@ -715,11 +910,12 @@ class Editor:
 
         if self.kind == "soft":
             options = range(max_skip_sets(cfg["n"]) + 1)
-            bw = min(30, (COL_W - (len(options) - 1) * BTN_GAP) // len(options))
-            lay["rows"].append(("Spring sets", (x0, y)))
-            y += LABEL_H
-            lay["sets"] = [(pygame.Rect(x0 + i * (bw + BTN_GAP), y, bw, BTN_H), s) for i, s in enumerate(options)]
-            y += BTN_H + ROW_GAP
+            if len(options) > 1:  # a triangle has no springs past its sides: nothing to choose
+                bw = min(30, (COL_W - (len(options) - 1) * BTN_GAP) // len(options))
+                lay["rows"].append(("Spring sets", (x0, y)))
+                y += LABEL_H
+                lay["sets"] = [(pygame.Rect(x0 + i * (bw + BTN_GAP), y, bw, BTN_H), s) for i, s in enumerate(options)]
+                y += BTN_H + ROW_GAP
             lay["rows"].append(("Spring strength", (x0, y)))
             y += LABEL_H
             lay["slider"] = pygame.Rect(x0 + 4, y + 4, 150, 6)
@@ -740,20 +936,32 @@ class Editor:
             y += 4 + ((len(self.colors) - 1) // per_row + 1) * (sw + BTN_GAP) - BTN_GAP + ROW_GAP + 2
 
         bw2 = (CONFIG_W - 3 * PAD) // 2
-        if self.kind in ("rope", "hook", "chain"):
-            lay["modes"] = [(pygame.Rect(PAD, y, CONFIG_W - 2 * PAD, MODE_H), self.kind, f"Place {self.kind}")]
+        full = pygame.Rect(PAD, y, CONFIG_W - 2 * PAD, MODE_H)
+        if self.kind in ("rope", "chain"):
+            lay["modes"] = [(full, self.kind, f"Place {self.kind}")]
+        elif self.kind == "fixed" and cfg["n"] == 2:  # a segment: click its two ends (no regular polygon to size)
+            lay["modes"] = [(full, "custom", "Place segment")]
         else:
             lay["modes"] = [(pygame.Rect(PAD, y, bw2, MODE_H), "regular", "Regular polygon"),
                             (pygame.Rect(2 * PAD + bw2, y, bw2, MODE_H), "custom", "Draw points")]
         px0 = PAD + COL_W + PAD
         lay["preview"] = pygame.Rect(px0, HEADER_H, CONFIG_W - PAD - px0, y - ROW_GAP - HEADER_H)
+        relations = self._relations()
+        if relations:  # free / inside / around under the preview, with what the chosen one means above the buttons
+            ry = y - ROW_GAP - BTN_H
+            bw = (lay["preview"].w - 2 * BTN_GAP) // 3
+            lay["relations"] = [(pygame.Rect(px0 + i * (bw + BTN_GAP), ry, bw, BTN_H), rel) for i, rel in enumerate(relations)]
+            lay["relation_row"] = (px0, ry - LABEL_H)
+            lay["preview"].h -= BTN_H + LABEL_H + ROW_GAP
         panel = self._centered(CONFIG_W, y + MODE_H + PAD)
 
         dx, dy = panel.topleft
         lay["panel"] = panel
         lay["rows"] = [(label, (x + dx, ly + dy)) for label, (x, ly) in lay["rows"]]
         lay["color_rows"] = [((x + dx, ly + dy), key) for (x, ly), key in lay["color_rows"]]
-        for key in ("counts", "sets", "widths", "ends", "swatches", "modes"):
+        if "relation_row" in lay:
+            lay["relation_row"] = (lay["relation_row"][0] + dx, lay["relation_row"][1] + dy)
+        for key in ("counts", "sets", "widths", "ends", "relations", "swatches", "modes"):
             if key in lay:
                 lay[key] = [(r.move(dx, dy),) + tuple(rest) for r, *rest in lay[key]]
         for key in ("slider", "preview"):
@@ -768,8 +976,8 @@ class Editor:
         return ws
 
     def _place_buttons(self):
-        """Undo / Finish / Redo: a row in the info card (real screen px), or under the hint box while the HUD is hidden
-        (UI px)."""
+        """Undo / Finish / Redo while placing, or Done while picking objects to go around: a row in the info card
+        (real screen px), or under the hint box while the HUD is hidden (UI px)."""
         if self.show_card:
             pause = self._card_layout()[1]
             gap, bh = HUD.px(BTN_GAP), HUD.px(CARD_BTN_H)
@@ -779,6 +987,9 @@ class Editor:
             gap, bh = BTN_GAP, CARD_BTN_H
             total = 3 * 60 + 2 * gap
             x0, y = box.centerx - total // 2, box.bottom + gap
+        if self.stage == "select":
+            label = f"Done ({len(self.selection)} picked)"
+            return [(pygame.Rect(x0, y, total, bh), self.done_selecting, ("button", label, bool(self.selection), not self.selection))]
         bw = (total - 2 * gap) // 3
         rects = [pygame.Rect(x0 + i * (bw + gap), y, bw if i < 2 else total - 2 * (bw + gap), bh) for i in range(3)]
         return [(rects[0], self.undo, ("button", "Undo", False, not self.undo_stack)),
@@ -793,7 +1004,7 @@ class Editor:
         can_edit = self.paused and not self.active
         ws = [(pause, self.toggle_pause, ("pause",)), (plus, self.open if can_edit else None, ("plus", not can_edit)),
               (compute, self.toggle_compute, ("compute",))]
-        if self._placing():
+        if self._row_shown():
             ws += self._place_buttons()
         ws.append((rect, None, ("blocker",)))  # the rest of the card swallows clicks (no grabs / points under it)
         if self.show_compute and self.compute_card is not None:
@@ -818,13 +1029,16 @@ class Editor:
                 ws.append((rect, lambda n=n: self._set_count(n), ("button", str(n), cfg["n"] == n, False)))
             for rect, s in lay.get("sets", []):
                 ws.append((rect, lambda s=s: cfg.__setitem__("sets", s), ("button", str(s), cfg["sets"] == s, False)))
-            for rect, which, kind in lay.get("ends", []):
-                ws.append((rect, lambda w=which, k=kind: self._set_chain_end(w, k), ("button", kind.capitalize(), cfg[which] == kind, False)))
+            for rect, start, end, label in lay.get("ends", []):
+                ws.append((rect, lambda a=start, b=end: self._set_chain_ends(a, b),
+                           ("button", label, (cfg["start"], cfg["end"]) == (start, end), False)))
+            for rect, rel in lay.get("relations", []):
+                ws.append((rect, lambda r=rel: self.set_relation(r), ("button", rel.capitalize(), self.relation == rel, False)))
             for rect, name, key in lay["swatches"]:
                 ws.append((rect, lambda c=name, k=key: cfg.__setitem__(k, c), ("swatch", name, cfg[key] == name)))
             for rect, mode, label in lay["modes"]:
                 ws.append((rect, lambda m=mode: self.start_place(m), ("button", label, False, False)))
-        elif self.stage == "place" and not self.show_card:
+        elif self._row_shown() and not self.show_card:
             ws += self._place_buttons()
         return ws
 
@@ -848,12 +1062,14 @@ class Editor:
         cfg["n"] = n
         if "sets" in cfg:
             cfg["sets"] = min(cfg["sets"], max_skip_sets(n))
+        if self.relation not in self._relations():  # e.g. "around" for a 2-point segment
+            self.set_relation("free")
 
-    def _set_chain_end(self, which, kind):
-        """Pick what the chain starts / ends with; the segment count moves to the nearest count that fits."""
+    def _set_chain_ends(self, start, end):
+        """Pick what the chain starts and ends with; the segment count moves to the nearest count that fits."""
         cfg = self._cfg()
-        cfg[which] = kind
-        cfg["segments"] = fit_chain_count(cfg["segments"], cfg["start"], cfg["end"])
+        cfg["start"], cfg["end"] = start, end
+        cfg["segments"] = fit_chain_count(cfg["segments"], start, end)
 
     def _set_strength(self, x):
         """Slider drag at UI x: strength / stiffness in 0.1 steps, or a chain's segment count in steps of 2."""
@@ -912,6 +1128,8 @@ class Editor:
                 if slider is not None and slider.inflate(12, 14).collidepoint(pos):
                     self.slider_drag = True
                     self._set_strength(pos[0])
+            elif self.active and self.stage == "select":
+                self._select(wp)
             elif self.active and self.stage == "place":
                 self._place_down(wp)
             return self.paused
@@ -930,10 +1148,15 @@ class Editor:
     # ---------------- Drawing: world-space preview (scaled-down game surfaces)
     def draw_world(self, surface, ghost_surface, mouse_ui):
         """Preview of the object being placed: grey ghost on the translucent layer, placed points on top.
-        Before anything is placed the ghost follows the mouse (red where a click would be rejected)."""
-        if not (self.active and self.stage == "place"):
+        Before anything is placed the ghost follows the mouse (red where a click would be rejected). While picking
+        objects (and while placing inside / around them) the picked objects are outlined, and the one under the
+        mouse too while picking."""
+        if not (self.active and self.stage in ("select", "place")):
             return
         wp = self.to_world(mouse_ui)
+        self._draw_picks(surface, wp, self._over_ui(mouse_ui))
+        if self.stage == "select":
+            return
         z = self.zoom
         n, complete = self._cfg()["n"], self._complete()
         pts, valid = list(self.points), True
@@ -960,6 +1183,25 @@ class Editor:
         for i, p in enumerate(self.points):
             col = self.palette.white if i in (hover, self.drag_idx) else self.palette.greyL
             pygame.draw.circle(surface, col, tuple(np.asarray(p) * z), 2)
+
+    def _draw_picks(self, surface, wp, over_ui):
+        """Outlines over the bodies' borders: yellow for the picked container / objects, white for the object a click
+        would pick (or unpick)."""
+        pal = self.palette
+        for body in self.selection:
+            self._outline(surface, body, pal.yellow)
+        if self.stage == "select" and not over_ui:
+            body = self._pick(wp)
+            if body is not None:
+                self._outline(surface, body, pal.white)
+
+    def _outline(self, surface, body, col):
+        if closed(body):  # exactly over the filled view's black border
+            loop = np.round(body.points[:, body.edges[0]] * self.zoom).astype(int)
+            draw_border(surface, loop, col, ui.BORDER, body.winding)
+        else:
+            a, b = body.points.T * self.zoom
+            pygame.draw.line(surface, col, a, b, 3)
 
     def _draw_rope_preview(self, surface, ghost_surface, wp, over_ui):
         """Ghost line between the ends (the mouse is the next end); white ring on the body point an end would snap to.
@@ -1009,9 +1251,8 @@ class Editor:
             pygame.draw.polygon(ghost_surface, ghost, (box * z).T.tolist())
 
     def _draw_hook_preview(self, surface, ghost_surface, wp, over_ui):
-        """Peg grid over the whole scene, the peg a click would use (white ring, ghost hook; red if taken), and the
-        placed hook. The overlay goes on the world surface after the bodies, so it's under the ghost layer and UI."""
-        surface.blit(self._peg_overlay(), (0, 0))
+        """The peg a click would use (white ring, ghost hook; red if taken) and the placed hook. The peg grid itself
+        is the native-res overlay from peg_layer(), which the main loop draws over the scene (under the HUD)."""
         z, pal = self.zoom, self.palette
         spot = None
         if not over_ui:
@@ -1025,13 +1266,11 @@ class Editor:
             pygame.draw.circle(ghost_surface, ghost, c, 4)
             pygame.draw.circle(surface, pal.white, c, 6, 1)
         hover = self._near_point(wp)
-        col = self._color(self._cfg()["color"])
+        col = self._color(HOOK_COLOR)
         for i, p in enumerate(self.points):
             Hook(p, col=col).draw(surface, z, filled=True)
             if i in (hover, self.drag_idx):
                 pygame.draw.circle(surface, pal.white, self._peg_px(p), 6, 1)
-        if spot is not None:
-            surface.set_at(self._peg_px(spot), pal.white)  # the target peg itself, on top
 
     # ---------------- Drawing: UI surface
     def draw_info_card(self, surface, mouse_px, origin=(0, 0)):
@@ -1067,8 +1306,8 @@ class Editor:
             ui.text(surface, title, (panel.centerx, panel.y + 6 + BTN_H // 2), ui.WHITE, "bold", ui.TITLE_SIZE, "center", "middle")
             if self.stage == "config":
                 self._draw_config_extras(surface, mouse_ui)
-        elif self.active and self.stage == "place":
-            self._draw_hint(surface)
+        elif self.active and self.stage in ("select", "place"):
+            self._draw_hint(surface, mouse_ui)
         for area, _, spec in self._panel_widgets():
             self._draw_widget(surface, area, spec, area.collidepoint(mouse_ui))
 
@@ -1084,8 +1323,14 @@ class Editor:
         ui.text(surface, self.message, (cx, cy), tuple(self.palette.debug_red), "bold", size, "center", "middle")
 
     def _hint_lines(self):
+        if self.stage == "select":
+            if self.relation == "inside":
+                return ["Click the object to spawn the new one inside", "Esc back"]
+            return [f"Click every object the new one goes around  ({len(self.selection)} picked)",
+                    "click again to unpick  ·  then Done  ·  Esc back"]
         n = self._cfg()["n"]
-        first = {"custom": "Click to place points in order",
+        segment = self.kind == "fixed" and n == 2
+        first = {"custom": "Click both ends of the segment" if segment else "Click to place points in order",
                  "regular": "Press and drag to size and rotate, or click for the default size",
                  "rope": "Click both ends: on a body point or hook to attach, elsewhere to anchor",
                  "hook": "Click a peg to place the hook (it doesn't collide)",
@@ -1098,12 +1343,20 @@ class Editor:
         area = self._area()
         return pygame.Rect(max(ui.CARD_MARGIN, area.centerx - w // 2), ui.CARD_MARGIN, w, 2 * LINE_H + 2 * ui.CARD_PAD - 2)
 
-    def _draw_hint(self, surface):
+    def _draw_hint(self, surface, mouse_ui=(-1, -1)):
+        """The hint box at the top. It takes no clicks, so with the mouse over it it fades to HINT_FADE opacity to
+        show the objects underneath."""
         lines, box = self._hint_lines(), self._hint_box()
-        ui.draw_frame(surface, box)
+        card = pygame.Surface(box.size, pygame.SRCALPHA)
+        ui.draw_frame(card, card.get_rect())
         for i, line in enumerate(lines):
-            ui.text(surface, line, (box.centerx, box.y + ui.CARD_PAD - 1 + i * LINE_H + LINE_H // 2),
+            ui.text(card, line, (box.w // 2, ui.CARD_PAD - 1 + i * LINE_H + LINE_H // 2),
                     ui.TEXT if i == 0 else ui.TEXT_DIM, align="center", valign="middle")
+        if box.inflate(2 * PAD, 2 * PAD).collidepoint(mouse_ui):
+            alpha = pygame.surfarray.pixels_alpha(card)
+            alpha[...] = alpha.astype(np.uint16) * HINT_FADE // 255
+            del alpha
+        surface.blit(card, box.topleft)
 
     def _draw_widget(self, surface, area, spec, hovered, st=ui.UI):
         """st: the ui_style.Style the widget is drawn in (HUD for the info card's buttons)."""
@@ -1268,6 +1521,10 @@ class Editor:
             hovered = [name for rect, name, k in lay["swatches"] if k == key and rect.collidepoint(mouse_ui)]
             name = hovered[0] if hovered else cfg[key]
             ui.text(surface, name.replace("_", " "), pos, ui.WHITE if hovered else ui.TEXT_DIM, align="right")
+        if "relation_row" in lay:  # what the hovered (or chosen) placement means
+            hovered = [rel for rect, rel in lay["relations"] if rect.collidepoint(mouse_ui)]
+            rel = hovered[0] if hovered else self.relation
+            ui.text(surface, f"Spawn {RELATION_HINTS[rel]}", lay["relation_row"], ui.WHITE if hovered else ui.TEXT)
         if "slider" in lay:
             track = lay["slider"]
             key, lo, hi, step = self._slider_spec()
@@ -1292,8 +1549,6 @@ class Editor:
         r = min(box.w, box.h) * 0.34
         if self.kind == "rope":
             self._draw_rope_icon(surface, box.centerx, box.centery, int(r), col, cfg["width"])
-        elif self.kind == "hook":
-            self._draw_hook_icon(surface, box.centerx, box.centery - 9, col, step=6)  # icon spans cy - 12 .. cy + 30
         elif self.kind == "chain":
             self._draw_chain_icon(surface, box.inflate(-8, -8), cfg["segments"], cfg["start"], cfg["end"], col,
                                   self._color(cfg["rope_color"]))
