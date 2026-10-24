@@ -39,6 +39,10 @@ class World:
         self.zone_count = 0  # how many substeps needed the rigid impact zone fallback (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
         self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend)
+        self.terminal_velocity = None  # px/s speed limit for this world (inf = none); None = EnvConfig's
+        # STAND-IN for the looping contract (flags + wall removal only, no wrapping); replaced by the real one on merge
+        self.looping = dict.fromkeys(("left", "right", "top", "bottom"), False)
+        self.walls = {}  # side -> its world box wall (scene.add_world_box)
 
     def add(self, body, index=None):
         """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
@@ -49,6 +53,18 @@ class World:
             self.bodies.insert(index, body)
             self.grabbed = None
         self._rebuild()
+
+    def set_looping(self, side, on):
+        """STAND-IN: flag a side as looping and take its world box wall out (or put it back)."""
+        self.looping[side] = bool(on)
+        wall = self.walls.get(side)
+        if wall is None:
+            return
+        if on and wall in self.bodies:
+            self.bodies.remove(wall)
+            self._rebuild()
+        elif not on and wall not in self.bodies:
+            self.add(wall, 0)
 
     def add_rope(self, rope):
         self.ropes.append(rope)
