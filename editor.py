@@ -1654,7 +1654,7 @@ class Editor(SelectionTools):
             ui.text(surface, title, (panel.centerx, panel.y + 6 + BTN_H // 2), ui.WHITE, "bold", ui.TITLE_SIZE, "center", "middle")
             if self.stage == "config":
                 self._draw_config_extras(surface, mouse_ui)
-        elif (self.active and self.stage in ("select", "place")) or (self._editing() and self.paste is not None):
+        elif (self.active and self.stage in ("select", "place")) or self._edit_hint():
             self._draw_hint(surface, mouse_ui)
         for area, _, spec in self._panel_widgets():
             self._draw_widget(surface, area, spec, area.collidepoint(mouse_ui))
@@ -1673,7 +1673,7 @@ class Editor(SelectionTools):
         ui.text(surface, self.message, (cx, cy), tuple(self.palette.debug_red), "bold", size, "center", "middle")
 
     def _hint_lines(self):
-        if self._editing() and self.paste is not None:
+        if self._edit_hint():
             return self._edit_hint_lines()
         if self.stage == "select":
             if self.relation == "inside":
