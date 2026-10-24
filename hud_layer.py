@@ -100,11 +100,6 @@ class HudLayer:
             y = r.bottom + h.CARD_GAP
         return self.placed
 
-    def card_area(self):
-        """Where the first card goes before layout() ran (native screen px): its left, top and width."""
-        h = ui.HUD
-        return self.rect.x + h.CARD_MARGIN, self.rect.y + h.CARD_MARGIN, self.rect.w - 2 * h.CARD_MARGIN
-
     # ---------------- Drawing
     def draw(self, mouse_px):
         """The sidebar background (a black rule on its left edge) and every card."""

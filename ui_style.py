@@ -65,14 +65,6 @@ class Style:
     def font(self, style="regular", size=None):
         return fonts[f"{style}{size or self.TEXT_SIZE}"]
 
-    def column_width(self):
-        """Width of a card column including its margins."""
-        return self.CARD_WIDTH + 2 * self.CARD_MARGIN
-
-    def card_rect(self, surface_width, top, height):
-        """A card in the top-right column, starting at `top` (use the previous card's rect.bottom + CARD_GAP)."""
-        return pygame.Rect(surface_width - self.CARD_MARGIN - self.CARD_WIDTH, top, self.CARD_WIDTH, height)
-
     def draw_frame(self, surface, rect, fill=CARD_BG):
         """Solid fill with a solid black border drawn just inside the rect."""
         pygame.draw.rect(surface, fill, rect)
@@ -116,4 +108,4 @@ def sidebar_rect(screen_size, ui_scale, frac):
 # UI-surface names (the editor's panels and hints)
 CARD_MARGIN, CARD_GAP, CARD_WIDTH, CARD_PAD, BORDER = UI.CARD_MARGIN, UI.CARD_GAP, UI.CARD_WIDTH, UI.CARD_PAD, UI.BORDER
 TEXT_SIZE, TITLE_SIZE = UI.TEXT_SIZE, UI.TITLE_SIZE
-font, card_rect, draw_frame, text, draw_button = UI.font, UI.card_rect, UI.draw_frame, UI.text, UI.draw_button
+font, draw_frame, text, draw_button = UI.font, UI.draw_frame, UI.text, UI.draw_button
