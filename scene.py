@@ -142,41 +142,47 @@ ENDESGA_32 = [Endesga.rust_red, Endesga.burnt_orange, Endesga.sand, Endesga.tan,
 BRIGHT_ENDESGA_32 = [c for c in ENDESGA_32 if sum(c) > 230]
 
 DIAMONDS_HEXAGONS = 140  # falling hexagons in the "diamonds" preset
-# its palette (a dusk mountain range): background, walls, diamonds (the cool tones) and hexagons (the reds)
-DUSK_BACKGROUND = [38, 37, 62]  # 26253e
-DUSK_WALL = [66, 79, 106]  # 424f6a
-DUSK_DIAMONDS = [[152, 146, 163], [66, 79, 106], [60, 33, 52]]  # 9892a3 424f6a 3c2134
-DUSK_HEXAGONS = [[107, 27, 43], [119, 45, 56], [131, 47, 68]]  # 6b1b2b 772d38 832f44
+DIAMONDS_HEX_SIZES = (8.0, 12.0)  # circumradius range of its hexagons (uniform)
+# its layout: of seeds 0-15 run for 60 s at a 1512x982 window, 12 left the hexagons most evenly spread (horizontal
+# spread weighted 0.7, vertical 0.3; seed 7, the old one, drifted them left)
+DIAMONDS_SEED = 12
 DIAMOND_SIDE = 32.0  # edge length of its diamonds (world units)
 DIAMOND_CHAIN_WIDTH = 120.0  # a cluster of touching diamonds is at most this wide (tall is fine): no long ledges
 DIAMOND_MARGIN = 30.0  # diamonds stay this far in from the side walls
 CUP_GAP = 40.0  # diamonds whose corners are closer than this (the widest hexagon) can't form a cup either
 
 
-def build_diamonds_scene(world_width, world_height, seed=7, fraction=0.09, hexagons=DIAMONDS_HEXAGONS, inset=INSET):
+def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, fraction=0.09, hexagons=DIAMONDS_HEXAGONS, inset=INSET):
     """"diamonds" preset: a seeded random `fraction` of the rhombi of a tumbling-blocks tiling (edge DIAMOND_SIDE,
     covering the world; never two that form a cup, diamonds_map.forms_cup) as fixed diamonds, and `hexagons` soft
-    hexagons of random sizes (8-20) that fall through them, all in the DUSK_ palette (its own background too). Looping is on: there is no floor or ceiling, so what falls
+    hexagons of random sizes (DIAMONDS_HEX_SIZES) that fall through them. Colors come from palettes.py (the sidebar's
+    Palette card switches them; walls, background and all). Looping is on: there is no floor or ceiling, so what falls
     off the bottom comes back in at the top, same x and velocity (looping.py). The side walls run a world size past
     the screen at both ends, so bodies passing through the off-screen bands above and below stay between them."""
     from diamonds_map import lattice_diamonds, pick_diamonds, place_hexagons
+    from palettes import DEFAULT, apply_palette
 
     world = World()
-    world.background = DUSK_BACKGROUND
-    add_world_box(world, world_width, world_height, inset, col=DUSK_WALL)
+    add_world_box(world, world_width, world_height, inset)
     world.set_looping("top", True)  # no ceiling: what loops off the bottom comes in from above the screen
     world.set_looping("bottom", True)  # no floor
-    tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed, palette=DUSK_DIAMONDS)
+    tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed)
     diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, fraction=fraction, side=inset,
                              margin=DIAMOND_MARGIN, size=DIAMOND_SIDE, gap=CUP_GAP, max_width=DIAMOND_CHAIN_WIDTH)
-    for corners, col in diamonds:
-        world.add(FixedBody(corners, point_col=col, stick_col=col, point_radius=2, fill_col=col))
-    rng = np.random.default_rng(seed + 2)
+    rng = np.random.default_rng(seed + 2)  # each body's palette_pick: which of its role's colors it gets
+    for corners, _ in diamonds:
+        body = FixedBody(corners, point_radius=2)
+        body.palette_role, body.palette_pick = "diamond", int(rng.integers(1 << 30))
+        world.add(body)
     for cx, cy, r, angle in place_hexagons([c for c, _ in diamonds], world_width, world_height, hexagons, seed=seed,
-                                           side=inset):
-        col = DUSK_HEXAGONS[int(rng.integers(len(DUSK_HEXAGONS)))]
-        world.add(SoftBody(polygon_points(cx, cy, r, 6, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
-                           point_col=col, stick_col=col, point_radius=2, fill_col=col))
+                                           r_min=DIAMONDS_HEX_SIZES[0], r_max=DIAMONDS_HEX_SIZES[1], side=inset):
+        body = SoftBody(polygon_points(cx, cy, r, 6, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
+                        point_radius=2)
+        body.palette_role, body.palette_pick = "hexagon", int(rng.integers(1 << 30))
+        world.add(body)
+    for wall in world.walls.values():
+        wall.palette_role = "wall"
+    apply_palette(world, DEFAULT)
     return world
 
 

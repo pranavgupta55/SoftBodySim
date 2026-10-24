@@ -60,6 +60,7 @@ class World:
         self.last_wraps = []  # [(body, (dx, dy))] moved by looping in the last step(), e.g. to break motion trails
         self.env = {}  # per-world EnvConfig overrides (attribute name -> value), in effect only during step()
         self.background = None  # per-world background color (rgb), None for the default (main_opengl.py)
+        self.palette = None  # the palettes.py palette this world's colors come from (None: it has none)
         self.bounce_bodies = []  # indices of bodies with restitution > 0 (see _bounce)
         # Optional debug recorder (debug_overlay.StepRecorder), set only while an overlay needs solver data. It is
         # told about each step's CCD hits and impact zone points; None (the default) costs one attribute check

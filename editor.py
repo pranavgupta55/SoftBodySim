@@ -1393,7 +1393,10 @@ class Editor(SelectionTools):
 
     def _card_widgets(self):
         """(rect, action or None, draw spec) on the Controls card, in real screen px, then the whole sidebar as a
-        blocker: clicks anywhere in it (other cards handle theirs first, see main_opengl) never reach the world."""
+        blocker: clicks anywhere in it (other cards handle theirs first, see main_opengl) never reach the world. A
+        world shown without the sidebar (an empty sidebar rect: main_opengl's fullscreen worlds) has no card."""
+        if not self.sidebar.w:
+            return []
         lay = self._card_layout()
         can_edit = self.paused and not self.active
         ws = [(lay.pause, self.toggle_pause, ("pause",)), (lay.plus, self.open if can_edit else None, ("plus", not can_edit)),

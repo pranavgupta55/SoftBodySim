@@ -50,6 +50,7 @@ from hud_layer import HudLayer
 from world_selector import WorldSession
 from trails import Trails
 from gravity_dial import GravityDial
+from palettes import PaletteCard, apply_palette
 from debug_overlay import DebugOverlays
 from timectl import TimeControl
 
@@ -272,6 +273,20 @@ def draw_sidebar(hud, editor, perf_hud, mouse_px, draw_top):
     hud.overlay(draw_top)
 
 
+# Worlds with a fullscreen twin: the same preset built across the whole window, shown without the sidebar (H switches
+# between them; in the twin, SPACE shows / hides the sidebar as a floating panel over the world instead of pausing)
+FULLSCREEN_TWINS = {"diamonds": "diamonds full"}
+
+
+def grid_colors(background):
+    """draw_grid colors for a world's own background: its default ones (made for Endesga.my_blue) are lifted toward
+    white by about as much as they are from my_blue. None (the default background) keeps the defaults."""
+    if background is None:
+        return {}
+    lift = lambda t: tuple(int(c + (255 - c) * t) for c in background)
+    return {"line_col": lift(0.10), "edge_cell_col": lift(0.025), "point_cell_col": lift(0.06)}
+
+
 def main(argv=None, display=None, max_frames=None, on_frame=None):
     """argv: command line (see the module docstring). display / max_frames / on_frame are test hooks: a Display to
     render into instead of opening a window, a frame limit, and a callback(frame_index, locals) after each frame."""
@@ -316,13 +331,44 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     world_view = screen2.subsurface((0, 0) + world_px)  # the grid, trails and bodies are drawn in the world area only
     profiler = Profiler()
 
+    full_width = screen_width / ViewConfig.zoom  # a fullscreen twin's world: the whole window
+    no_sidebar = pygame.Rect(win_w, 0, 0, win_h)  # a fullscreen editor's sidebar while the panel is hidden
+
     def make_editor(w):
-        return Editor(w, Endesga, (screen_width, screen_height), (world_width, world_height), scaleDownFactor, INSET,
-                      ViewConfig.zoom, view=ViewConfig, screen_size=display.window_size, sidebar=hud.rect)
+        full = getattr(w, "fullscreen", False)
+        return Editor(w, Endesga, (screen_width, screen_height), (full_width if full else world_width, world_height),
+                      scaleDownFactor, INSET, ViewConfig.zoom, view=ViewConfig, screen_size=display.window_size,
+                      sidebar=no_sidebar if full else hud.rect)
+
+    def build_twin(name):
+        def build(_w, h):
+            w = PRESETS[name](full_width, h)
+            w.fullscreen = True
+            return w
+        return build
+
+    presets = dict(PRESETS)
+    presets.update({twin: build_twin(name) for name, twin in FULLSCREEN_TWINS.items()})
+    twins = {**FULLSCREEN_TWINS, **{twin: name for name, twin in FULLSCREEN_TWINS.items()}}
+    panel_open = False  # the floating sidebar in a fullscreen world (SPACE)
+
+    def toggle_fullscreen():
+        """H / the Palette card's button: switch to the active world's twin, keeping its palette; the fullscreen one
+        always runs (SPACE opens the panel there instead of pausing), the normal one keeps the run state."""
+        nonlocal panel_open
+        twin = twins.get(session.name)
+        if twin is None:
+            return
+        old, paused = session.world, session.editor.paused
+        session.switch(session.index(twin))
+        if old.palette is not None and session.world.palette is not None:
+            apply_palette(session.world, old.palette)
+        session.editor.paused = False if getattr(session.world, "fullscreen", False) else paused
+        panel_open = False
 
     # Custom (the default scene at launch, kept for the session) + the presets; only the active world steps, and it
     # alone has the profiler attached (the session moves it)
-    session = WorldSession(PRESETS, (world_width, world_height), make_editor, profiler, start=args.scene)
+    session = WorldSession(presets, (world_width, world_height), make_editor, profiler, start=args.scene)
     world, editor = session.world, session.editor
     perf_hud = PerfHUD(profiler)
     trails = Trails()  # T: fading paths behind moving bodies, drawn under them
@@ -330,6 +376,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     # the sidebar's cards, top to bottom (hud_layer.py describes a card provider; append new cards here)
     # (the Controls card is the active world's editor: the session swaps it in this list when it switches worlds)
     hud.cards = [editor, session, perf_hud, gravity_dial]
+    palette_card = PaletteCard(lambda: session.world, toggle_fullscreen)  # last, while the active world has palettes
     session.bind_cards(hud.cards)
     hud.layout()
 
@@ -351,6 +398,15 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     while running:
         profiler.frame()
         world, editor = session.world, session.editor  # the active world (anything may have switched / replaced it)
+        full = getattr(world, "fullscreen", False)
+        sidebar_shown = not full or panel_open
+        if full:
+            editor.sidebar = hud.rect if panel_open else no_sidebar
+        if (world.palette is not None) != (palette_card in hud.cards):  # the Palette card comes and goes with it
+            if palette_card in hud.cards:
+                hud.cards.remove(palette_card)
+            else:
+                hud.cards.append(palette_card)
         profiler.begin("draw")
 
         # ---------------- Reset Variables and Clear screens
@@ -373,11 +429,27 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            if editor.scenes.state is None and session.handle_event(event):  # W, the Worlds card and panel
+            if event.type == pygame.KEYDOWN and editor.scenes.state is None and not editor.active:
+                if event.key == pygame.K_h and session.name in twins:  # H: fullscreen twin and back
+                    toggle_fullscreen()
+                    world, editor = session.world, session.editor
+                    full = getattr(world, "fullscreen", False)
+                    sidebar_shown = not full
+                    editor.sidebar = no_sidebar if full else editor.sidebar
+                    continue
+                if event.key == pygame.K_SPACE and full:  # fullscreen: SPACE shows / hides the floating panel
+                    panel_open = sidebar_shown = not panel_open
+                    editor.sidebar = hud.rect if panel_open else no_sidebar
+                    continue
+            if not sidebar_shown and event.type != pygame.KEYDOWN and event.type != pygame.KEYUP:
+                pass  # no sidebar: its cards take no clicks (the editor still gets them, below)
+            elif editor.scenes.state is None and session.handle_event(event):  # W, the Worlds card and panel
                 world, editor = session.world, session.editor  # (may switch worlds)
                 continue
             # arrow / 0 / numpad keys, and clicks on the gravity card (not while the modal save / open dialog is up)
-            if editor.scenes.state is None and gravity_dial.handle_event(event):
+            elif editor.scenes.state is None and palette_card in hud.cards and palette_card.handle_event(event):
+                continue  # clicks on the Palette card
+            elif editor.scenes.state is None and gravity_dial.handle_event(event):
                 continue
             if editor.handle_event(event):  # the Controls card, the rest of the sidebar, editor panels and placement
                 continue
@@ -420,16 +492,17 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
             stepped = True
         time_ctl.pending = 0  # a step requested just before resuming is dropped
         profiler.switch("draw")
+        view = screen2 if full else world_view  # a fullscreen world fills the whole render surface
         if ViewConfig.show_grid:
-            world.draw_grid(world_view, zoom=ViewConfig.zoom)
+            world.draw_grid(view, zoom=ViewConfig.zoom, **grid_colors(world.background))
         with profiler.section("trails"):
             trails.set_enabled(ViewConfig.trails)
             trails.update(world, dt / fps, stepped)
-            trails.draw(world_view, zoom=ViewConfig.zoom)  # under the bodies
-        world.draw(world_view, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
+            trails.draw(view, zoom=ViewConfig.zoom)  # under the bodies
+        world.draw(view, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
         if overlays.any():
             with profiler.section("overlays"):
-                overlays.draw(world_view, world, ViewConfig.zoom)
+                overlays.draw(view, world, ViewConfig.zoom)
         editor.draw_world(screen2, screenT, (mx, my))
         if overlays.any():  # the legend: top left of the world area
             overlays.draw_legend(screenUI, world, (OVERLAY_LEGEND_PX, OVERLAY_LEGEND_PX))
@@ -439,19 +512,22 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         profiler.switch("ui")
         pygame.mouse.set_visible(False)
         draw_top(screenUI)  # message + cursor
-        draw_sidebar(hud, editor, perf_hud, pygame.mouse.get_pos(), draw_top)  # native res, over the composite
+        if sidebar_shown:
+            draw_sidebar(hud, editor, perf_hud, pygame.mouse.get_pos(), draw_top)  # native res, over the composite
 
         # ---------------- Present: textures -> one shader pass (+ the HUD quad) -> swap
         profiler.switch("present")
         with profiler.section("upload"):
             presenter.upload()
-            with profiler.section("hud"):
-                presenter.upload_hud()
+            if sidebar_shown:
+                with profiler.section("hud"):
+                    presenter.upload_hud()
         with profiler.section("render"):
             presenter.render(shake)
             presenter.render_pegs(editor.peg_layer())  # native-res peg grid while placing a hook
-            with profiler.section("hud"):
-                presenter.render_hud()
+            if sidebar_shown:
+                with profiler.section("hud"):
+                    presenter.render_hud()
         if MEASURE_GPU:
             with profiler.section("gpu wait", device="gpu"):
                 ctx.finish()

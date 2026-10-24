@@ -73,7 +73,7 @@ def current_env(world=None):
 DEFAULT_ENV = current_env()  # applied when a preset (which has no env of its own) is loaded
 _KINDS = ((SoftBody, "soft"), (RigidBody, "rigid"), (FixedBody, "fixed"), (Body, "body"))
 _CLASSES = {"soft": SoftBody, "rigid": RigidBody, "fixed": FixedBody, "body": Body}
-BODY_EXTRAS = ("restitution", "wall_side")  # optional per-body settings (numbers / strings), saved when present
+BODY_EXTRAS = ("restitution", "wall_side", "palette_role", "palette_pick")  # optional per-body settings (numbers / strings), saved when present
 SIDES = ("left", "right", "top", "bottom")
 
 
@@ -162,6 +162,8 @@ def _world_state(world, index, arr, col):
                      for k, v in world.env.items() if v is None or isinstance(v, (int, float, list, tuple, np.ndarray))}
     if getattr(world, "background", None) is not None:
         st["background"] = [int(c) for c in world.background]
+    if isinstance(getattr(world, "palette", None), str):
+        st["palette"] = world.palette
     tv = getattr(world, "terminal_velocity", None)
     if isinstance(tv, (int, float)) and not isinstance(tv, bool) and math.isfinite(tv):
         st["terminal_velocity"] = float(tv)
@@ -499,6 +501,8 @@ def install(world, bodies, ropes, hooks, state=None):
         world.terminal_velocity = None
     if hasattr(world, "background"):
         world.background = None
+    if hasattr(world, "palette"):
+        world.palette = None
     if hasattr(world, "last_wraps"):
         world.last_wraps = []
     for key, value in (state or {}).items():
