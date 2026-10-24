@@ -96,13 +96,13 @@ world.add(SoftBody(polygon_points(screen_center[0] + 4, square_y - square_half -
 hexagon_stiffness = 0.1
 for x_frac, y, strength, col in ((0.32, ground_top - 100, 1.0, Endesga.cream),
                                  (0.68, ground_top - 100, 0.75, Endesga.sebastian_lague_light_purple),
-                                 (0.60, ground_top - 180, 0.5, Endesga.lighter_maroon_red)):
+                                 (0.60, max(ground_top - 180, inset + 25), 0.5, Endesga.lighter_maroon_red)):  # clamp: short screens
     world.add(SoftBody(polygon_points(screen_width * x_frac, y, 18, 12),
                        stiffness=hexagon_stiffness * strength, skip_sets=2, point_col=col, stick_col=Endesga.very_light_blue, point_radius=3, fill_col=col))
 
 # Ropes: a small rigid box hung from the top wall by two ropes in a V, and a rope from the square to the cream dodecagon
 square, cream_dodecagon = world.bodies[5], world.bodies[7]
-hang_x, box_half = screen_width * 0.12, 8
+hang_x, box_half = screen_width * 0.88, 8  # right side; the container demo below is on the left
 anchor = (hang_x, inset)
 hanging_box = RigidBody(rect_points(hang_x, inset + 50 + box_half, 2 * box_half, 2 * box_half),
                         point_col=Endesga.cream, stick_col=Endesga.greyL, point_radius=2)
