@@ -6,8 +6,15 @@ import pygame
 
 from entities import Body, EnvConfig, RigidBody, SoftBody
 import looping
+import solver_jit
 
 _NO_SECTION = nullcontext()  # stands in for profiler sections when no profiler is attached
+
+
+def _jit():
+    """Whether the hot CPU paths run as compiled kernels (solver_jit.py, bit-identical to the numpy code here):
+    EnvConfig.jit on and numba importable. The numpy code stays the reference and the fallback."""
+    return EnvConfig.jit and solver_jit.enabled()
 
 
 def _make_backend(world):
@@ -197,6 +204,11 @@ class World:
 
     def _solve_body_constraints(self):
         """Every body's own constraints, as if each body's solve_constraints ran (bodies don't share points)."""
+        if _jit():
+            solver_jit.solve_body_constraints(self)
+            for b in self.solo_bodies:
+                b.solve_constraints()
+            return
         P, W = self.P, self.W
         if self.springs.shape[1]:  # SoftBody.solve_constraints for all soft bodies at once
             i, j = self.springs
@@ -211,14 +223,27 @@ class World:
         for idx, rest, stiffness in self.rigid_groups:  # RigidBody.solve_constraints, one group of same-size bodies
             pts = P[:, idx]  # (2, B, n)
             com = pts.mean(axis=2, keepdims=True)
-            a = np.matmul((pts - com).transpose(1, 0, 2), rest.transpose(0, 2, 1))  # (B, 2, 2) covariances
-            theta = np.arctan2(a[:, 1, 0] - a[:, 0, 1], a[:, 0, 0] + a[:, 1, 1])
-            c, s = np.cos(theta), np.sin(theta)
-            rot = np.array([[c, -s], [s, c]]).transpose(2, 0, 1)  # (B, 2, 2)
-            goal = np.matmul(rot, rest).transpose(1, 0, 2) + com
+            q, rx, ry = pts - com, rest[:, 0], rest[:, 1]
+            # best-fit rotation: cos / sin of atan2(num, den) straight from the covariance sums, without matmul
+            # (BLAS uses FMA) or trig (np.sin isn't libm's sin), so solver_jit's kernel matches it bit for bit
+            num = (q[1] * rx).sum(axis=1) - (q[0] * ry).sum(axis=1)
+            den = (q[0] * rx).sum(axis=1) + (q[1] * ry).sum(axis=1)
+            norm = np.hypot(num, den)
+            ok = norm > 0
+            norm = np.where(ok, norm, 1.0)
+            c = np.where(ok, den / norm, 1.0)[:, None]  # no rotation at all when num = den = 0 (atan2(0, 0) = 0)
+            s = np.where(ok, num / norm, 0.0)[:, None]
+            goal = np.array([c * rx - s * ry, s * rx + c * ry]) + com
             P[:, idx] += stiffness[:, None] * (goal - pts)
         for b in self.solo_bodies:
             b.solve_constraints()
+
+    def _solve_ropes(self):
+        """Every rope's solve_constraints, in list order (Gauss-Seidel)."""
+        if self.ropes and _jit() and solver_jit.solve_ropes(self):
+            return
+        for r in self.ropes:
+            r.solve_constraints()
 
     # ---------------- Mouse dragging
     def grab(self, pos):
@@ -316,6 +341,9 @@ class World:
         move the positions, so the no-intersection guarantee is untouched.
         """
         r = EnvConfig.contact_radius
+        if _jit():
+            solver_jit.bounce(self, h, r)
+            return
         bodies = [b for b in (self.bodies[k] for k in self.bounce_bodies) if (b.inv_mass > 0).all()]
         if len(bodies) < 2:
             return
@@ -374,8 +402,7 @@ class World:
         for _ in range(EnvConfig.iterations):
             with sec("constraints"):
                 self._solve_body_constraints()
-                for r in self.ropes:
-                    r.solve_constraints()
+                self._solve_ropes()
             with sec("contacts"):
                 reach = self._solve_contacts(candidates, reach)
 
@@ -485,6 +512,8 @@ class World:
 
     def _candidates(self):
         """(point, edge) pairs that share a grid cell. Edges are registered in every cell their padded AABB touches."""
+        if _jit():
+            return solver_jit.candidates(self, EnvConfig.cell_size, EnvConfig.contact_radius)
         cell, pad = EnvConfig.cell_size, 2 * EnvConfig.contact_radius
         a, b = self.P[:, self.edges[0]], self.P[:, self.edges[1]]
         lo = np.floor((np.minimum(a, b) - pad) / cell).astype(np.int64)
@@ -499,6 +528,8 @@ class World:
         to a segment changes by at most its own motion plus the farther endpoint's, so while no point has moved
         slack / 2 since then, the other candidates are out of range and are skipped (same result, less work)."""
         r, mu = EnvConfig.contact_radius, EnvConfig.friction
+        if _jit():
+            return solver_jit.solve_contacts(self, candidates, reach, r, mu)
         P, PREV, W = self.P, self.PREV, self.W
         slack = r
         if reach is not None and np.hypot(*(P - reach[2])).max() < 0.5 * slack - 1e-6:
@@ -580,6 +611,8 @@ class World:
 
     def _ccd_cells(self, D):
         """Grid cell ranges of the swept boxes: (point lo, point hi, edge lo, edge hi) cell indices."""
+        if _jit():
+            return solver_jit.ccd_cells(self, D, EnvConfig.cell_size)
         return [np.floor(box / EnvConfig.cell_size).astype(int) for box in self._ccd_boxes(D)]
 
     def _ccd_pairs(self, D, cells=None):
@@ -588,6 +621,8 @@ class World:
         pairs = None if self.backend is None else self.backend.ccd_pairs(cells)  # None: use the CPU code below
         if pairs is not None:
             return pairs
+        if _jit():
+            return solver_jit.ccd_pairs(self, cells)
         return self._filter_pairs(*self._cell_pairs(*cells), contact=False)
 
     def _ccd_new_pairs(self, old_cells, cells):
@@ -609,6 +644,8 @@ class World:
         `pairs` reuses an earlier broad phase; only a fresh one (the default) can prove there are no collisions.
         """
         pts, eids = self._ccd_pairs(D) if pairs is None else pairs
+        if _jit():
+            return solver_jit.ccd_detect(self, D, pts, eids, EnvConfig.ccd_gap)
         empty = np.empty(0)
         X0 = self.PREV
         if pts.size:
@@ -733,6 +770,9 @@ class World:
 
     def _ccd_impulses(self, pts, eids, ts, ss, sides, h):
         """One pass of sequential (Gauss-Seidel) impulses over detected collisions, earliest first, editing V."""
+        if _jit():
+            solver_jit.ccd_impulses(self, pts, eids, ts, ss, sides, h, EnvConfig.ccd_push)
+            return
         V, W, X0, E = self.V, self.W, self.PREV, self.edges
         push = EnvConfig.ccd_push
         for k in np.argsort(ts):
