@@ -170,7 +170,7 @@ def peg_positions(lo, hi, spacing):
 class Editor:
     def __init__(self, world, palette, ui_size, world_size, scale, inset, zoom=1.0, view=None, screen_size=None):
         """ui_size: the UI surface size (real screen / scale); scale: real screen px per UI px; zoom: UI px per world
-        unit; view: an object with `show_grid` and `filled` (the G / V states listed on the info card); screen_size:
+        unit; view: an object with `show_grid`, `filled` and `trails` (the G / V / T states listed on the info card); screen_size:
         the real screen (window) size the info card is laid out on (default ui_size * scale)."""
         self.world, self.palette, self.scale, self.inset, self.zoom, self.view = world, palette, scale, inset, zoom, view
         self.W, self.H = ui_size
@@ -852,9 +852,11 @@ class Editor:
         v = self.view
         grid = None if v is None else ("on" if v.show_grid else "off")
         look = None if v is None else ("filled" if v.filled else "points")
+        trails = None if v is None else ("on" if getattr(v, "trails", False) else "off")
         return [("P", "pause", "paused" if self.paused else "running", True),
                 ("G", "grid", grid, True),
                 ("V", "view", look, True),
+                ("T", "trails", trails, True),
                 ("F", "compute", "shown" if self.show_compute else "hidden", True),
                 ("SPACE", "HUD", "shown", True),
                 ("Z", "undo", None, placing and bool(self.undo_stack)),
