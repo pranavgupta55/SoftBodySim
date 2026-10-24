@@ -1,6 +1,6 @@
 # 05: Compiled loops (numba / Cython / C extension / mypyc / numpy restructuring)
 
-Status: cycle 1 complete (overlap-validation runs: see F9). Prototype, harnesses and logs in
+Status: cycle 1 complete (all validation runs in; F9). Prototype, harnesses and logs in
 `/private/tmp/claude-501/research-05/`; the repo is untouched.
 
 | file | what |
@@ -12,6 +12,7 @@ Status: cycle 1 complete (overlap-validation runs: see F9). Prototype, harnesses
 | `pcore.py`, `phases.py` | short P-core timing (`nice -n 10`), per-phase breakdown |
 | `bench_kern.py`, `cext/`, `fma_test.py` | numpy vs numba vs C (cffi) per kernel; FMA contraction test |
 | `zones_test.py`, `ccd_nb.py`, `code_nb/` | forced impact zones; suite `ccd_test.py` and research-10's `run_bench.py` on a numba copy |
+| `test_robust.py` | numba port of 02's robust narrow phase vs 02's numpy reference (`variants.robust`) |
 
 Terms: **JIT** = just-in-time compilation (numba compiles a function the first time it is called with given argument
 types); **AOT** = ahead-of-time compilation (an ordinary compiled extension module); **FMA** = fused multiply-add
@@ -40,8 +41,9 @@ a few seconds each, interleaved A/B, median); background runs were used only for
    | pile500 settled (3137) | 33.5 | 6.35 | 5.3x |
    | pile1000 settled (6262) | 90.6 | 20.4 | 4.4x |
 
-   For comparison, the GPU backend (09) is 19.6 ms at pile500 and 43.5 ms at pile1000: **compiled CPU code beats the
-   default GPU backend at every size measured**, and makes the small presets dispatch-free.
+   For comparison, the GPU backend (09) is 19.6 ms at pile500 and 43.5 ms at pile1000 (04's improved GPU path: 16.7 /
+   44 ms): **compiled CPU code beats the GPU backend at every size measured**, and makes the small presets
+   dispatch-free.
 2. **The zero-overlap guarantee is untouched, and provably so: the numba world's trajectory is bitwise identical to
    numpy's** (every frame of pile200 dragged 150 frames, demo dragged 200, pile500 120, diamonds, cradle; 662 forced
    impact-zone fallbacks). Same float64 operations in the same order, same pair sets in the same order, same impulse
@@ -54,8 +56,9 @@ a few seconds each, interleaved A/B, median); background runs were used only for
    per substep; impact zones only under aggressive drags, 10 saw 47 of 2,400 substeps). The time is in the
    *vectorized* numpy passes (contacts 40-55%, CCD broad + narrow 25-35%, constraints 15-20%) and, for small scenes,
    in numpy call overhead (09: ~1,200 numpy C calls per frame). Fusing each pass into one compiled loop removes both
-   the temporaries and the call overhead. The rare paths are still worth porting for spikes: one forced impact-zone
-   fallback costs 0.91 ms in numpy vs 0.11 ms in numba (8.5x).
+   the temporaries and the call overhead. The rare paths still matter in two places: one forced impact-zone fallback
+   costs 0.91 ms in numpy vs 0.11 ms in numba (8.5x), and in 04's compressed 1000-body pile (66-127 CCD hits per
+   substep) the impulse loop + redetects are most of the CCD; there "CCD narrow + impulses" drops 17.9 -> 3.3 ms.
 4. **numba is the right tool here; C / Cython would run at the same speed but cost a build system.** A cffi C port
    of the CCD narrow phase ran at the same speed as numba (1.77 vs 1.80 ms, E-core) with the same per-call overhead
    (~8 us E-core, ~1-2 us P-core). But Apple clang contracts `a*b+c` into FMA by default (`-ffp-contract=on`): the
@@ -66,6 +69,14 @@ a few seconds each, interleaved A/B, median); background runs were used only for
    frame, so call `warmup()` at startup. Two numba pitfalls hit during the prototype: a self-recursive jitted
    function segfaults when loaded from the on-disk cache (fixed by an iterative version), and a hot-loop helper that
    takes a dozen arrays costs ~4x even with `inline="always"` (inline by hand).
+6. **02's robust float64 narrow phase ports cleanly:** the numba version is bitwise identical to 02's numpy
+   reference (`variants.robust`) on every test (up to 5,727 hits per call), 8-11x faster than it, and within +-20% of
+   the stock-math numba kernel. Land the two together so numpy reference and kernel never disagree (F10).
+7. **Validation: 0 overlaps everywhere.** Brute-force checks on 6,400 substeps of demo / pile50 / cradle / random
+   walls plus every 5th frame of looping / diamonds / pile200 dragged (all bitwise identical to numpy, too); the
+   suite's 7 `ccd_test.py` stress drags (12,000 substeps, 0 bad, 0 zone fallbacks); research-10's full accuracy suite
+   on a numba copy of the repo: **0 FAIL, 0 WARN, 0 overlaps in ~29k checked substeps**, same 47 `ccd_demo` zone
+   fallbacks as main, CPU determinism holds.
 
 ## Findings
 
@@ -216,15 +227,23 @@ that, only fewer passes or a compiler does.
 
 ### F7. How this combines with the other topics
 
+- **02 (CCD accuracy):** robust narrow phase ported and verified (F10). 02's Harmon-style inelastic-projection
+  fallback is another Python loop (PGS per zone); it runs only in bad substeps, but if it lands it should follow the
+  `zone_round` pattern. 02's displacement-certificate pair reuse and 03's fat list both shrink the CCD broad phase,
+  which is the larger half of CCD after this port (pile1000: broad 3.5 vs narrow + impulses 3.3 ms).
 - **08 (parallelism):** serial numba is the base; 08's `prange` + CSR gather on top adds 1.6-2.6x to the contact pass
-  (bit-identical). After this port, contacts are 51% of pile500 (3.3 of 6.4 ms), so the remaining gain is ~1.3x
+  (bit-identical; 08's per-substep numbers: pile200 0.73 -> 0.46 ms, pile500 1.76 -> 0.96, pile2000 7.35 -> 2.85). After this port, contacts are 51% of pile500 (3.3 of 6.4 ms), so the remaining gain is ~1.3x
   end to end at 500 bodies, less for small scenes (fork/join ~10-20 us per `prange`). The kernels are `nogil=True`,
   so a physics thread would now spend most of its time without the GIL, which weakens 08's convoy-effect objection to
   a physics thread (the Python glue still needs the GIL ~20 times per substep; untested).
-- **03 (broad phase):** 03's per-call exact numba broad phase (pairs already box-filtered) and fat-box list are
-  complementary to F2: my `cell_pairs` reproduces the grid pairs exactly so CCD results are bitwise; 03's variant emits
+- **03 (broad phase):** 03 measured its fat-box (Verlet skin) pair list at demo 2.25 -> 1.63, pile200 11.7 -> 7.3,
+  pile500 32.7 -> 19.8 ms with a numba rebuild, and a per-call exact numba grid (`nb_grid.pairs_nb`) at 1.2 vs 6.9 ms.
+  These are complementary to F2: my `cell_pairs` reproduces the grid pairs exactly so CCD results are bitwise; 03's variant emits
   12.7x fewer pairs and lets `ccd_detect` skip the pre-reject. Either way the broad phase drops to ~1 ms at pile500.
   The latent `_cell_pairs` empty-join `IndexError` 03 found does not exist in the kernel (no empty-array indexing).
+  After this port the broad phases are 1.2 of 6.4 ms at pile500 (contacts' grid + CCD broad), so 03's list on top of
+  the kernels is worth ~1.2-1.4x at big sizes, not the 1.6x it gives over numpy; 03's B3 and this file's
+  `cell_pairs` should be one kernel (same counting-sort design; mine adds the dense / sparse switch for long walls).
 - **01 (XPBD / substeps):** 01 found the per-substep fixed cost F (broad phase + first contact pass + CCD) is what
   makes many small substeps expensive. numba cuts F ~6x, so 16x1 or 20x1 schedules come within today's frame budget
   even before hoisting the broad phase / CCD out of the substep loop.
@@ -246,18 +265,46 @@ that, only fewer passes or a compiler does.
 
 ### F9. Overlap validation of the numba world (measured)
 
-(being filled: suite `ccd_test.py` stress drags with the kernels installed class-wide; brute-force checker on every
-substep of demo / pile50 / cradle / random walls, every 5th frame of looping / diamonds / pile200 dragged; research-10
-`run_bench.py --skip-perf` on `code_nb/`, a copy of the repo with the kernels installed.)
+| run | where | substeps checked | bad | zone fallbacks | bitwise vs numpy |
+|---|---|---|---|---|---|
+| demo dragged, 300 frames | `compare2.py`, brute every substep | 1,200 | 0 | 0 | yes |
+| pile50 dragged, 200 frames | same | 800 | 0 | 0 | yes |
+| Newton's cradle, 200 frames | same | 1,600 | 0 | 0 | yes |
+| random walls dragged, 300 frames | same | 1,200 | 0 | 0 | yes |
+| looping 300 / diamonds 200 / pile200 dragged 200 frames | brute every 5th frame | 160 frames | 0 | 0 | yes |
+| suite `ccd_test.py` (5 targeted drags + 2 random whips) | kernels installed class-wide (`ccd_nb.py`) | 12,000 | 0 | 0 | - |
+| research-10 `run_bench.py --skip-perf` | `code_nb/` (repo copy + kernels) | ~29,000 | 0 | 47 (ccd_demo, = main) | n/a (trig-free rigid) |
 
-Already measured: demo dragged 200 frames, brute-force check on all 800 substeps: 0 bad substeps, 0 impact zones
-(earlier kernel version). Since every trajectory tested is bitwise identical to numpy, overlap results are those of
-the numpy code by construction.
+research-10 `compare.py base_acc.json nb_acc.json`: **0 FAIL, 0 WARN**; one "better" (`ccd_pile200.min_gap_px`
+0.0116 -> 0.0178, from the trajectory change of the trig-free shape matching); `cpu_demo_repeat_identical` true.
+End-state hashes differ from main only because the copy uses the trig-free rotation (F4), as expected.
+
+### F10. Porting 02's robust narrow phase (measured)
+
+02 found two float64 defects in `_ccd_detect` (endpoint false negatives from the cancelling root formula plus the exact
+`0 <= s <= 1` test; spurious hits for collapsing edges) and fixes both with the stable roots `q / c2`, `c0 / q` and a
+distance-at-root acceptance `|q - s e| <= TAU = 1e-6 px`, which also deletes the collapsing-edge pass. 02 asked that
+the numba narrow phase port the same math. `nbk.ccd_detect_robust` does (pre-reject inline, no `collapses` pass).
+`test_robust.py`, P-core, real pile states with motion scaled 1x / 20x / 200x:
+
+| state | pairs | hits | numpy robust (02) | numba robust | numba stock math | bitwise vs 02's numpy |
+|---|---|---|---|---|---|---|
+| pile200 x1 | 5,674 | 0 | 0.29 ms | 0.022 | 0.026 | yes |
+| pile200 x200 | 57,513 | 3,008 | 6.27 | 0.87 | 0.83 | yes |
+| pile500 x1 | 19,698 | 0 | 0.83 | 0.073 | 0.094 | yes |
+| pile500 x20 | 25,186 | 62 | 1.33 | 0.17 | 0.13 | yes |
+| pile500 x200 | 112,015 | 5,727 | 12.3 | 2.22 | 1.77 | yes |
+
+Hit sets equal the stock math in all six (as 02 found on real data). So: implement 02's change in the numpy reference
+and use `ccd_detect_robust` as the kernel; the bitwise A/B then still holds between the two paths, and both close
+02's guarantee hole.
 
 ## Applicability to this codebase
 
 Proposed shape of the change (what a worktree agent would build):
 
+- `_ccd_detect` (numpy) adopts 02's robust root + TAU acceptance and the kernel is `ccd_detect_robust` (F10), so the
+  two paths stay bit-identical.
 - New `kernels.py` (from `nbk.py`): the jitted functions, `warmup()`, and a module flag `AVAILABLE` (False if numba
   can't be imported; everything then runs the numpy code as today).
 - `entities.EnvConfig.compiled = True` (per world via `World.env` like other settings). `solver.World` methods keep
@@ -300,30 +347,35 @@ dedupe); the rest are direct ports.
 
 ## Build plan
 
-Ranked; 1 first, the others can run in parallel worktrees on top of 1 (or independently against numpy).
+Ranked; 1 first, 2-4 can then run in parallel worktrees on top of it (2 and 3 can also start against numpy). Gates for
+every item: research-10 `run_bench.py --code <worktree> --skip-perf` + `compare.py` (0 FAIL, 0 overlaps), the suite
+`ccd_test.py`, and timing at `nice -n 10` with interleaved A/B (`/private/tmp/claude-501/research-05/pcore.py`,
+`phases.py`).
 
-1. **Compiled physics core (numba) with numpy fallback, bitwise-tested.** Files: new `kernels.py` (from
-   `/private/tmp/claude-501/research-05/nbk.py`), `solver.py` (dispatch in the methods listed above, contiguous
-   topology in `_rebuild`), `entities.EnvConfig.compiled`, shape matching -> trig-free form in `solver.py` (and
-   `entities.RigidBody.solve_constraints` for solo bodies), `main_opengl.py` -> `kernels.warmup()`.
-   Metric: physics ms/frame on demo, cradle, diamonds, pile200, pile500 (P-core, `nice -n 10`, interleaved A/B:
-   `/private/tmp/claude-501/research-05/pcore.py` / `phases.py`), bitwise-identical state every frame vs the numpy
-   path (`compare2.py`), 0 overlaps on `/private/tmp/claude-501/hud-layout-agent/suite/ccd_test.py` and research-10's
-   `run_bench.py --code <worktree>`. Expected: 5.6x demo, 12.8x cradle, 5-9x piles. Risk: low (bitwise A/B).
-   Effort: medium (1 day).
-2. **Deterministic `prange` for the contact pass and CCD detect (with 08).** On top of 1: 08's CSR gather
-   (`/private/tmp/claude-501/research-08/numba_par.py`) for `solve_contacts`, plain `prange` for `ccd_detect`
-   (independent per pair, compact hits afterwards), `numba.set_num_threads(4)`, serial below ~10k candidates.
-   Metric: pile500 / pile1000 physics ms, bitwise vs serial. Expected: ~1.3x at pile500 (contacts are 51% after 1),
-   ~1.5x at pile1000. Risk: low. Effort: small.
-3. **Hoist and shrink the broad phase in compiled code (with 03 / 01).** On top of 1: 03's fat-box pair list (or the
-   box-filtered exact pairs) rebuilt by the `cell_pairs` kernel, shared by contacts and CCD; optionally 01's "broad
-   phase once per frame". Metric: physics ms at pile200/500 and on a 16x1 schedule; 0 overlaps on 10's suite.
-   Expected: broad phase is 2 of 6.4 ms at pile500 after 1, so up to ~1.4x there and makes 16x1 affordable.
-   Risk: medium (new cached state; guarantee argument is 03's superset proof). Effort: medium.
-4. **Cheap physics upgrades now that constraints are ~free (with 06 / 07).** On top of 1: 06's soft shape matching
-   or ARAP triangles and 07's rigid-aware ropes as numba kernels. Metric: 06/07 accuracy metrics on 10's suite at
-   <= 1.2x the compiled baseline's ms. Risk: medium (changes physics, not the guarantee). Effort: medium.
+1. **Compiled physics core (numba) with numpy fallback, bitwise-tested, including 02's robust narrow phase.**
+   Change: new `kernels.py` (from `/private/tmp/claude-501/research-05/nbk.py`, using `ccd_detect_robust`);
+   `solver.py` dispatches in `_solve_contacts`, `_solve_body_constraints`, `_candidates` / `_ccd_cells` /
+   `_ccd_pairs`, `_ccd_detect`, `_ccd_impulses`, `_impact_zones`, `_bounce` and the rope loop, with contiguous
+   topology built in `_rebuild`; numpy reference gets the trig-free shape matching (F4) and 02's robust detect;
+   `EnvConfig.compiled`; `main_opengl.py` calls `kernels.warmup()`. Metric: physics ms/frame demo, cradle, diamonds,
+   pile200, pile500, pile1000; bitwise-identical state every frame between the numpy and compiled paths
+   (`compare2.py`, `ALT_RIGID` mode shows how); 0 overlaps. Expected: 5.6x demo (2.7 -> 0.48 ms), 12.8x cradle,
+   5-9x piles to 500, 4.5x at 1000. Risk: low (bitwise A/B proves identical CCD decisions). Effort: ~1 day.
+2. **Deterministic `prange` for contacts and CCD detect (08's CSR gather).** On top of 1: 08's `_pair_phase_par` /
+   `_csr_build` / `_gather_par` (`/private/tmp/claude-501/research-08/numba_par.py`) in `solve_contacts`, plain
+   `prange` + compaction in `ccd_detect_robust`, `numba.set_num_threads(4)` (P-cores only), serial below ~10k
+   candidates. Metric: pile500 / pile1000 physics ms, bitwise vs serial. Expected: ~1.3x at pile500, ~1.5x at
+   pile1000 (contacts are 51-56% of the compiled frame). Risk: low. Effort: small.
+3. **One compiled broad phase, cached across substeps (03's fat-box list on the `cell_pairs` kernel).** On top of 1:
+   merge 03's `nb_grid.pairs_nb` (inline exact box test) with `cell_pairs` (dense / sparse switch), use it as the
+   rebuild of 03's fat-box list shared by contacts and CCD; optionally 01's broad phase once per frame. Metric:
+   physics ms at pile200/500/1000 and on a 16x1 schedule; 03's superset invariant test; 0 overlaps. Expected: ~1.2-1.4x
+   at big sizes after 1, and 16x1 schedules within budget (01). Risk: medium (cached state; guarantee rests on 03's
+   superset argument). Effort: ~1 day.
+4. **Spend the freed budget on accuracy (06 / 07 / 02).** On top of 1: 06's soft shape matching or ARAP triangles,
+   07's rigid-aware ropes, 02's inelastic-projection fallback, as numba kernels following the `shape_match` /
+   `zone_round` patterns. Metric: 06/07/02 accuracy metrics on 10's suite at <= 1.2x the compiled baseline's ms.
+   Risk: medium (physics changes, guarantee untouched). Effort: medium.
 
 Not recommended: Cython / C / Rust extensions (same speed as numba, need a build system and `-ffp-contract=off`),
-mypyc (no gain on numpy code), `fastmath`.
+mypyc (no gain on numpy code), `fastmath` (breaks bitwise identity and the CCD's rounding-level tests).
