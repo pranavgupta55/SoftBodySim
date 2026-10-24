@@ -78,7 +78,8 @@ def solve_contacts(world, candidates, reach, r, mu):
         return reach
     _, ea, eb, _, _, _, _, esign, *_ = _topology(world)
     snap = P.copy() if reach is None else None  # P when the candidates were picked, before this pass moves it
-    keep = contact_pass(P, world.PREV, world.W, ea, eb, esign, pts, edge_ids, r, mu, slack, reach is None)
+    XS = world.PREV if world._span_start is None else world._span_start
+    keep = contact_pass(P, world.PREV, XS, world.W, ea, eb, esign, pts, edge_ids, r, mu, slack, reach is None)
     return (pts[keep], edge_ids[keep], snap) if reach is None else reach
 
 
@@ -160,7 +161,7 @@ def moved_max(P, P0):
 
 
 @njit(**NB)
-def contact_pass(P, PREV, W, ea, eb, esign, pts, eids, r, mu, slack, want_reach):
+def contact_pass(P, PREV, XS, W, ea, eb, esign, pts, eids, r, mu, slack, want_reach):
     """One Jacobi contact pass, in place on P. Returns the mask dist < r + slack over the candidates if want_reach,
     else an empty array. One loop that skips non-touching pairs right after the distance (numpy computes everything
     for every candidate, then filters)."""
@@ -189,10 +190,11 @@ def contact_pass(P, PREV, W, ea, eb, esign, pts, eids, r, mu, slack, want_reach)
             keep[k] = dist < r + slack
         if not dist < r:
             continue
-        # edge normal facing the side the point started this substep on
-        pax, pay = PREV[0, ia], PREV[1, ia]
-        e0x, e0y = PREV[0, ib] - pax, PREV[1, ib] - pay
-        q0x, q0y = PREV[0, ip] - pax, PREV[1, ip] - pay
+        # edge normal facing the side the point started on: XS is PREV (this substep's start), or the CCD span's
+        # start when CCD runs once per frame (World._span_start)
+        pax, pay = XS[0, ia], XS[1, ia]
+        e0x, e0y = XS[0, ib] - pax, XS[1, ib] - pay
+        q0x, q0y = XS[0, ip] - pax, XS[1, ip] - pay
         cross0 = e0x * q0y - e0y * q0x
         if cross0 != 0:
             side = 1.0 if cross0 > 0 else -1.0
@@ -801,7 +803,7 @@ def warmup():
     i2, i1 = np.array([0, 1], np.int64), np.array([1, 2], np.int64)
     e, f = np.empty(0, np.int64), np.empty(0)
     moved_max(P, P)
-    contact_pass(P, P.copy(), W, i2, i1, np.ones(2), e, e, 3.0, 0.5, 3.0, True)
+    contact_pass(P, P.copy(), P.copy(), W, i2, i1, np.ones(2), e, e, 3.0, 0.5, 3.0, True)
     springs(P, W, i2, i1, np.ones(2), np.ones(2), np.ones(4))
     shape_match(P, np.zeros((1, 4), np.int64), np.zeros((1, 2, 4)), np.ones(1))
     rope_pass(P, W, e, e, np.zeros((0, 2, 2)), f, f)

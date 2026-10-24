@@ -171,8 +171,11 @@ _CONTACT_ACC = """
     float2 d = pa - tt * e;
     float dist = length(d);
     if (!(dist < r)) return;
-    // edge normal facing the side the point started the substep on
-    float cross0 = e0.x * q0.y - e0.y * q0.x;
+    // edge normal facing the side the point started on: the substep start (sref = 0), or inside a multi-substep CCD
+    // span the span start (sref = span start - prev), the last CCD-checked state
+    float2 se = e0 + float2(sref[ib] - sref[ia], sref[N + ib] - sref[N + ia]);
+    float2 sq = q0 + float2(sref[ip] - sref[ia], sref[N + ip] - sref[N + ia]);
+    float cross0 = se.x * sq.y - se.y * sq.x;
     float side = cross0 != 0.0f ? sign(cross0) : -esign[ed];
     float2 n_edge = -side * float2(e.y, -e.x) / sqrt(len2);
     bool inside = dot(d, n_edge) < 0.0f;
@@ -224,7 +227,7 @@ def _kernels():
           ["acc", "rsum"], _CON_ACC, True)
         k("con_apply", ["prev", "x", "acc", "scount", "kinds", "rslot", "rbody", "ranchor", "rn", "rsum", "rrest",
                         "rrestsum", "rstiff", "params"], ["xout"], _CON_APPLY, False)
-        k("contact_acc", ["prev", "x", "w", "cpt", "ce", "npairs", "edges_a", "edges_b", "esign", "params", "fparams"],
+        k("contact_acc", ["prev", "sref", "x", "w", "cpt", "ce", "npairs", "edges_a", "edges_b", "esign", "params", "fparams"],
           ["acc", "cnt"], _CONTACT_ACC, True)
         k("contact_apply", ["x", "acc", "cnt", "params"], ["xout"], _CONTACT_APPLY, False)
     return _K
@@ -371,16 +374,29 @@ class GpuBackend:
             w.V += EnvConfig.gravity[:, None] * h * (w.W > 0)
             w.PREV[:] = w.P
             w.P += w.V * h
-            w._apply_grab()
+            w._apply_grab(h)
         g, K = self._topology(), _kernels()
         N = g.n_pts
         cell, pad = EnvConfig.cell_size, 2 * EnvConfig.contact_radius
+        span = w._span_contacts  # inside a multi-substep CCD span: (GPU pairs or None, point box lo, hi)
         with sec("upload"):
-            # contact candidate cell ranges, exactly as World._candidates computes them
-            a, b = w.P[:, w.edges[0]], w.P[:, w.edges[1]]
-            elo = np.floor((np.minimum(a, b) - pad) / cell).astype(np.int64)
-            ehi = np.floor((np.maximum(a, b) + pad) / cell).astype(np.int64)
-            pc = np.floor(w.P / cell).astype(np.int64)
+            if w._span_start is None:
+                # contact candidate cell ranges, exactly as World._candidates computes them
+                a, b = w.P[:, w.edges[0]], w.P[:, w.edges[1]]
+                elo = np.floor((np.minimum(a, b) - pad) / cell).astype(np.int64)
+                ehi = np.floor((np.maximum(a, b) + pad) / cell).astype(np.int64)
+                pc = np.floor(w.P / cell).astype(np.int64)
+                cells = (pc, pc, elo, ehi)
+                w.contact_builds += 1
+                sref = mx.zeros((2 * N,), dtype=mx.float32)
+            else:
+                # World._span_candidates on the GPU: the span's swept-box pairs, rebuilt when a point leaves its box
+                if span is None or (w.P < span[1]).any() or (w.P > span[2]).any():
+                    boxes = w._span_boxes()
+                    cells = [np.floor(box / cell).astype(np.int64) for box in boxes]
+                    w._span_contacts = span = (None, boxes[0], boxes[1])
+                    w.contact_builds += 1
+                sref = _f32((w._span_start - w.PREV).ravel())
             prev, inv_mass = _f32(w.PREV.ravel()), _f32(w.W)  # W re-sent each substep in case it was edited
             x0 = _f32((w.P - w.PREV).ravel())
         S, R = g.n_springs, g.n_rigid_pts
@@ -390,7 +406,10 @@ class GpuBackend:
         with self._gpu_section("gpu pbd"):
             while True:
                 cap = self.contact_cap
-                npairs, cpt, ce = self._pairs(pc, pc, elo, ehi, 0, cap)
+                if span is not None and span[0] is not None:  # pairs this span already built (and fit in cap)
+                    npairs, cpt, ce = span[0]
+                else:
+                    npairs, cpt, ce = self._pairs(*cells, 0, cap)
                 kparams = _i32([N, cap])
                 x = x0
                 for _ in range(EnvConfig.iterations):
@@ -405,7 +424,7 @@ class GpuBackend:
                                     g.rrest, g.rrestsum, g.rstiff, cparams],
                             grid=_grid(N), threadgroup=tg, output_shapes=[(2 * N,)], output_dtypes=[mx.float32])
                     acc, cnt = K["contact_acc"](
-                        inputs=[prev, x, inv_mass, cpt, ce, npairs, g.edges_a, g.edges_b, g.esign, kparams, fparams],
+                        inputs=[prev, sref, x, inv_mass, cpt, ce, npairs, g.edges_a, g.edges_b, g.esign, kparams, fparams],
                         grid=_grid(cap), threadgroup=tg, output_shapes=[(2 * N,), (N,)],
                         output_dtypes=[mx.float32] * 2, init_value=0)
                     x, = K["contact_apply"](inputs=[x, acc, cnt, kparams], grid=_grid(N), threadgroup=tg,
@@ -413,6 +432,8 @@ class GpuBackend:
                 mx.eval(x, npairs)
                 n = int(npairs.item())
                 if n <= cap:
+                    if span is not None:
+                        w._span_contacts = (npairs, cpt, ce), span[1], span[2]
                     break
                 self.stats["pbd_retries"] += 1
                 self.contact_cap = _pow2(int(n * 1.5))

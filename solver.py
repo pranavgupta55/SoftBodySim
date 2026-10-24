@@ -1,5 +1,6 @@
 from collections import defaultdict
 from contextlib import nullcontext
+import math
 
 import numpy as np
 import pygame
@@ -39,13 +40,14 @@ def _outline_gap(a, b):
 
 
 class World:
-    """Owns all bodies and steps them. Per substep:
+    """Owns all bodies and steps them. Per CCD span (EnvConfig.ccd_stride substeps, by default the whole frame):
 
-    1. PBD: predict, drag, then springs / shape matching + soft contacts (thickness and friction).
-    2. Turn that motion into velocities and run continuous collision detection (CCD) on the straight-line paths
-       from the start positions, with impulses until no point crosses an edge (Bridson et al. 2002).
+    1. PBD substeps: predict, drag, then springs / shape matching + soft contacts (thickness and friction).
+    2. Turn the span's motion into velocities and run continuous collision detection (CCD) on the straight-line
+       paths from the span's start positions, with impulses until no point crosses an edge (Bridson et al. 2002).
     3. If impulses don't converge, merge colliding points into rigid impact zones until nothing collides.
-    Since each substep starts intersection-free and its whole motion is checked, it also ends intersection-free.
+    Since each span starts intersection-free and its whole motion is checked, it also ends intersection-free. The
+    substeps inside a span are only a proposal for that motion and may overlap.
     """
 
     def __init__(self):
@@ -54,7 +56,7 @@ class World:
         self.hooks = []  # entities.Hook: fixed points for ropes; drawn only, never stepped or collided
         self.grabbed = None  # global index of the point being dragged
         self.grab_target = np.zeros(2)
-        self.zone_count = 0  # how many substeps needed the rigid impact zone fallback (for debugging)
+        self.zone_count = 0  # how many CCD passes needed the rigid impact zone fallback (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
         self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend)
         # Looping (looping.py): a body that fully leaves `bounds` through a looping side re-enters through the opposite
@@ -72,6 +74,13 @@ class World:
         # Optional debug recorder (debug_overlay.StepRecorder), set only while an overlay needs solver data. It is
         # told about each step's CCD hits and impact zone points; None (the default) costs one attribute check
         self.debug = None
+        # During a multi-substep CCD span (see _ccd_span): positions at its start, which are intersection-free, so
+        # contacts take their sides from them. None when CCD runs after every substep (contacts then use PREV)
+        self._span_start = None
+        self._span_left = 0.0  # time from the current substep's start to the end of the span
+        self._span_contacts = None  # (candidates, point box lo, point box hi), shared by the span's substeps
+        self._span_reach = None  # _solve_contacts' reach, carried across the span's substeps
+        self.contact_builds = 0  # contact candidate broad phases run (for debugging)
 
     def add(self, body, index=None):
         """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
@@ -261,15 +270,17 @@ class World:
     def release(self):
         self.grabbed = None
 
-    def _apply_grab(self):
-        """Nudge the held point toward the cursor once per substep, so contacts (solved after) can out-vote the hand."""
+    def _apply_grab(self, h):
+        """Nudge the held point toward the cursor once per substep of length h, so contacts (solved after) can
+        out-vote the hand. The pull is set per second, so dragging feels the same at any substep count."""
         if self.grabbed is None:
             return
         gap = self.grab_target - self.P[:, self.grabbed]
-        step = gap * EnvConfig.grab_stiffness
+        step = gap * -math.expm1(-EnvConfig.grab_stiffness * h)
         length = np.hypot(*step)
-        if length > EnvConfig.grab_max_step:
-            step *= EnvConfig.grab_max_step / length
+        max_step = EnvConfig.grab_max_speed * h
+        if length > max_step:
+            step *= max_step / length
         self.P[:, self.grabbed] += step
 
     def _section(self, name):
@@ -303,6 +314,11 @@ class World:
         sec = self._section
         if self.debug is not None:
             self.debug.begin_step(self)
+        stride = n if EnvConfig.ccd_stride is None else max(1, min(int(EnvConfig.ccd_stride), n))
+        if stride > 1:
+            for k in range(0, n, stride):
+                self._ccd_span(h, min(stride, n - k))
+            return
         for _ in range(n):
             if self.bounce_bodies:
                 self._bounce(h)
@@ -314,6 +330,41 @@ class World:
                 self._resolve_ccd(h)
             self.P[:] = self.PREV + self.V * h
             self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
+
+    def _ccd_span(self, h, m):
+        """m substeps of length h without CCD, then one CCD pass over the span's straight-line motion (Bridson et al.
+        2002, sec. 5: any internal dynamics propose the end positions, CCD then edits the average velocity).
+
+        The span starts intersection-free and CCD makes its straight path from there collision-free, the same
+        argument as per-substep CCD with h = m h. Contacts in the substeps take their sides from the span start and
+        share one swept-box candidate list (_span_candidates). Points CCD leaves alone keep their last substep's
+        velocity; points it edited take the corrected average velocity."""
+        sec = self._section
+        T = m * h
+        X0 = self.P.copy()
+        self._span_start, self._span_contacts, self._span_reach = X0, None, None
+        damp = max(0.0, 1.0 - EnvConfig.damping * h)
+        try:
+            for k in range(m):
+                self._span_left = T - k * h
+                if self.bounce_bodies:
+                    self._bounce(h)
+                if self.backend is None or not self.backend.pbd_substep(h):  # False: the backend can't run this scene
+                    self._pbd_substep(h)
+                self.V[:] = (self.P - self.PREV) / h
+                self._limit_speed()
+                self.P[:] = self.PREV + self.V * h
+                self.V *= damp
+        finally:
+            self._span_start, self._span_contacts, self._span_reach = None, None, None
+        v_last = self.V.copy()
+        self.PREV[:] = X0
+        self.V[:] = v_avg = (self.P - X0) / T
+        with sec("ccd"):
+            self._resolve_ccd(T)
+        changed = (self.V != v_avg).any(axis=0)
+        self.P[:] = X0 + self.V * T
+        self.V[:] = np.where(changed, self.V * damp ** m, v_last)
 
     def _limit_speed(self):
         """Terminal velocity: scale down any point velocity faster than the limit (direction kept). It runs on V
@@ -395,16 +446,21 @@ class World:
             else:
                 for b in self.bodies:
                     b.predict(h)
-            self._apply_grab()
+            self._apply_grab(h)
         with sec("contacts"):
-            candidates = self._candidates()
-            reach = None  # (candidates within reach, positions when they were picked), see _solve_contacts
+            if self._span_start is None:
+                candidates = self._candidates()
+                reach = None  # (candidates within reach, positions when they were picked), see _solve_contacts
+            else:
+                candidates, reach = self._span_candidates()
         for _ in range(EnvConfig.iterations):
             with sec("constraints"):
                 self._solve_body_constraints()
                 self._solve_ropes()
             with sec("contacts"):
                 reach = self._solve_contacts(candidates, reach)
+        if self._span_start is not None:
+            self._span_reach = reach
 
     def draw(self, surface, filled=False, zoom=1.0):
         """Bodies in the order they were added (later ones on top). filled: solid polygons instead of points + springs.
@@ -519,7 +575,39 @@ class World:
         lo = np.floor((np.minimum(a, b) - pad) / cell).astype(np.int64)
         hi = np.floor((np.maximum(a, b) + pad) / cell).astype(np.int64)
         point_cells = np.floor(self.P / cell).astype(np.int64)
+        self.contact_builds += 1
         return self._filter_pairs(*self._cell_pairs(point_cells, point_cells, lo, hi), contact=True)
+
+    def _span_boxes(self):
+        """Per-point boxes over the predicted motion to the end of the CCD span, x .. x + v t + g t^2 / 2 (t =
+        _span_left), grown by contact_radius, plus the edge boxes around them grown by 2 contact_radius more:
+        (point lo, point hi, edge lo, edge hi). While every point stays in its box, any point within 2
+        contact_radius of an edge has overlapping boxes with it, so the pairs are a superset of _candidates'."""
+        r, t = EnvConfig.contact_radius, self._span_left
+        end = self.P + self.V * t + 0.5 * EnvConfig.gravity[:, None] * t * t * (self.W > 0)
+        if self.grabbed is not None:  # the hand pulls toward the cursor at up to grab_max_speed
+            g = self.grabbed
+            pull = self.grab_target - self.P[:, g]
+            reach = EnvConfig.grab_max_speed * t
+            dist = float(np.hypot(*pull))
+            end[:, g] = self.P[:, g] + self.V[:, g] * t + (pull if dist <= reach else pull * (reach / dist))
+        plo, phi = np.minimum(self.P, end) - r, np.maximum(self.P, end) + r
+        ea, eb = self.edges
+        return (plo, phi, np.minimum(plo[:, ea], plo[:, eb]) - 2 * r, np.maximum(phi[:, ea], phi[:, eb]) + 2 * r)
+
+    def _span_candidates(self):
+        """Contact candidates and reach for a substep inside a CCD span: the span's swept-box candidate list
+        (_span_boxes), rebuilt only when a point has left its box, and the reach carried over from the last
+        substep (it is checked against how far points moved, so it holds across substeps)."""
+        sc = self._span_contacts
+        if sc is not None and not ((self.P < sc[1]).any() or (self.P > sc[2]).any()):
+            return sc[0], self._span_reach
+        boxes = self._span_boxes()
+        cells = [np.floor(box / EnvConfig.cell_size).astype(np.int64) for box in boxes]
+        candidates = self._filter_pairs(*self._cell_pairs(*cells), contact=True)
+        self.contact_builds += 1
+        self._span_contacts = (candidates, boxes[0], boxes[1])
+        return candidates, None
 
     # ---------------- Narrow phase + resolution: point vs edge capsule
     def _solve_contacts(self, candidates, reach=None):
@@ -561,10 +649,12 @@ class World:
 
         # Edge normal facing the side the point started this substep on. CCD guarantees no point ever crosses an
         # edge, so that's always the free side: outside for neighboring bodies, inside for a body's contents.
-        # (Only a point exactly on the edge's line at the start falls back to the body's outward side.)
-        pa0 = PREV[:, ia]
-        e0 = PREV[:, ib] - pa0
-        q0 = PREV[:, pts] - pa0
+        # (Only a point exactly on the edge's line at the start falls back to the body's outward side.) Inside a
+        # multi-substep CCD span only the span start is CCD-checked, so the side comes from there.
+        X_side = PREV if self._span_start is None else self._span_start
+        pa0 = X_side[:, ia]
+        e0 = X_side[:, ib] - pa0
+        q0 = X_side[:, pts] - pa0
         cross0 = e0[0] * q0[1] - e0[1] * q0[0]
         side = np.where(cross0 != 0, np.sign(cross0), -self.edge_sign[edge_ids])
         n_edge = -side * np.array([e[1], -e[0]]) / np.sqrt(len2)

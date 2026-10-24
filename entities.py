@@ -25,12 +25,17 @@ class EnvConfig:
     terminal_velocity = 1000.0
     cell_size = 24.0  # px; spatial hash grid cell size, keep >= longest edge you care about
     max_dt = 1 / 30  # clamp for frame hitches
-    ccd_passes = 8  # collision-impulse passes per substep before falling back to rigid impact zones
+    # Substeps per CCD pass. 1: CCD after every substep, contact candidates rebuilt every substep. k > 1: k substeps
+    # run without CCD, then one CCD pass checks the straight path from their start to their end, and the contact
+    # candidates come from swept boxes over those k substeps. None: once per frame (all substeps).
+    ccd_stride = None
+    ccd_passes = 8  # collision-impulse passes per CCD pass before falling back to rigid impact zones
     ccd_gap = 0.01  # px; minimum gap continuous collision detection keeps between a point and an edge
     ccd_push = 0.25  # px; gap a collision impulse aims for, larger than ccd_gap so chains of contacts settle quickly
     grab_radius = 15.0  # px; how close the cursor must be to a point to pick it up
-    grab_stiffness = 0.3  # fraction of the gap to the cursor closed per substep
-    grab_max_step = 4.0  # px; max pull per substep
+    # 1/s; the gap to the cursor shrinks as exp(-grab_stiffness * t) (85.6: 30% per 1/240 s substep)
+    grab_stiffness = 85.6
+    grab_max_speed = 960.0  # px/s; fastest the hand pulls a point (4 px per 1/240 s substep)
     peg_spacing = 15.0  # world units (= screen px at the default zoom); hooks snap to a grid of pegs this far apart, aligned to the world origin
     # "cpu": all physics in numpy (fastest for small scenes). "gpu": broad phases + PBD solves on the Apple GPU via
     # MLX, exact CCD still float64 on the CPU (gpu_backend.py); faster from roughly 600 points (M4). Read in World.add.
