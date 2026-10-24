@@ -12,7 +12,8 @@ drawn last with the HUD shader and uploaded only when it changes.
 
     python3 main_opengl.py                      fullscreen, GPU compositing
     python3 main_opengl.py --window 1280x800    windowed
-    python3 main_opengl.py --scene diamonds     a preset scene (scene.PRESETS; default "default")
+    python3 main_opengl.py --scene diamonds     a preset scene (scene.PRESETS; default "default"),
+    python3 main_opengl.py --scene "newtons cradle"    e.g. this one (quote names with spaces)
     python3 main_opengl.py --basic              the Framework pipeline as-is: layers composited on the CPU into one
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
 

@@ -167,7 +167,11 @@ def build_diamonds_scene(world_width, world_height, seed=7, fraction=0.10, hexag
 
 
 # Preset scenes by name: builder(world_width, world_height) -> World. main_opengl.py --scene NAME picks one.
+# Imported last: preset modules import from here.
+from presets_cradle import build_newtons_cradle  # noqa: E402
+
 PRESETS = {
     "default": build_scene,
     "diamonds": build_diamonds_scene,
+    "newtons cradle": build_newtons_cradle,
 }
