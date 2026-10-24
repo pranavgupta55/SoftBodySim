@@ -84,12 +84,13 @@ MODE_H = 22
 COL_W = 232  # settings column of the config panel; the shape preview fills the rest
 CONFIG_W = 400
 LINE_H = 13  # one hotkey / hint line
+MIN_LINE_H = 11  # info card hotkey rows are packed down to this when the card column is short (see _card_rows)
 CARD_TITLE_H = 16
 CARD_BTN_H = 20
 KEY_COL_W = 46  # hotkey name column on the info card (room for ENTER / SPACE in bold)
 # hotkeys listed side by side in one row of the info card (short, related ones), so the card stays short enough for
 # the compute card to fit under it on small screens
-PAIRED_HOTKEYS = {"Z": "X", "S": "M"}
+PAIRED_HOTKEYS = {"Z": "X", "S": "M", "[ ]": "N"}
 PAIR_GAP = 4  # base px between a paired hotkey's key, label and state
 
 
@@ -231,6 +232,10 @@ class Editor:
         self.show_compute = True  # F / the card's [f] button: the main loop draws the compute card only while set
         self.compute_card = None  # its rect (real screen px), set by the main loop when drawn: clicks on it are swallowed
         self.gravity_card = None  # the gravity selector's rect (screen px) while shown, set by the main loop: swallowed too
+        # set by the main loop, for the info card's states: debug_overlay.DebugOverlays (keys 1-4) and
+        # timectl.TimeControl ([ / ] speed, N frame step); None leaves those rows without a state
+        self.overlays = None
+        self.time = None
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
         # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
@@ -355,6 +360,11 @@ class Editor:
             self.paused = not self.paused
             if self.paused:
                 self.world.release()
+
+    def can_frame_step(self):
+        """N steps one physics frame while paused: with the editor closed or on its spawn menu / settings panel, not
+        while picking objects or placing points (those are validated against where the bodies are now)."""
+        return self.paused and not (self.active and self.stage in ("select", "place"))
 
     def open(self):
         self.active, self.stage = True, "menu"
@@ -999,12 +1009,31 @@ class Editor:
         lines_y = buttons_y + bh + pad
         if self._row_shown():  # Undo / Finish / Redo (or Done) row under the pause / edit / compute buttons
             lines_y += bh + gap
-        rect = HUD.card_rect(self.screen_w, top, lines_y + len(self._hotkey_rows()) * px(LINE_H) + pad - px(1) - top)
+        rows, line_h = self._card_rows(lines_y)
+        rect = HUD.card_rect(self.screen_w, top, lines_y + len(rows) * line_h + pad - px(1) - top)
         bw = (rect.w - 2 * pad - 2 * gap) // 3
         pause = pygame.Rect(rect.x + pad, buttons_y, bw, bh)
         plus = pygame.Rect(pause.right + gap, buttons_y, bw, bh)
         compute = pygame.Rect(plus.right + gap, buttons_y, rect.right - pad - plus.right - gap, bh)
         return rect, pause, plus, compute, lines_y
+
+    def _card_rows(self, lines_y):
+        """The hotkey rows the info card shows and their line height (screen px), given where the list starts. All of
+        _hotkey_rows() at LINE_H when the card and the compute card under it fit on the screen; on a short screen the
+        rows that can't be used right now (dimmed) are left out, bottom up, and if that's not enough the rest are
+        packed closer, down to MIN_LINE_H."""
+        rows, px = self._hotkey_rows(), HUD.px
+        below = HUD.CARD_GAP + self.compute_card.h if self.show_compute and self.compute_card is not None else 0
+        room = self.screen_h - below - (lines_y + HUD.CARD_PAD - px(1))  # screen px left for the rows
+        line_h = px(LINE_H)
+        for k in reversed(range(len(rows))):
+            if len(rows) * line_h <= room:
+                break
+            if not any(usable for *_, usable in rows[k]):
+                del rows[k]
+        if len(rows) * line_h > room:
+            line_h = max(px(MIN_LINE_H), room // max(len(rows), 1))
+        return rows, line_h
 
     def _placing(self):
         return self.active and self.stage == "place"
@@ -1024,6 +1053,9 @@ class Editor:
     def _hotkeys(self):
         """(key, what it does, current state or None, usable now) for every hotkey, as listed on the info card."""
         placing = self._placing()
+        # speed and frame stepping don't apply while picking objects / placing points (physics is paused and N is
+        # off), so those two rows make room for that stage's button row
+        positioning = self.active and self.stage in ("select", "place")
         v = self.view
         grid = None if v is None else ("on" if v.show_grid else "off")
         look = None if v is None else ("filled" if v.filled else "points")
@@ -1044,7 +1076,10 @@ class Editor:
                 ("M", "mirror", "on" if self.mirror else "off",
                  not placing or self.mode == "freehand" or (self.mode == "custom" and self._cfg()["n"] >= 3)),
                 ("ESC", "back" if self.active else "quit", None, True),
-                ("drag", "grab bodies", None, not self.paused)]
+                ("drag", "grab bodies", None, not self.paused),
+                ("1-4", "overlays", None if self.overlays is None else self.overlays.state(), True)] + ([] if positioning else [
+                ("[ ]", "speed", None if self.time is None else self.time.label(), True),
+                ("N", "step", None, self.can_frame_step())])
 
     def _hotkey_rows(self):
         """The info card's hotkey rows: one hotkey each, or two (PAIRED_HOTKEYS) side by side."""
@@ -1555,14 +1590,15 @@ class Editor:
         rect on `surface`; the next card goes at rect.bottom + ui_style.HUD.CARD_GAP."""
         ox, oy = origin
         screen_rect, *_, lines_y = self._card_layout()
+        rows, line_h = self._card_rows(lines_y)
         rect, lines_y = screen_rect.move(-ox, -oy), lines_y - oy
         HUD.draw_frame(surface, rect)
-        px, pad, line_h = HUD.px, HUD.CARD_PAD, HUD.px(LINE_H)
+        px, pad = HUD.px, HUD.CARD_PAD
         HUD.text(surface, "Controls", (rect.x + pad, rect.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
         for area, _, spec in self._card_widgets():
             if spec[0] != "blocker":
                 self._draw_widget(surface, area.move(-ox, -oy), spec, area.collidepoint(mouse_px), HUD)
-        for i, row in enumerate(self._hotkey_rows()):
+        for i, row in enumerate(rows):
             y = lines_y + i * line_h + line_h // 2
             if len(row) == 2:
                 self._draw_hotkey_pair(surface, rect, row, y)

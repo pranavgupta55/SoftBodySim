@@ -19,7 +19,8 @@ drawn last with the HUD shader and uploaded only when it changes.
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
 GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, T motion trails, P pause,
-numpad 1-9 gravity (direction = numpad layout, 5 = off/on), ESC quit.
+numpad 1-9 gravity (direction = numpad layout, 5 = off/on), ESC quit, 1-4 debug overlays (debug_overlay.py), [ / ]
+physics speed 0.25x-2x and N one physics frame while paused (timectl.py).
 
 Timing: the compute card's "present" section is split into upload / render / gpu wait / flip. "gpu wait" is a
 GPU-tagged section around ctx.finish(): the time the CPU blocks until the GPU has finished this frame's texture
@@ -44,12 +45,15 @@ from perf_hud import PerfHUD
 from hud_layer import HudLayer
 from trails import Trails
 from gravity_dial import GravityDial
+from debug_overlay import DebugOverlays
+from timectl import TimeControl
 import ui_style
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
 FPS = 60
 SCALE_DOWN = 2  # real screen px per render surface px
 GHOST_ALPHA = 100  # opacity of the translucent ghost layer (screenT)
+OVERLAY_LEGEND_PX = 6  # the debug overlay legend's top-left corner, UI px in from the top-left of the screen
 MEASURE_GPU = True  # ctx.finish() before the flip so the compute card can show GPU time
 
 # ---------------- moderngl plumbing
@@ -329,6 +333,10 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     trails = Trails()  # T: fading paths behind moving bodies, drawn under them
     gravity_dial = GravityDial(display.window_size, scaleDownFactor)  # bottom-left gravity selector, native res (numpad 1-9 too)
 
+    overlays = DebugOverlays()  # keys 1-4
+    time_ctl = TimeControl()  # [ / ] physics speed, N frame step
+    editor.overlays, editor.time = overlays, time_ctl
+
     def dial_shown():
         """The gravity selector shows with the HUD (SPACE), but not over the editor's modal menu / settings panels."""
         return toggle and not (editor.active and editor.stage in ("menu", "config"))
@@ -392,13 +400,29 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     ViewConfig.filled = not ViewConfig.filled
                 if event.key == pygame.K_t:
                     ViewConfig.trails = not ViewConfig.trails
+                if pygame.K_1 <= event.key <= pygame.K_4:
+                    overlays.toggle(event.key - pygame.K_1)
+                if event.key == pygame.K_LEFTBRACKET:
+                    time_ctl.slower()
+                if event.key == pygame.K_RIGHTBRACKET:
+                    time_ctl.faster()
+                if event.key == pygame.K_n and editor.can_frame_step():
+                    time_ctl.request_step()
 
         # ---------------- Updating Screen
         profiler.switch("physics")
         world.drag_to((wx, wy))
+        overlays.attach(world)  # World.debug: a step recorder while overlay 2 or 4 is on, else None
+        # dt is in frames here, World wants seconds; the time scale applies to the physics only (timectl.py)
         stepped = not editor.paused
         if stepped:
-            world.step(dt / fps)  # dt is in frames here, World wants seconds
+            world.step(*time_ctl.step_args(dt / fps))
+            overlays.after_step(world)
+        for _ in range(time_ctl.take_steps() if editor.paused else 0):  # N: one nominal frame per press
+            world.step(*time_ctl.step_args(1 / fps))
+            overlays.after_step(world)
+            stepped = True
+        time_ctl.pending = 0  # a step requested just before resuming is dropped
         profiler.switch("draw")
         if ViewConfig.show_grid:
             world.draw_grid(screen2, zoom=ViewConfig.zoom)
@@ -407,7 +431,12 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
             trails.update(world, dt / fps, stepped)
             trails.draw(screen2, zoom=ViewConfig.zoom)  # under the bodies
         world.draw(screen2, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
+        if overlays.any():
+            with profiler.section("overlays"):
+                overlays.draw(screen2, world, ViewConfig.zoom)
         editor.draw_world(screen2, screenT, (mx, my))
+        if overlays.any():  # the legend: top left of the world area, independent of the HUD toggle
+            overlays.draw_legend(screenUI, world, (OVERLAY_LEGEND_PX, OVERLAY_LEGEND_PX))
         editor.draw_ui(screenUI, (mx, my))  # panels, buttons and hints, under the HUD cards
 
         profiler.switch("ui")
