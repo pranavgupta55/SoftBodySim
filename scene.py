@@ -142,22 +142,26 @@ ENDESGA_32 = [Endesga.rust_red, Endesga.burnt_orange, Endesga.sand, Endesga.tan,
 BRIGHT_ENDESGA_32 = [c for c in ENDESGA_32 if sum(c) > 230]
 
 DIAMONDS_HEXAGONS = 140  # falling hexagons in the "diamonds" preset
+DIAMOND_SIDE = 40.0  # edge length of its diamonds (world units)
+CUP_GAP = 40.0  # diamonds whose corners are closer than this (the widest hexagon) can't form a cup either
 
 
-def build_diamonds_scene(world_width, world_height, seed=7, fraction=0.10, hexagons=DIAMONDS_HEXAGONS, inset=INSET):
-    """"diamonds" preset: a seeded random `fraction` of the rhombi of a tumbling-blocks image (maps/diamonds.json,
-    fitted to cover the world) as fixed diamonds in the image's colors, and `hexagons` soft hexagons of random sizes
+def build_diamonds_scene(world_width, world_height, seed=7, fraction=0.08, hexagons=DIAMONDS_HEXAGONS, inset=INSET):
+    """"diamonds" preset: a seeded random `fraction` of the rhombi of a tumbling-blocks tiling (edge DIAMOND_SIDE,
+    covering the world; never two that form a cup, diamonds_map.forms_cup) as fixed diamonds in the colors of
+    maps/diamonds.json, and `hexagons` soft hexagons of random sizes
     (8-20) and ENDESGA 32 colors that fall through them. Looping is on: there is no floor or ceiling, so what falls
     off the bottom comes back in at the top, same x and velocity (looping.py). The side walls run a world size past
     the screen at both ends, so bodies passing through the off-screen bands above and below stay between them."""
-    from diamonds_map import fit_to_world, load_tiling, pick_diamonds, place_hexagons
+    from diamonds_map import lattice_diamonds, pick_diamonds, place_hexagons
 
     world = World()
     add_world_box(world, world_width, world_height, inset, col=Endesga.greyD)
     world.set_looping("top", True)  # no ceiling: what loops off the bottom comes in from above the screen
     world.set_looping("bottom", True)  # no floor
-    diamonds = pick_diamonds(fit_to_world(load_tiling(), world_width, world_height), world_width, world_height,
-                             seed=seed, fraction=fraction, side=inset)
+    tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed)
+    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, fraction=fraction, side=inset,
+                             size=DIAMOND_SIDE, gap=CUP_GAP)
     for corners, col in diamonds:
         world.add(FixedBody(corners, point_col=col, stick_col=col, point_radius=2, fill_col=col))
     rng = np.random.default_rng(seed + 2)

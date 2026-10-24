@@ -1,6 +1,7 @@
-"""The "diamonds" preset's geometry: the rhombus tiling recovered from a tumbling-blocks image (maps/diamonds.json,
-made offline by a lattice fit, so nothing here needs the image or image processing), fitted to the world, plus
-placement of the falling hexagons. Pure geometry; scene.py turns the results into bodies.
+"""The "diamonds" preset's geometry: a tumbling-blocks rhombus tiling (the lattice of an isometric image, see
+maps/diamonds.json, which also gives the palette) laid over the world at any size, a seeded random pick of its
+diamonds that never forms a cup, plus placement of the falling hexagons. Pure geometry; scene.py turns the results
+into bodies.
 """
 import json
 import math
@@ -9,36 +10,98 @@ import os
 import numpy as np
 
 MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "diamonds.json")
+SQRT3_2 = math.sqrt(3) / 2
 
 
 def load_tiling(path=MAP_PATH):
-    """{'image_size': [w, h], 'palette': [[r, g, b], ...], 'diamonds': [{'corners': 4 x [x, y], 'color': k}, ...]}
-    with corners in image px (y down), one entry per rhombus of the image."""
+    """{'image_size': [w, h], 'lattice': {...}, 'palette': [[r, g, b], ...], 'diamonds': [...]} (corners in image px)."""
     with open(path) as f:
         return json.load(f)
 
 
-def fit_to_world(tiling, world_w, world_h):
-    """Every diamond as ((2, 4) world corners, rgb). The image is scaled uniformly to cover the world (the larger
-    of the width and height ratios, so the width is always covered) and centered; the overflow is cropped."""
-    img_w, img_h = tiling["image_size"]
-    scale = max(world_w / img_w, world_h / img_h)
-    off = np.array([[(world_w - img_w * scale) / 2], [(world_h - img_h * scale) / 2]])
-    palette = tiling["palette"]
-    return [(np.array(d["corners"], dtype=float).T * scale + off, list(palette[d["color"]])) for d in tiling["diamonds"]]
+def cube_faces(c, side):
+    """The 3 faces of the isometric cube whose front corner (where its faces meet) is c: {face: (2, 4) corners}.
+    The top face points left / right; the left and right faces each point down (their lowest corner is below c)."""
+    a, cx, cy = side * SQRT3_2, c[0], c[1]
+    pts = {"top": [(0, 0), (-a, -side / 2), (0, -side), (a, -side / 2)],
+           "left": [(0, 0), (0, side), (-a, side / 2), (-a, -side / 2)],
+           "right": [(0, 0), (a, -side / 2), (a, side / 2), (0, side)]}
+    return {face: np.array([[cx + dx for dx, _ in v], [cy + dy for _, dy in v]]) for face, v in pts.items()}
 
 
-def pick_diamonds(fitted, world_w, world_h, seed=7, fraction=0.10, side=5.0, margin=10.0, top=20.0):
-    """A seeded random `fraction` of the fitted diamonds in the playfield: at least `margin` in from the side walls
-    (at x = side and world_w - side), at least `top` below the top edge (keeps the band where looping bodies re-enter
-    clear), and centered above the bottom edge (there's no floor, so one may hang off the bottom). Returns the chosen
-    (corners, rgb) in tiling order."""
-    inside = [d for d in fitted
+def lattice_diamonds(world_w, world_h, side, seed=7, palette=None):
+    """Every diamond of a tumbling-blocks tiling with edge length `side` covering the world: [(corners (2, 4),
+    rgb, face)], each a random palette color (default: the image's, maps/diamonds.json, minus its dark navy, which
+    vanishes against the background). Cubes sit in rows 1.5 side apart, alternate rows shifted half a cube."""
+    if palette is None:
+        palette = [c for c in load_tiling()["palette"] if sum(c) > 230]
+    rng = np.random.default_rng(seed)
+    w = 2 * side * SQRT3_2  # one cube's width
+    out = []
+    for j in range(-1, int(world_h / (1.5 * side)) + 3):
+        for i in range(-1, int(world_w / w) + 3):
+            c = (i * w + (w / 2 if j % 2 else 0.0), j * 1.5 * side)
+            for face, corners in cube_faces(c, side).items():
+                out.append((corners, list(palette[int(rng.integers(len(palette)))]), face))
+    return out
+
+
+def _corner_arc(poly, k):
+    """The directions (start, end) radians, counterclockwise with y up, that convex poly (2, n) covers at corner k."""
+    v = poly[:, k]
+    e1, e2 = poly[:, k - 1] - v, poly[:, (k + 1) % poly.shape[1]] - v
+    a1, a2 = math.atan2(-e1[1], e1[0]), math.atan2(-e2[1], e2[0])
+    if (a2 - a1) % (2 * math.pi) > math.pi:  # the interior angle is under 180 degrees: take the short way round
+        a1, a2 = a2, a1
+    return a1 % (2 * math.pi), a2 % (2 * math.pi)
+
+
+def forms_cup(p, q, side, gap=0.0):
+    """Do diamonds p and q (2, 4) touch at a corner with an open valley above it, walled by p on one side and q on
+    the other? The gap between them there is a wedge of directions; it's a cup when that wedge opens upward and both
+    of its walls point up (the two faces of a cube without its top face, two top faces tip to tip, ...): it catches
+    what falls in. With `gap` > 0, corners up to that far apart count too (q is slid onto p's corner for the
+    test): a pocket narrower than `gap` catches anything wider than it just the same."""
+    eps = 1e-6 * side
+    for i in range(p.shape[1]):
+        d = np.hypot(*(q - p[:, i:i + 1]))
+        if d.min() > max(gap, eps):
+            continue  # no corner of q at (or near) this one
+        arcs = [_corner_arc(p, i) + ("p",), _corner_arc(q, int(d.argmin())) + ("q",)]
+        # the free wedges are between one arc's end and the other's start (counterclockwise)
+        for (s1, e1, n1), (s2, e2, n2) in (arcs, arcs[::-1]):
+            lo, hi = e1, s2  # free from the end of arc 1 to the start of arc 2
+            width = (hi - lo) % (2 * math.pi)
+            if width < 1e-9:
+                continue
+            if 0 < lo < math.pi and 0 < lo + width < math.pi:  # both walls point up: an upward-opening valley
+                return True
+    return False
+
+
+def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, margin=10.0, top=20.0, size=None,
+                  gap=0.0):
+    """A seeded random `fraction` of the diamonds (corners, rgb, face) in the playfield: at least `margin` in from the
+    side walls (at x = side and world_w - side), at least `top` below the top edge (keeps the band where looping
+    bodies re-enter clear), and centered above the bottom edge (there's no floor, so one may hang off the bottom).
+    A diamond that would form a cup with one already picked (forms_cup; corners up to `gap` apart count as touching)
+    is skipped and the next random one tried.
+    `size`: the tiling's edge length (for the cup test; default: from the first diamond). Returns [(corners, rgb)]
+    in tiling order."""
+    inside = [d for d in diamonds
               if d[0][0].min() >= side + margin and d[0][0].max() <= world_w - side - margin
               and d[0][1].min() >= top and d[0][1].mean() <= world_h]
-    count = max(1, int(round(fraction * len(inside)))) if inside else 0
-    keep = np.random.default_rng(seed).choice(len(inside), size=count, replace=False) if count else []
-    return [inside[k] for k in sorted(keep)]
+    if not inside:
+        return []
+    size = float(np.hypot(*(inside[0][0][:, 1] - inside[0][0][:, 0]))) if size is None else size
+    count = max(1, int(round(fraction * len(inside))))
+    chosen = []
+    for k in np.random.default_rng(seed).permutation(len(inside)):
+        if len(chosen) == count:
+            break
+        if not any(forms_cup(inside[k][0], inside[m][0], size, gap) for m in chosen):
+            chosen.append(int(k))
+    return [inside[k][:2] for k in sorted(chosen)]
 
 
 def _dist_to_polygon(p, poly):
