@@ -28,6 +28,39 @@ class Endesga:
     sebastian_lague_light_purple = [137, 133, 181]
     network_green = [64, 128, 67]
     network_red = [127, 45, 41]
+    # The rest of the ENDESGA 32 palette by Endesga (https://lospec.com/palette-list/endesga-32), in its order;
+    # its white (#ffffff) is already `white` above
+    rust_red = [190, 74, 47]  # be4a2f
+    burnt_orange = [215, 118, 67]  # d77643
+    sand = [234, 212, 170]  # ead4aa
+    tan = [228, 166, 114]  # e4a672
+    clay = [184, 111, 80]  # b86f50
+    brown = [115, 62, 57]  # 733e39
+    dark_brown = [62, 39, 49]  # 3e2731
+    crimson = [162, 38, 51]  # a22633
+    red = [228, 59, 68]  # e43b44
+    orange = [247, 118, 34]  # f77622
+    amber = [254, 174, 52]  # feae34
+    yellow = [254, 231, 97]  # fee761
+    grass_green = [99, 199, 77]  # 63c74d
+    green = [62, 137, 72]  # 3e8948
+    forest_green = [38, 92, 66]  # 265c42
+    deep_teal = [25, 60, 62]  # 193c3e
+    navy_blue = [18, 78, 137]  # 124e89
+    sky_blue = [0, 153, 219]  # 0099db
+    cyan = [44, 232, 245]  # 2ce8f5
+    pale_steel = [192, 203, 220]  # c0cbdc
+    steel_grey = [139, 155, 180]  # 8b9bb4
+    slate = [90, 105, 136]  # 5a6988
+    dark_slate = [58, 68, 102]  # 3a4466
+    midnight_blue = [38, 43, 68]  # 262b44
+    near_black = [24, 20, 37]  # 181425
+    neon_red = [255, 0, 68]  # ff0044
+    plum = [104, 56, 108]  # 68386c
+    orchid = [181, 80, 136]  # b55088
+    salmon = [246, 117, 122]  # f6757a
+    peach = [232, 183, 150]  # e8b796
+    caramel = [194, 133, 105]  # c28569
 
 
 class FireCols:
