@@ -159,7 +159,7 @@ def _world_state(world, index, arr, col):
         st["bounds"] = [float(v) for v in world.bounds]
     if isinstance(getattr(world, "env", None), dict) and world.env:  # per-world EnvConfig overrides
         st["env"] = {str(k): (np.asarray(v, dtype=float).tolist() if isinstance(v, (list, tuple, np.ndarray)) else v)
-                     for k, v in world.env.items() if isinstance(v, (int, float, list, tuple, np.ndarray))}
+                     for k, v in world.env.items() if v is None or isinstance(v, (int, float, list, tuple, np.ndarray))}
     tv = getattr(world, "terminal_velocity", None)
     if isinstance(tv, (int, float)) and not isinstance(tv, bool) and math.isfinite(tv):
         st["terminal_velocity"] = float(tv)
@@ -205,7 +205,21 @@ def scene_data(world, box, view=None, name=""):
             "world": {"width": float(box[0]), "height": float(box[1]), "inset": float(box[2])}, "env": current_env(world)}
     if view is not None:
         data["view"] = {"filled": bool(view.filled), "show_grid": bool(view.show_grid), "zoom": float(view.zoom)}
+    return _with_contents(data, world, box)
+
+
+def _with_contents(data, world, box):
+    """data plus the world's contents; the world's own friction / damping / terminal velocity (World.env) go in
+    data["env"] only (a load puts them back into World.env), so a file states each setting once."""
     data.update(capture(world, box))
+    own = data.get("state", {}).get("env")
+    if own is not None:
+        for name in ENV_SCALARS:
+            if name in own:
+                v = own.pop(name)
+                data["env"][name] = None if v is None else float(v)
+        if not own:
+            del data["state"]["env"]
     return data
 
 
@@ -594,9 +608,8 @@ def preset_data(name, box):
     w, h, inset = box
     world = PRESETS[name](w, h)
     data = {"format": FORMAT, "version": VERSION, "name": name,
-            "world": {"width": float(w), "height": float(h), "inset": float(inset)}, "env": DEFAULT_ENV}
-    data.update(capture(world, box))
-    return data
+            "world": {"width": float(w), "height": float(h), "inset": float(inset)}, "env": dict(DEFAULT_ENV)}
+    return _with_contents(data, world, box)
 
 
 # ---------------- World undo / redo

@@ -1504,7 +1504,7 @@ class Editor(SelectionTools):
                 if self.paused:  # otherwise whole-world changes (spawns, loads, ...), only while paused
                     self.world_undo() if undo_key else self.world_redo()
                     return True
-                self._say("pause (P) to undo / redo")
+                self._say("pause (SPACE) to undo / redo")
                 return False
             if self._editing():  # selection editing: Delete, Ctrl/Cmd+C / V / D, Q / E, Esc (selection.py)
                 return self._edit_key(event)
