@@ -92,6 +92,13 @@ for x_frac, y, strength, col in ((0.32, ground_top - 100, 1.0, Endesga.cream),
     world.add(SoftBody(polygon_points(screen_width * x_frac, y, 18, 12),
                        stiffness=hexagon_stiffness * strength, skip_sets=2, point_col=col, stick_col=Endesga.very_light_blue, point_radius=3))
 
+# Hollow rigid box near the left wall with a soft dodecagon inside it; drag the box to slosh it around.
+# The container is added first so it draws underneath its contents.
+box_cx, box_cy = inset + 50, screen_height * 0.3
+world.add(RigidBody(rect_points(box_cx, box_cy, 90, 70), point_col=Endesga.light_brown, stick_col=Endesga.greyL, point_radius=3))
+world.add(SoftBody(polygon_points(box_cx, box_cy, 20, 12), stiffness=hexagon_stiffness, skip_sets=2,
+                   point_col=Endesga.network_red, stick_col=Endesga.very_light_blue, point_radius=3))
+
 # ---------------- Main Game Loop
 last_time = time.time()
 running = True
