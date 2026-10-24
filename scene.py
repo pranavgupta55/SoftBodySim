@@ -143,7 +143,7 @@ BRIGHT_ENDESGA_32 = [c for c in ENDESGA_32 if sum(c) > 230]
 
 DIAMONDS_HEXAGONS = 140  # falling hexagons in the "diamonds" preset
 DIAMOND_SIDE = 32.0  # edge length of its diamonds (world units)
-DIAMOND_SPACING = 70.0  # no two diamond centers closer than this: spreads them out
+DIAMOND_CHAIN_WIDTH = 120.0  # a cluster of touching diamonds is at most this wide (tall is fine): no long ledges
 DIAMOND_MARGIN = 60.0  # diamonds stay this far in from the side walls
 CUP_GAP = 40.0  # diamonds whose corners are closer than this (the widest hexagon) can't form a cup either
 
@@ -163,7 +163,7 @@ def build_diamonds_scene(world_width, world_height, seed=7, fraction=0.09, hexag
     world.set_looping("bottom", True)  # no floor
     tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed)
     diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, fraction=fraction, side=inset,
-                             margin=DIAMOND_MARGIN, size=DIAMOND_SIDE, gap=CUP_GAP, spacing=DIAMOND_SPACING)
+                             margin=DIAMOND_MARGIN, size=DIAMOND_SIDE, gap=CUP_GAP, max_width=DIAMOND_CHAIN_WIDTH)
     for corners, col in diamonds:
         world.add(FixedBody(corners, point_col=col, stick_col=col, point_radius=2, fill_col=col))
     rng = np.random.default_rng(seed + 2)

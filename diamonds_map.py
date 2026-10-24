@@ -79,14 +79,19 @@ def forms_cup(p, q, side, gap=0.0):
     return False
 
 
+def _corner_gap(p, q):
+    """The smallest distance between a corner of p and a corner of q ((2, n) each)."""
+    return float(np.hypot(*(p[:, :, None] - q[:, None, :])).min())
+
+
 def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, margin=10.0, top=20.0, size=None,
-                  gap=0.0, spacing=0.0):
+                  gap=0.0, max_width=None):
     """A seeded random `fraction` of the diamonds (corners, rgb, face) in the playfield: at least `margin` in from the
     side walls (at x = side and world_w - side), at least `top` below the top edge (keeps the band where looping
     bodies re-enter clear), and centered above the bottom edge (there's no floor, so one may hang off the bottom).
     A diamond that would form a cup with one already picked (forms_cup; corners up to `gap` apart count as touching)
-    is skipped and the next random one tried, as is one whose center is closer than `spacing` to a picked one's
-    (spreads them out more evenly than a plain random pick).
+    is skipped and the next random one tried, as is one that would make a cluster (picked diamonds linked by
+    corners up to `gap` apart) wider than `max_width`: clusters may grow tall, never into long horizontal chains.
     `size`: the tiling's edge length (for the cup test; default: from the first diamond). Returns [(corners, rgb)]
     in tiling order."""
     inside = [d for d in diamonds
@@ -96,15 +101,24 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, m
         return []
     size = float(np.hypot(*(inside[0][0][:, 1] - inside[0][0][:, 0]))) if size is None else size
     count = max(1, int(round(fraction * len(inside))))
-    centers = np.array([d[0].mean(axis=1) for d in inside])
-    chosen = []
+    link = max(gap, 1e-6 * size)
+    chosen, cluster = [], {}  # cluster: picked index -> its cluster (a shared list of picked indices)
     for k in np.random.default_rng(seed).permutation(len(inside)):
         if len(chosen) == count:
             break
-        if chosen and np.hypot(*(centers[chosen] - centers[k]).T).min() < spacing:
+        p = inside[k][0]
+        if any(forms_cup(p, inside[m][0], size, gap) for m in chosen):
             continue
-        if not any(forms_cup(inside[k][0], inside[m][0], size, gap) for m in chosen):
-            chosen.append(int(k))
+        near = [m for m in chosen if _corner_gap(p, inside[m][0]) <= link]
+        merged = {id(c): c for c in (cluster[m] for m in near)}.values()
+        members = [int(k)] + [m for c in merged for m in c]
+        if max_width is not None:
+            xs = np.concatenate([inside[m][0][0] for m in members])
+            if xs.max() - xs.min() > max_width:
+                continue
+        for m in members:
+            cluster[m] = members
+        chosen.append(int(k))
     return [inside[k][:2] for k in sorted(chosen)]
 
 
