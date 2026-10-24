@@ -77,6 +77,9 @@ class ViewConfig:
     filled = True  # V: filled polygons with a black border instead of points + springs
     trails = False  # T: fading motion trails behind moving bodies (trails.py)
     zoom = 0.5  # render pixels per world unit: 0.5 shows twice as much world each way
+    # share of the screen width taken by the right-hand sidebar (all the cards); the world fills the rest. The sidebar
+    # is at least wide enough for legible cards (ui_style.sidebar_rect), e.g. 158 px (12%) on a 1280 px screen
+    sidebar_frac = 0.10
 
 
 INSET = 5  # the world box walls sit this many world units in from each edge
@@ -110,7 +113,7 @@ def build_scene(world_width, world_height, inset=INSET):
 
     # Ropes: a small rigid box hung from the top wall by two ropes in a V, and a rope from the square to the cream dodecagon
     square, cream_dodecagon = world.bodies[5], world.bodies[7]
-    hang_x, box_half = world_width * 0.62, 8  # clear of the container (left) and the HUD cards (top right)
+    hang_x, box_half = world_width * 0.62, 8  # clear of the container (left)
     anchor = (hang_x, inset)
     hanging_box = RigidBody(rect_points(hang_x, inset + 50 + box_half, 2 * box_half, 2 * box_half),
                             point_col=Endesga.cream, stick_col=Endesga.greyL, point_radius=2)
@@ -169,9 +172,11 @@ def build_diamonds_scene(world_width, world_height, seed=7, fraction=0.10, hexag
 # Preset scenes by name: builder(world_width, world_height) -> World. main_opengl.py --scene NAME picks one.
 # Imported last: preset modules import from here.
 from presets_cradle import build_newtons_cradle  # noqa: E402
+from presets_basic import PRESETS as BASIC_PRESETS  # noqa: E402
 
 PRESETS = {
     "default": build_scene,
     "diamonds": build_diamonds_scene,
     "newtons cradle": build_newtons_cradle,
 }
+PRESETS.update(BASIC_PRESETS)  # blank, random walls, looping (presets_basic.py)

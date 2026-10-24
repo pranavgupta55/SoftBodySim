@@ -551,27 +551,26 @@ class SelectionTools:
 
     # ---------------- Hotkeys on the info card
     def _edit_hotkeys(self):
-        """The info card's row while editing, in place of "drag  grab bodies" (so the card keeps its height: on short
-        screens the card column is already full): what's selected. The selection's hotkeys are in the hint box
-        (_edit_hint_lines), shown while something is selected."""
-        if self._live_picked():
-            return [("click", "select", self._selection_summary(), True)]
-        return [("click", "select / drag box", None, True)]
+        """The Controls card's "Select" section while editing: what's selected and what can be done with it."""
+        has = bool(self._live_picked())
+        n = self._clip_count()
+        return [("click", "select", self._selection_summary(), True),
+                ("shift", "add / remove", None, True),
+                ("drag", "move" if has else "box select", None, True),
+                ("Q E", "rotate", None, has or self.paste is not None),
+                ("DEL", "delete", None, has),
+                ("^C", "copy", None, has),
+                ("^V", "paste", f"{n} copied" if n else None, n > 0),
+                ("^D", "duplicate", None, has)]
 
     def _edit_hint(self):
-        """Is the selection hint box up (something selected, or a paste ghost)?"""
-        return self._editing() and (self.paste is not None or bool(self._live_picked()))
+        """Is the paste hint box up (a paste ghost follows the mouse)?"""
+        return self._editing() and self.paste is not None
 
     def _edit_hint_lines(self):
-        """The hint box while editing: the paste ghost's keys, or the selection's hotkeys."""
-        n = self._clip_count()
-        paste = f"^V paste ({n})" if n else "^V paste"
-        if self.paste is not None:
-            pose = self.paste["pose"]
-            what = "copy" if len(pose.bodies) + len(pose.hooks) == 1 else "copies"
-            return [f"Click to place the {what}", "Q / E rotate  ·  Esc cancel"]
-        return [f"{self._selection_summary()} selected  ·  drag to move  ·  Shift+click add / remove",
-                f"Del delete  ·  ^C copy  ·  {paste}  ·  ^D duplicate  ·  Q / E rotate  ·  Esc"]
+        pose = self.paste["pose"]
+        what = "copy" if len(pose.bodies) + len(pose.hooks) == 1 else "copies"
+        return [f"Click to place the {what}", "Q / E rotate  ·  Esc cancel"]
 
     # ---------------- Drawing
     def _draw_edit(self, surface, ghost_surface, wp, over_ui):

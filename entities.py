@@ -20,6 +20,9 @@ class EnvConfig:
     contact_radius = 3.0  # px; a point collides with an edge when closer than this
     friction = 0.5  # 0 = ice, 1 = sticky
     damping = 0.2  # fraction of velocity lost per second
+    # px/s; no point moves faster than this (None = no limit; per world via World.env).
+    # A fall down a whole 982-unit-tall world peaks near 850 px/s, so only longer falls (looping worlds) reach it.
+    terminal_velocity = 1000.0
     cell_size = 24.0  # px; spatial hash grid cell size, keep >= longest edge you care about
     max_dt = 1 / 30  # clamp for frame hitches
     ccd_passes = 8  # collision-impulse passes per substep before falling back to rigid impact zones
