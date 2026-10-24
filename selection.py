@@ -560,10 +560,10 @@ class SelectionTools:
         if has or self.clipboard is not None or self.paste is not None:
             n = self._clip_count()
             rows += [("shift", "add / remove", None, True),
-                     ("DEL", "delete", None, has),
+                     ("DEL", "delete", None, has),  # DEL and ^D share a row (editor.PAIRED_HOTKEYS)
+                     ("^D", "duplicate", None, has),
                      ("^C", "copy", None, has),
                      ("^V", "paste", f"{n} copied" if n else None, n > 0),
-                     ("^D", "duplicate", None, has),
                      ("Q E", "rotate", None, has or self.paste is not None)]
         return rows
 

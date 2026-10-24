@@ -50,6 +50,10 @@ class Body:
     """A closed polygon of points. Collision outline is the loop 0 -> 1 -> ... -> n-1 -> 0."""
     fixed = False
     self_collide = False  # whether a point can hit this body's own non-neighboring edges
+    # Opt-in bounce between two bodies that both have restitution > 0 (World._bounce): 0 = the usual inelastic
+    # contacts, 1 = perfectly elastic. Treats the bodies as balls (impulses through the centres, no spin), e.g. the
+    # Newton's cradle. Set it before World.add.
+    restitution = 0.0
 
     def __init__(self, points=None, vels=None, mass=1.0, point_col=None, stick_col=None, point_radius=2, stick_width=1,
                  fill_col=None):

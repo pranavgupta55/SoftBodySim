@@ -18,6 +18,7 @@ import time
 import numpy as np
 import pygame
 
+import freehand
 import ui_style as ui
 from ui_style import HUD
 from peg_layer import PegLayer
@@ -61,6 +62,17 @@ INCOMPLETE = "complete the new object to resume the sim"
 FINISH_FIRST = "complete the new object first"
 DIFFERENT_CONTAINERS = "pick objects in the same container"
 MESSAGE_SIZE = 20  # bold, shrunk to fit narrow surfaces
+# freehand shapes (a third placement mode for polygon kinds): the stroke is resampled to points about FREEHAND_SPACING
+# world units apart (further apart on big shapes, so there are at most FREEHAND_MAX); the panel's point count doesn't
+# apply to them
+FREEHAND_SPACING = 12.0
+FREEHAND_MAX = 64
+FREEHAND_STEP = 1.0  # world units the mouse must move before the stroke records another position
+TOO_SMALL = "draw a bigger shape"
+BAD_SHAPE = "you cannot spawn that shape there"
+MIRROR_LOCKED = "undo the placed points to toggle mirror"
+SNAP_STEP_DEG = 15.0  # S: a new point's direction from the previous one snaps to multiples of this
+POLYGON_MODES = ("regular", "custom", "freehand")
 
 # layout, in UI-surface pixels (the info card uses the CARD_* / LINE_H / BTN_GAP / KEY_COL_W ones times HUD_SCALE)
 PAD = 8  # panel padding
@@ -73,9 +85,14 @@ MODE_H = 22
 COL_W = 232  # settings column of the config panel; the shape preview fills the rest
 CONFIG_W = 400
 LINE_H = 13  # one hotkey / hint line
+MIN_LINE_H = 11  # info card hotkey rows are packed down to this when the card column is short (see _card_rows)
 CARD_TITLE_H = 16
 CARD_BTN_H = 20
 KEY_COL_W = 46  # hotkey name column on the info card (room for ENTER / SPACE in bold)
+# hotkeys listed side by side in one row of the info card (short, related ones), so the card stays short enough for
+# the compute card to fit under it on small screens
+PAIRED_HOTKEYS = {"Z": "X", "S": "M", "[ ]": "N", "DEL": "^D"}
+PAIR_GAP = 4  # base px between a paired hotkey's key, label and state
 
 
 def max_skip_sets(n):
@@ -197,7 +214,11 @@ class Editor(SelectionTools):
         self.active = False  # editor mode
         self.stage = None  # "menu" -> "config" -> ("select" ->) "place"; Finish goes back to "menu"
         self.kind = None
-        self.mode = None  # "regular", "custom", "rope", "hook" or "chain"
+        self.mode = None  # "regular", "custom", "freehand", "rope", "hook" or "chain"
+        self.snap = False  # S: snap placed / dragged points to the peg grid, new edges to 15 degree steps
+        self.mirror = False  # M: mirror "Draw points" and freehand shapes across a vertical axis through the first point
+        self.stroke = None  # freehand: the positions recorded while the button is held (world units), else None
+        self._stroke_key, self._stroke_poly = None, None  # cached (stroke length, mirror) -> resampled polygon
         self.relation = "free"  # "free", "inside" or "around" (chosen on the settings panel, reset per kind)
         self.selection = []  # the container (inside) or the objects to enclose (around), picked in the "select" stage
         self._tree_key, self._tree = None, None  # cached containment hierarchy (see _parents)
@@ -212,6 +233,10 @@ class Editor(SelectionTools):
         self.show_compute = True  # F / the card's [f] button: the main loop draws the compute card only while set
         self.compute_card = None  # its rect (real screen px), set by the main loop when drawn: clicks on it are swallowed
         self.gravity_card = None  # the gravity selector's rect (screen px) while shown, set by the main loop: swallowed too
+        # set by the main loop, for the info card's states: debug_overlay.DebugOverlays (keys 1-4) and
+        # timectl.TimeControl ([ / ] speed, N frame step); None leaves those rows without a state
+        self.overlays = None
+        self.time = None
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
         # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
@@ -229,7 +254,86 @@ class Editor(SelectionTools):
         return self.settings[self.kind]
 
     def _complete(self):
+        if self.mode == "freehand":  # the stroke's resampled outline, however many points it has
+            return len(self.points) >= 3
+        if self._mirroring():  # the placed half: the axis point and the points mirrored (see _shape_points)
+            return len(self.points) == self._cfg()["n"] // 2 + 1
         return len(self.points) == self._cfg()["n"]
+
+    # ---------------- Snapping (S) and mirror (M), world units
+    def _mirroring(self):
+        """Is "Draw points" placing a mirrored shape? Then self.points holds only the placed half (see _shape_points)."""
+        return self.mirror and self.mode == "custom" and self.kind in POINT_COUNTS and self._cfg()["n"] >= 3
+
+    def toggle_snap(self):
+        self.snap = not self.snap
+
+    def toggle_mirror(self):
+        """M. Not while a mirrored (or not yet mirrored) "Draw points" shape has points: they'd change meaning."""
+        if self._placing() and self.mode == "custom" and self.points and self.kind in POINT_COUNTS and self._cfg()["n"] >= 3:
+            self._say(MIRROR_LOCKED)
+            return
+        self.mirror = not self.mirror
+
+    def _axis_x(self):
+        """The mirror axis (x, world units): through the first placed point, or None before there is one."""
+        if self.mode == "freehand" and self.stroke:
+            return float(self._stroke_start()[0])
+        return float(self.points[0][0]) if self._mirroring() and self.points else None
+
+    def _stroke_start(self):
+        return freehand.snap_grid(self.stroke[0], EnvConfig.peg_spacing) if self.snap else np.asarray(self.stroke[0], dtype=float)
+
+    def _shape_points(self, half=None):
+        """The polygon's points in outline order. Mirrored "Draw points": half = [axis point, p1, ..., pk] becomes
+        axis, p1 .. pk, mirror(pk) .. mirror(p1) once complete (for an even point count pk is the second axis point and
+        isn't mirrored); while incomplete it's the open chain mirror(pk) .. mirror(p1), axis, p1 .. pk, the edges that
+        will stay. Otherwise the points as placed."""
+        half = self._half_points(half)
+        if not (self._mirroring() and half):
+            return half
+        n, ax = self._cfg()["n"], float(half[0][0])
+        complete = len(half) == n // 2 + 1
+        if complete:
+            back = half[1:-1] if n % 2 == 0 else half[1:]
+            return half + [freehand.mirror_point(p, ax) for p in reversed(back)]
+        return [freehand.mirror_point(p, ax) for p in reversed(half[1:])] + half
+
+    def _half_points(self, half=None):
+        """The placed points (or `half`), with a mirrored shape's second axis point kept on the axis (which moves
+        when the first point is dragged)."""
+        half = list(self.points if half is None else half)
+        n = self._cfg()["n"] if self.kind in POINT_COUNTS else 0
+        if self._mirroring() and n % 2 == 0 and len(half) > n // 2:
+            half[n // 2] = np.array([half[0][0], half[n // 2][1]])
+        return half
+
+    def _final_axis_point(self, i):
+        """Is half point i the second axis point (mirrored "Draw points" with an even point count)?"""
+        n = self._cfg()["n"]
+        return self._mirroring() and n % 2 == 0 and i == n // 2 and i > 0
+
+    def _new_point(self, wp):
+        """Where a "Draw points" click at wp puts the next point: snapped (the first to the peg grid, later ones at
+        15 degree steps and whole peg spacings from the previous point) and, for the second axis point of a mirrored
+        shape, onto the axis."""
+        s, i = EnvConfig.peg_spacing, len(self.points)
+        p = np.asarray(wp, dtype=float)
+        if self.snap:
+            p = freehand.snap_grid(p, s) if i == 0 else freehand.snap_polar(self.points[-1], p, s, SNAP_STEP_DEG)
+        if self._final_axis_point(i):
+            p = np.array([self.points[0][0], freehand.snap_grid(p, s)[1] if self.snap else p[1]])
+        return p
+
+    def _drag_point(self, i, wp):
+        """Where dragging polygon point i to wp puts it: on the peg grid while snapping, kept on the axis if it's
+        the second axis point of a mirrored shape (the first one carries the axis with it)."""
+        p = np.asarray(wp, dtype=float)
+        if self.snap:
+            p = freehand.snap_grid(p, EnvConfig.peg_spacing)
+        if self._final_axis_point(i):
+            p = np.array([self.points[0][0], p[1]])
+        return p
 
     def to_ui(self, screen_pos):
         """Real screen pixels -> UI surface pixels."""
@@ -261,6 +365,11 @@ class Editor(SelectionTools):
             else:
                 self._end_edit()
 
+    def can_frame_step(self):
+        """N steps one physics frame while paused: with the editor closed or on its spawn menu / settings panel, not
+        while picking objects or placing points (those are validated against where the bodies are now)."""
+        return self.paused and not (self.active and self.stage in ("select", "place"))
+
     def open(self):
         self._end_edit()
         self.active, self.stage = True, "menu"
@@ -286,6 +395,7 @@ class Editor(SelectionTools):
     def _reset_object(self):
         self.points, self.snaps, self.undo_stack, self.redo_stack = [], [], [], []
         self.drag_idx = self.drag_from = self.reg_start = None
+        self.stroke = None
 
     def choose_kind(self, kind):
         self.kind, self.stage, self.relation, self.selection = kind, "config", "free", []
@@ -334,10 +444,11 @@ class Editor(SelectionTools):
             self.world.add_chain(Chain(ends[0], ends[1], segments, start, end, box_col=col,
                                        rope_col=self._color(cfg["rope_color"])))
             return
-        pts = np.array(self.points, dtype=float).T
+        pts = np.array(self._shape_points(), dtype=float).T
         style = dict(point_col=col, stick_col=col, fill_col=col)
-        if self.kind == "soft":
-            body = SoftBody(pts, stiffness=cfg["strength"], skip_sets=cfg["sets"], point_radius=3, **style)
+        if self.kind == "soft":  # a freehand outline has its own point count: the sets are clamped to it
+            sets = min(cfg["sets"], max_skip_sets(pts.shape[1]))
+            body = SoftBody(pts, stiffness=cfg["strength"], skip_sets=sets, point_radius=3, **style)
         elif self.kind == "rigid":
             body = RigidBody(pts, point_radius=3, **style)
         else:
@@ -534,15 +645,18 @@ class Editor(SelectionTools):
             if segs_dist(new[:, i], new[:, j], a, b).min() < r:
                 return False  # an edge too close to (or crossing) an existing edge
 
-        # the object itself: points spread out, edges not crossing each other
-        for i in range(k):
-            for j in range(i + 1, k):
-                if np.hypot(*(new[:, i] - new[:, j])) < 2 * r:
-                    return False
-        for x, (i, j) in enumerate(edges):
-            for (m, n) in edges[x + 1:]:
-                if len({i, j, m, n}) == 4 and seg_seg_dist(new[:, i], new[:, j], new[:, m:m + 1], new[:, n:n + 1])[0] == 0.0:
-                    return False
+        # the object itself: points spread out, edges not crossing each other (vectorized: freehand shapes have up to
+        # FREEHAND_MAX points and are validated live while drawing)
+        iu, ju = np.triu_indices(k, 1)
+        if iu.size and np.hypot(*(new[:, iu] - new[:, ju])).min() < 2 * r:
+            return False
+        if len(edges) >= 2:
+            e = np.array(edges).T
+            d = segs_dist(new[:, e[0]], new[:, e[1]], new[:, e[0]], new[:, e[1]])
+            x, y = np.triu_indices(len(edges), 1)
+            apart = (e[0][x] != e[0][y]) & (e[0][x] != e[1][y]) & (e[1][x] != e[0][y]) & (e[1][x] != e[1][y])
+            if (d[x, y][apart] == 0.0).any():
+                return False
 
         if complete and k >= 3:
             if poly_area(new) < r * r:
@@ -715,10 +829,11 @@ class Editor(SelectionTools):
         return np.floor(np.asarray(coords, dtype=float) * self.zoom * self.scale + 1e-6).astype(int)
 
     def peg_layer(self):
-        """The native-res peg overlay (peg_layer.PegLayer) while a hook is being placed, else None. Its dots are at
+        """The native-res peg overlay (peg_layer.PegLayer) while a hook is being placed (or a polygon with snapping
+        on: its points snap to the same grid), else None. Its dots are at
         the very pegs _hook_spot snaps to (_pegs, mapped by peg_screen_px); it's rebuilt only when the screen size,
         zoom, peg spacing or world box changes (layer.version then changes, so the main loop re-uploads it)."""
-        if not (self.active and self.stage == "place" and self.mode == "hook"):
+        if not (self.active and self.stage == "place" and (self.mode == "hook" or (self.snap and self.mode in POLYGON_MODES))):
             return None
         key = (self.screen_w, self.screen_h, self.zoom, self.scale, EnvConfig.peg_spacing, self.inset, self.world_w, self.world_h)
         self.pegs.update(key, lambda: tuple(self.peg_screen_px(c) for c in self._pegs()))
@@ -732,12 +847,19 @@ class Editor(SelectionTools):
             return self._valid_chain(self.points, self.snaps)
         if self.mode == "hook":
             return all(self._valid_hook(p) for p in self.points)
-        return self._valid(self.points, self._complete())
+        return self._valid(self._shape_points(), self._complete())
 
     def _regular_points(self, start, end):
+        """While snapping the centre (a segment's first end) is on the peg grid and the corner the drag points at
+        is at a 15 degree step and a whole number of peg spacings from it."""
         n = self._cfg()["n"]
         start, end = np.asarray(start, dtype=float), np.asarray(end, dtype=float)
         dist = np.hypot(*(end - start))
+        if self.snap:
+            start = freehand.snap_grid(start, EnvConfig.peg_spacing)
+            if dist >= 4:
+                end = freehand.snap_polar(start, end, EnvConfig.peg_spacing, SNAP_STEP_DEG)
+                dist = np.hypot(*(end - start))
         if n == 2:  # a segment: press and release are its endpoints
             if dist < 4:
                 return [start - (20.0, 0.0), start + (20.0, 0.0)]
@@ -749,7 +871,7 @@ class Editor(SelectionTools):
         return list(polygon_points(start[0], start[1], radius, n, angle).T)
 
     def _near_point(self, wp):
-        for i, p in enumerate(self.points):
+        for i, p in enumerate(self._half_points() if self._mirroring() else self.points):
             if np.hypot(*(np.asarray(p) - wp)) <= 6.0:
                 return i
         return None
@@ -780,15 +902,47 @@ class Editor(SelectionTools):
             else:
                 self._say(BAD_SPOT)
         elif self.mode == "custom":
-            candidate = self.points + [wp]
-            if self._valid(candidate, len(candidate) == self._cfg()["n"]):
-                self.points.append(wp)
+            pts, complete, p = self._custom_candidate(wp)
+            if self._valid(pts, complete):
+                self.points.append(p)
                 self.snaps.append(None)
-                self._push(("add", wp, None))
+                self._push(("add", p, None))
             else:
                 self._say(BAD_SPOT)
+        elif self.mode == "freehand":
+            self.stroke, self._stroke_key = [np.asarray(wp, dtype=float)], None
         else:
             self.reg_start = wp
+
+    def _custom_candidate(self, wp):
+        """("Draw points") the shape's points with the next point at wp, whether that completes it, and the point."""
+        p = self._new_point(wp)
+        half = self.points + [p]
+        return self._shape_points(half), len(half) == (self._cfg()["n"] // 2 + 1 if self._mirroring() else self._cfg()["n"]), p
+
+    def _stroke_shape(self):
+        """The resampled polygon of the stroke so far (cached while it doesn't grow), or None if it's too small."""
+        key = (len(self.stroke), self.mirror, self.snap)
+        if key != self._stroke_key:
+            pts = [self._stroke_start()] + self.stroke[1:]
+            if self.mirror:
+                poly = freehand.mirror_stroke_polygon(pts, FREEHAND_SPACING, FREEHAND_MAX)
+            else:
+                poly = freehand.stroke_polygon(pts, FREEHAND_SPACING, FREEHAND_MAX)
+            self._stroke_key, self._stroke_poly = key, (poly, poly is not None and self._valid(poly, True))
+        return self._stroke_poly
+
+    def _end_stroke(self):
+        """Release: the stroke's polygon becomes the shape (Z undoes it, like a regular polygon), if it's valid."""
+        poly, valid = self._stroke_shape()
+        self.stroke = None
+        if poly is None:
+            self._say(TOO_SMALL)
+        elif not valid:
+            self._say(BAD_SHAPE)
+        else:
+            self.points, self.snaps = list(poly), [None] * len(poly)
+            self._push(("poly", list(poly)))
 
     def _place_motion(self, wp):
         if self.drag_idx is not None:
@@ -796,8 +950,12 @@ class Editor(SelectionTools):
                 spot = self._hook_spot(wp)
                 if spot is not None:
                     self.points[self.drag_idx] = spot
+            elif self.mode in POLYGON_MODES:
+                self.points[self.drag_idx] = self._drag_point(self.drag_idx, wp)
             else:
                 self.points[self.drag_idx] = wp
+        elif self.stroke is not None and np.hypot(*(np.asarray(wp) - self.stroke[-1])) >= FREEHAND_STEP:
+            self.stroke.append(np.asarray(wp, dtype=float))
 
     def _place_up(self, wp):
         if self.drag_idx is not None:
@@ -808,16 +966,23 @@ class Editor(SelectionTools):
             elif self.mode == "hook":  # off the box there's no peg: keep wp so validation rejects it
                 spot = self._hook_spot(wp)
                 new, snap = (spot if spot is not None else np.asarray(wp, dtype=float)), None
+            elif self.mode in POLYGON_MODES:
+                new, snap = self._drag_point(i, wp), None
             else:
                 new, snap = wp, None
             self.points[i], self.snaps[i] = new, snap
-            if np.hypot(*((new if self.mode == "hook" else wp) - old)) < 0.5:  # a hook on its own peg didn't move
+            moved = new if self.mode == "hook" or (self.mode in POLYGON_MODES and self.snap) else wp
+            if np.hypot(*(moved - old)) < 0.5:  # a hook on its own peg (or a snapped point on its own spot) didn't move
                 self.points[i], self.snaps[i] = old, old_snap
             elif self._valid_now():
                 self._push(("move", i, old, new, old_snap, snap))
             else:
                 self.points[i], self.snaps[i] = old, old_snap
                 self._say(BAD_SPOT)
+        elif self.stroke is not None:
+            if np.hypot(*(np.asarray(wp) - self.stroke[-1])) > 1e-9:
+                self.stroke.append(np.asarray(wp, dtype=float))
+            self._end_stroke()
         elif self.reg_start is not None:
             pts = self._regular_points(self.reg_start, wp)
             self.reg_start = None
@@ -849,12 +1014,31 @@ class Editor(SelectionTools):
         lines_y = buttons_y + bh + pad
         if self._row_shown():  # Undo / Finish / Redo (or Done) row under the pause / edit / compute buttons
             lines_y += bh + gap
-        rect = HUD.card_rect(self.screen_w, top, lines_y + len(self._hotkeys()) * px(LINE_H) + pad - px(1) - top)
+        rows, line_h = self._card_rows(lines_y)
+        rect = HUD.card_rect(self.screen_w, top, lines_y + len(rows) * line_h + pad - px(1) - top)
         bw = (rect.w - 2 * pad - 2 * gap) // 3
         pause = pygame.Rect(rect.x + pad, buttons_y, bw, bh)
         plus = pygame.Rect(pause.right + gap, buttons_y, bw, bh)
         compute = pygame.Rect(plus.right + gap, buttons_y, rect.right - pad - plus.right - gap, bh)
         return rect, pause, plus, compute, lines_y
+
+    def _card_rows(self, lines_y):
+        """The hotkey rows the info card shows and their line height (screen px), given where the list starts. All of
+        _hotkey_rows() at LINE_H when the card and the compute card under it fit on the screen; on a short screen the
+        rows that can't be used right now (dimmed) are left out, bottom up, and if that's not enough the rest are
+        packed closer, down to MIN_LINE_H."""
+        rows, px = self._hotkey_rows(), HUD.px
+        below = HUD.CARD_GAP + self.compute_card.h if self.show_compute and self.compute_card is not None else 0
+        room = self.screen_h - below - (lines_y + HUD.CARD_PAD - px(1))  # screen px left for the rows
+        line_h = px(LINE_H)
+        for k in reversed(range(len(rows))):
+            if len(rows) * line_h <= room:
+                break
+            if not any(usable for *_, usable in rows[k]):
+                del rows[k]
+        if len(rows) * line_h > room:
+            line_h = max(px(MIN_LINE_H), room // max(len(rows), 1))
+        return rows, line_h
 
     def _placing(self):
         return self.active and self.stage == "place"
@@ -874,6 +1058,9 @@ class Editor(SelectionTools):
     def _hotkeys(self):
         """(key, what it does, current state or None, usable now) for every hotkey, as listed on the info card."""
         placing = self._placing()
+        # speed and frame stepping don't apply while picking objects / placing points (physics is paused and N is
+        # off), so those two rows make room for that stage's button row
+        positioning = self.active and self.stage in ("select", "place")
         v = self.view
         grid = None if v is None else ("on" if v.show_grid else "off")
         look = None if v is None else ("filled" if v.filled else "points")
@@ -890,8 +1077,24 @@ class Editor(SelectionTools):
                 ("Z", "undo", None, placing and bool(self.undo_stack)),
                 ("X", "redo", None, placing and bool(self.redo_stack)),
                 ("ENTER", enter[0], None, enter[1]),
+                ("S", "snap", "on" if self.snap else "off", not placing or self.mode in POLYGON_MODES),
+                ("M", "mirror", "on" if self.mirror else "off",
+                 not placing or self.mode == "freehand" or (self.mode == "custom" and self._cfg()["n"] >= 3)),
                 ("ESC", "back" if self.active or self._esc_cancels() else "quit", None, True)] + (
-                self._edit_hotkeys() if self._editing() else [("drag", "grab bodies", None, not self.paused)])
+                self._edit_hotkeys() if self._editing() else [("drag", "grab bodies", None, not self.paused)]) + [
+                ("1-4", "overlays", None if self.overlays is None else self.overlays.state(), True)] + ([] if positioning else [
+                ("[ ]", "speed", None if self.time is None else self.time.label(), True),
+                ("N", "step", None, self.can_frame_step())])
+
+    def _hotkey_rows(self):
+        """The info card's hotkey rows: one hotkey each, or two (PAIRED_HOTKEYS) side by side."""
+        rows, keys = [], self._hotkeys()
+        i = 0
+        while i < len(keys):
+            pair = i + 1 < len(keys) and PAIRED_HOTKEYS.get(keys[i][0]) == keys[i + 1][0]
+            rows.append(keys[i:i + 2] if pair else keys[i:i + 1])
+            i += 2 if pair else 1
+        return rows
 
     def _menu_layout(self):
         n, cols = len(KIND_TITLES), MENU_COLS
@@ -970,15 +1173,16 @@ class Editor(SelectionTools):
                                 for i, (name, _) in enumerate(self.colors)]
             y += 4 + ((len(self.colors) - 1) // per_row + 1) * (sw + BTN_GAP) - BTN_GAP + ROW_GAP + 2
 
-        bw2 = (CONFIG_W - 3 * PAD) // 2
         full = pygame.Rect(PAD, y, CONFIG_W - 2 * PAD, MODE_H)
         if self.kind in ("rope", "chain"):
             lay["modes"] = [(full, self.kind, f"Place {self.kind}")]
         elif self.kind == "fixed" and cfg["n"] == 2:  # a segment: click its two ends (no regular polygon to size)
             lay["modes"] = [(full, "custom", "Place segment")]
-        else:
-            lay["modes"] = [(pygame.Rect(PAD, y, bw2, MODE_H), "regular", "Regular polygon"),
-                            (pygame.Rect(2 * PAD + bw2, y, bw2, MODE_H), "custom", "Draw points")]
+        else:  # freehand outlines get their points from the stroke (FREEHAND_SPACING), not from "Points"
+            bw3 = (CONFIG_W - 4 * PAD) // 3
+            lay["modes"] = [(pygame.Rect(PAD + i * (bw3 + PAD), y, bw3 if i < 2 else CONFIG_W - 3 * PAD - 2 * (bw3 + PAD), MODE_H), mode, label)
+                            for i, (mode, label) in enumerate((("regular", "Regular polygon"), ("custom", "Draw points"),
+                                                               ("freehand", "Freehand")))]
         px0 = PAD + COL_W + PAD
         lay["preview"] = pygame.Rect(px0, HEADER_H, CONFIG_W - PAD - px0, y - ROW_GAP - HEADER_H)
         relations = self._relations()
@@ -1139,6 +1343,13 @@ class Editor(SelectionTools):
             if event.key == pygame.K_f:
                 self.toggle_compute()
                 return True
+            if not event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META):  # Ctrl/Cmd+S is save
+                if event.key == pygame.K_s:
+                    self.toggle_snap()
+                    return True
+                if event.key == pygame.K_m:
+                    self.toggle_mirror()
+                    return True
             if self._editing():  # selection editing: Delete, Ctrl/Cmd+C / V / D, Q / E, Esc (selection.py)
                 return self._edit_key(event)
             if self.active:
@@ -1216,31 +1427,70 @@ class Editor(SelectionTools):
         if self.stage == "select":
             return
         z = self.zoom
-        n, complete = self._cfg()["n"], self._complete()
-        pts, valid = list(self.points), True
+        complete = self._complete()
+        pts, valid = self._shape_points(), True
         if self.mode in ("rope", "chain"):
             self._draw_rope_preview(surface, ghost_surface, wp, self._over_ui(mouse_ui))
             return
         if self.mode == "hook":
             self._draw_hook_preview(surface, ghost_surface, wp, self._over_ui(mouse_ui))
             return
-        if self._over_ui(mouse_ui) or self.drag_idx is not None or complete:
+        snapped = None  # where a click would put the point / centre while snapping (white ring)
+        over_ui = self._over_ui(mouse_ui)
+        if self.mode == "freehand" and self.stroke is not None:
+            poly, valid = self._stroke_shape()  # the resampled outline, live, under the raw stroke
+            pts = poly or []
+            valid = valid or poly is None
+        elif over_ui or self.drag_idx is not None or complete:
             pass  # no hover ghost while aiming at a button, dragging a point, or once the object is done
         elif self.mode == "custom":
-            pts = pts + [wp]
-            valid = self._valid(pts, len(pts) == n)
+            pts, done, p = self._custom_candidate(wp)
+            valid = self._valid(pts, done)
+            snapped = p if self.snap else None
         elif self.mode == "regular":
-            pts = self._regular_points(self.reg_start if self.reg_start is not None else wp, wp)
+            start = self.reg_start if self.reg_start is not None else wp
+            pts = self._regular_points(start, wp)
             valid = self._valid(pts, True)
+            snapped = freehand.snap_grid(start, EnvConfig.peg_spacing) if self.snap else None
+        elif self.mode == "freehand" and self.snap:
+            snapped = freehand.snap_grid(wp, EnvConfig.peg_spacing)  # where the stroke (and mirror axis) starts
+        self._draw_mirror_axis(surface, snapped if snapped is not None else wp, over_ui)
         ghost = (200, 200, 200) if valid else tuple(self.palette.debug_red)
         if len(pts) >= 3:
             pygame.draw.polygon(ghost_surface, ghost, [tuple(np.asarray(p) * z) for p in pts])
         if len(pts) >= 2:
             pygame.draw.lines(surface, ghost, len(pts) >= 3, [tuple(np.asarray(p) * z) for p in pts], 1)  # opaque outline
+        if self.stroke is not None:
+            if len(self.stroke) >= 2:  # the raw stroke over its outline
+                pygame.draw.lines(surface, self.palette.white, False, [tuple(p * z) for p in self.stroke], 1)
+            for p in pts:
+                pygame.draw.circle(surface, self.palette.greyL, tuple(np.asarray(p) * z), 1)
+        if snapped is not None:
+            pygame.draw.circle(surface, self.palette.white, tuple(np.asarray(snapped) * z), 4, 1)
         hover = self._near_point(wp)
-        for i, p in enumerate(self.points):
+        placed = self._half_points() if self._mirroring() else self.points
+        for i, p in enumerate(placed):
             col = self.palette.white if i in (hover, self.drag_idx) else self.palette.greyL
             pygame.draw.circle(surface, col, tuple(np.asarray(p) * z), 2)
+        if self._mirroring() and placed:  # the mirrored points follow the placed half: hollow, not draggable
+            for p in self._shape_points():
+                if not any(np.hypot(*(np.asarray(p) - q)) < 1e-6 for q in placed):
+                    pygame.draw.circle(surface, self.palette.greyL, tuple(np.asarray(p) * z), 2, 1)
+
+    def _draw_mirror_axis(self, surface, wp, over_ui):
+        """Mirror mode: the vertical axis as a dashed line over the world box, through the first point (or where
+        the first point would go)."""
+        if not (self.mirror and (self._mirroring() or self.mode == "freehand")):
+            return
+        ax = self._axis_x()
+        if ax is None:
+            if over_ui:
+                return
+            ax = float(wp[0])
+        z, x = self.zoom, int(math.floor(ax * self.zoom))
+        top, bottom = int(self.inset * z), int((self.world_h - self.inset) * z)
+        for y in range(top, bottom, 6):
+            pygame.draw.line(surface, self.palette.yellow, (x, y), (x, min(y + 2, bottom)), 1)
 
     def _draw_picks(self, surface, wp, over_ui):
         """Outlines over the bodies' borders: yellow for the picked container / objects, white for the object a click
@@ -1356,21 +1606,43 @@ class Editor(SelectionTools):
         rect on `surface`; the next card goes at rect.bottom + ui_style.HUD.CARD_GAP."""
         ox, oy = origin
         screen_rect, *_, lines_y = self._card_layout()
+        rows, line_h = self._card_rows(lines_y)
         rect, lines_y = screen_rect.move(-ox, -oy), lines_y - oy
         HUD.draw_frame(surface, rect)
-        px, pad, line_h = HUD.px, HUD.CARD_PAD, HUD.px(LINE_H)
+        px, pad = HUD.px, HUD.CARD_PAD
         HUD.text(surface, "Controls", (rect.x + pad, rect.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
         for area, _, spec in self._card_widgets():
             if spec[0] != "blocker":
                 self._draw_widget(surface, area.move(-ox, -oy), spec, area.collidepoint(mouse_px), HUD)
-        for i, (key, label, state, usable) in enumerate(self._hotkeys()):
+        for i, row in enumerate(rows):
             y = lines_y + i * line_h + line_h // 2
+            if len(row) == 2:
+                self._draw_hotkey_pair(surface, rect, row, y)
+                continue
+            key, label, state, usable = row[0]
             dim = ui.TEXT_DIM if not usable else None
             HUD.text(surface, key, (rect.x + pad, y), dim or ui.WHITE, "bold", valign="middle")
             HUD.text(surface, label, (rect.x + pad + px(KEY_COL_W), y), dim or ui.TEXT, valign="middle")
             if state is not None:
                 HUD.text(surface, state, (rect.right - pad, y), dim or ui.ACCENT, "bold", align="right", valign="middle")
         return rect
+
+    @staticmethod
+    def _draw_hotkey_pair(surface, rect, row, y):
+        """Two hotkeys in one card row: the first from the key column's left edge, the second from the card's
+        middle (or right after the first if that's wider), each as key, label, state."""
+        px, pad = HUD.px, HUD.CARD_PAD
+        x = rect.x + pad
+        for n, (key, label, state, usable) in enumerate(row):
+            if n == 1:
+                x = max(x + px(3 * PAIR_GAP), rect.centerx)
+            dim = ui.TEXT_DIM if not usable else None
+            for text, col, style in ((key, ui.WHITE, "bold"), (label, ui.TEXT, "regular"), (state, ui.ACCENT, "bold")):
+                if text is None:
+                    continue
+                HUD.text(surface, text, (x, y), dim or col, style, valign="middle")
+                x += HUD.font(style).size(text)[0] + px(PAIR_GAP)
+            x -= px(PAIR_GAP)
 
     def draw_ui(self, surface, mouse_ui):
         """Panels, buttons and hints (not the info card or the message). Call before the HUD cards."""
@@ -1415,10 +1687,19 @@ class Editor(SelectionTools):
         else:
             first = {"custom": "Click both ends of the segment" if segment else "Click to place points in order",
                      "regular": "Press and drag to size and rotate, or click for the default size",
+                     "freehand": "Press and drag to draw the outline, release to close it",
                      "rope": "Click both ends: on a body point or hook to attach, elsewhere to anchor",
                      "hook": "Click a peg to place the hook (it doesn't collide)"}[self.mode]
         what = {"rope": "an end", "chain": "an end", "hook": "the hook"}.get(self.mode, "a placed point")
-        return [f"{first}  ({len(self.points)}/{n})", f"drag {what} to move it  ·  Z undo  ·  X redo  ·  Enter finish  ·  Esc back"]
+        count = f"{len(self.points)}/{n}"
+        if self.mode == "freehand":
+            if self.mirror:
+                first = "Draw one half from the axis, release to mirror it"
+            count = f"{len(self.points)} points" if self.points else "auto points"
+        elif self._mirroring():
+            first = "Click one half, starting on the axis; it is mirrored"
+            count = f"{len(self.points)}/{n // 2 + 1}"
+        return [f"{first}  ({count})", f"drag {what} to move it  ·  Z undo  ·  X redo  ·  Enter finish  ·  Esc back"]
 
     def _chain_hint(self):
         """What clicking the next chain end does, for its fixed / free setting (the first hint line)."""
