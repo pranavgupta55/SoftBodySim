@@ -1115,7 +1115,7 @@ class Editor:
                 ("KP1-9", "gravity", direction_name(compass=True), True),
                 self._undo_hotkey(),
                 ("ENTER", enter[0], None, enter[1]),
-                ("^S/^O", "save / open", None, not (placing and self.points)),  # Ctrl/Cmd+S, Ctrl/Cmd+O scenes
+                ("^S/^O", "save, open", None, not (placing and self.points)),  # Ctrl/Cmd+S, Ctrl/Cmd+O scenes
                 ("S", "snap", "on" if self.snap else "off", not placing or self.mode in POLYGON_MODES),
                 ("M", "mirror", "on" if self.mirror else "off",
                  not placing or self.mode == "freehand" or (self.mode == "custom" and self._cfg()["n"] >= 3)),
@@ -1139,9 +1139,9 @@ class Editor:
         """Z / X (one card line): while placing they step through the object's points (state "point"); otherwise
         through world changes, only while paused (state: undo / redo steps available, e.g. "3 / 1")."""
         if self._placing():
-            return "Z/X", "undo/redo", "point", bool(self.undo_stack or self.redo_stack)
+            return "Z/X", "undo, redo", "point", bool(self.undo_stack or self.redo_stack)
         nu, nr = len(self.history.undo_stack), len(self.history.redo_stack)
-        return "Z/X", "undo/redo", f"{nu} / {nr}" if nu or nr else "none", self.paused and nu + nr > 0
+        return "Z/X", "undo, redo", f"{nu} / {nr}" if nu or nr else "none", self.paused and nu + nr > 0
 
     def _menu_layout(self):
         n, cols = len(KIND_TITLES), MENU_COLS
