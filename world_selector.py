@@ -1,4 +1,5 @@
-"""A session of several live worlds and the world selector panel (W, or the World button on the Controls card).
+"""A session of several live worlds: the sidebar's Worlds card and the world selector panel (W, [w] on the Controls
+card, or a click on the Worlds card).
 
 The session holds "Custom" (the player's own world: the default demo scene at launch, keeps every edit for the rest of
 the session, never saved to disk, so it starts fresh on every launch) plus one world per scene.PRESETS entry (except
@@ -18,8 +19,12 @@ Looping (World.looping / World.set_looping, looping.py: a side without its wall 
 toggled per world from the panel. Re-adding a wall is deferred by the world while a body is beyond or straddles that
 edge (World.pending_walls); the panel shows such a side in pink until the wall is back.
 
-The panel is drawn on the scaled-down UI surface in the editor's pixel style (ui_style), over a dimmed scene; the sim
-keeps running behind it. Its rects are UI-surface px.
+The Worlds card (the session is a sidebar card provider, see hud_layer.py) shows the active world: its name (a button
+that opens the panel), whether it's running, and its looping sides as L R T B toggles; its compact form drops the
+toggles. The full list (every world with its state, L R T B toggles and Reset) doesn't fit the sidebar on small
+screens, so it's the panel: drawn on the scaled-down UI surface in the editor's pixel style (ui_style), centred in the
+world area over a dimmed scene, while the sim keeps running behind it. Panel rects are UI-surface px, card rects
+native screen px.
 """
 import time
 
@@ -27,7 +32,9 @@ import numpy as np
 import pygame
 
 import ui_style as ui
+from ui_style import HUD
 from entities import EnvConfig
+from editor import BTN_GAP, CARD_BTN_H, CARD_TITLE_H
 
 SIDES = ("left", "right", "top", "bottom")
 SIDE_LABELS = {"left": "L", "right": "R", "top": "T", "bottom": "B"}
@@ -45,6 +52,8 @@ TOGGLE_W = 18
 RESET_W = 46
 COL_GAP = 8
 LINE_H = 13
+# UI attributes the main loop / keys set on the active editor, carried to the next one on a switch
+CARRIED = ("show_compute", "overlays", "time", "_card_pos")
 
 _ENV_DEFAULTS = {name: np.array(getattr(EnvConfig, name), copy=True) for name in GLOBAL_ENV}
 
@@ -106,6 +115,8 @@ class WorldSession:
         self.open = False  # the panel
         self.confirm_until = 0.0  # the Custom Reset's confirmation window
         self._shared = None  # UI preferences shared by every world's editor (see _share_ui)
+        self._cards = None  # the sidebar's card list (bind_cards): the active editor is swapped into it
+        self.card_rect = pygame.Rect(0, 0, 0, 0)  # the Worlds card, native screen px (set by the sidebar, place)
         self._build(self.slots[0])
         self._attach(self.slots[0])
         if start not in (None, "default"):
@@ -152,16 +163,25 @@ class WorldSession:
         else:
             src = self._shared
             editor.settings, editor.pegs = src.settings, src.pegs  # the same objects: one peg texture, one set of settings
-            editor.show_card, editor.show_compute, editor.compute_card = src.show_card, src.show_compute, src.compute_card
+            self._copy_ui(src, editor)
         editor.world_selector = self
+
+    @staticmethod
+    def _copy_ui(src, dst):
+        for name in CARRIED:
+            if hasattr(src, name):
+                setattr(dst, name, getattr(src, name))
 
     def _carry_ui(self, src, dst):
         """Per-frame UI flags the main loop and the F key set on the active editor."""
-        dst.show_card, dst.show_compute, dst.compute_card = src.show_card, src.show_compute, src.compute_card
-        for name in ("gravity_card", "overlays", "time"):  # set by the main loop on the active editor
-            if hasattr(src, name):
-                setattr(dst, name, getattr(src, name))
+        self._copy_ui(src, dst)
         self._shared = dst
+        if self._cards is not None:  # the Controls card is the active editor
+            self._cards[:] = [dst if c is src else c for c in self._cards]
+
+    def bind_cards(self, cards):
+        """The sidebar's card list (HudLayer.cards, holding the active editor as the Controls card): kept in sync."""
+        self._cards = cards
 
     def _detach(self, slot):
         """Leave a world: cancel any placement / spawn menu, pause it, drop the grab, stop profiling it, save its
@@ -298,6 +318,13 @@ class WorldSession:
                 self.toggle()
                 return True
             return False
+        if event.type == pygame.MOUSEBUTTONDOWN and self.card_rect.collidepoint(event.pos):
+            if event.button == 1:
+                for rect, action, _ in self._card_widgets():
+                    if rect.collidepoint(event.pos) and action is not None:
+                        action()
+                        break
+            return True  # the whole card swallows clicks
         if not self.open or event.type != pygame.MOUSEBUTTONDOWN:
             return False
         ed = self.editor
@@ -310,7 +337,7 @@ class WorldSession:
                         break
             return True
         if any(w[0].collidepoint(event.pos) for w in ed._card_widgets()):
-            return False  # the Controls / compute cards keep working (their World button closes the panel)
+            return False  # the sidebar keeps working ([w] closes the panel)
         self.toggle()
         return True
 
@@ -363,3 +390,70 @@ class WorldSession:
             name = name.rstrip(".")[:-1].rstrip() + ".."
         ui.text(surface, name, (rect.x + 5, rect.centery), ui.WHITE, "bold", valign="middle")
         ui.text(surface, state, (rect.right - 5, rect.centery), ui.WHITE if active else ui.TEXT_DIM, align="right", valign="middle")
+
+    # ---------------- The Worlds card (a sidebar card provider, hud_layer.py; native screen px, HUD style)
+    compactable = True
+
+    @staticmethod
+    def card_height(compact=False):
+        """Title, the active world's button, and (not compact) its looping toggles. Independent of the state."""
+        px, pad = HUD.px, HUD.CARD_PAD
+        h = pad + px(CARD_TITLE_H) + px(CARD_BTN_H) + pad - px(1)
+        return h if compact else h + px(BTN_GAP) + px(CARD_BTN_H)
+
+    def place(self, rect):
+        self.card_rect = pygame.Rect(rect)
+
+    def _card_layout(self):
+        """{"name": the active world's button, "toggles": [(side, rect)] (empty when compact)}, native screen px."""
+        r, px, pad = self.card_rect, HUD.px, HUD.CARD_PAD
+        gap, bh = px(BTN_GAP), px(CARD_BTN_H)
+        y = r.y + pad + px(CARD_TITLE_H)
+        lay = {"name": pygame.Rect(r.x + pad, y, r.w - 2 * pad, bh), "toggles": [], "loop_y": None}
+        if r.h >= self.card_height(False):
+            y += bh + gap
+            label_w = HUD.font().size("loop")[0] + px(6)
+            x0 = r.x + pad + label_w
+            tw = (r.right - pad - x0 - 3 * gap) // 4
+            lay["toggles"] = [(side, pygame.Rect(x0 + k * (tw + gap), y, tw if k < 3 else r.right - pad - x0 - 3 * (tw + gap), bh))
+                              for k, side in enumerate(SIDES)]
+            lay["loop_y"] = y + bh // 2
+        return lay
+
+    def _card_widgets(self):
+        lay = self._card_layout()
+        ws = [(lay["name"], self.toggle, ("name",))]
+        lp = looping_of(self.world)
+        ws += [(rect, lambda s=side: self.toggle_looping(self.active, s), ("loop", side, lp[side])) for side, rect in lay["toggles"]]
+        return ws
+
+    def draw_card(self, surface, origin, mouse_px, compact=False):
+        """Title + run state, the active world's name (opens the panel; lit while it's open), its looping toggles."""
+        ox, oy = origin
+        r = self.card_rect.move(-ox, -oy)
+        HUD.draw_frame(surface, r)
+        px, pad = HUD.px, HUD.CARD_PAD
+        HUD.text(surface, "Worlds", (r.x + pad, r.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
+        HUD.text(surface, "paused" if self.editor.paused else "running", (r.right - pad, r.y + pad), ui.ACCENT, "bold",
+                 align="right")
+        lay = self._card_layout()
+        slot = self.slot
+        for rect, _, spec in self._card_widgets():
+            local, hovered = rect.move(-ox, -oy), rect.collidepoint(mouse_px)
+            if spec[0] == "name":
+                HUD.draw_button(surface, local, None, hovered, self.open)
+                room = local.w - 2 * px(5) - HUD.font().size("[w]")[0] - px(4)
+                name = self.name
+                while len(name) > 1 and HUD.font("bold").size(name)[0] > room:
+                    name = name.rstrip(".")[:-1].rstrip() + ".."
+                HUD.text(surface, name, (local.x + px(5), local.centery), ui.WHITE, "bold", valign="middle")
+                HUD.text(surface, "[w]", (local.right - px(5), local.centery), ui.TEXT_DIM if not self.open else ui.WHITE,
+                         align="right", valign="middle")
+            else:
+                _, side, on = spec
+                pending = slot.pending(side)
+                HUD.draw_button(surface, local, None, hovered, on and not pending)
+                col = ui.ACCENT if pending else ui.WHITE if on else ui.TEXT_DIM
+                HUD.text(surface, SIDE_LABELS[side], local.center, col, "bold", align="center", valign="middle")
+        if lay["loop_y"] is not None:
+            HUD.text(surface, "loop", (r.x + pad, lay["loop_y"] - oy), ui.TEXT, valign="middle")

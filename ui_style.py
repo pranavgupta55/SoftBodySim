@@ -1,26 +1,32 @@
-"""Shared look for the UI: HUD cards, editor panels, buttons.
+"""Shared look for the UI: sidebar cards, editor panels, buttons.
 
 One pixel-art style (Endesga colors, solid black borders like the filled shape view, non-antialiased Montserrat text)
 at two resolutions:
 
 - `UI` (scale 1): the scaled-down UI surface (screenUI, real screen / scaleDownFactor), used by the editor's panels,
   hints and messages. The module-level names (CARD_PAD, BORDER, text(), draw_button(), ...) are UI's.
-- `HUD` (scale HUD_SCALE): the two info cards (Controls, Compute), drawn at native screen resolution on their own
-  layer (hud_layer.py). Every metric is UI's times HUD_SCALE, so with HUD_SCALE == scaleDownFactor (2) the cards keep
-  their old on-screen footprint but get sharper text and a finer chart.
+- `HUD`: the cards in the right-hand sidebar (Controls, Compute, Gravity, ...), drawn at native screen resolution on
+  the sidebar layer (hud_layer.py). Every metric is a base (UI-style) length times HUD.scale, rounded to whole px.
+  The sidebar picks that scale for the screen (HudLayer.fit): as large as its width allows (it's SIDEBAR_FRAC of
+  the screen, but at least wide enough for HUD_MIN_SCALE) while all its cards still fit its height.
 """
 import pygame
 
 from fontDict import fonts
 
-# HUD card px per UI-style px. The cards are drawn at native resolution (1 native px per pixel), so 2 = the same
-# on-screen size as UI drawn on the 2x scaled-down UI surface. Fonts, borders and all card metrics scale with it.
-HUD_SCALE = 2
+# Sidebar card scale bounds (native px per base px). Cards are drawn 1 native px per pixel; 1 is the smallest scale
+# that's comfortably legible (11 px text), so the sidebar is at least wide enough for that. Below it (only if the cards
+# can't fit the screen's height otherwise) the scale may drop to HUD_FLOOR_SCALE.
+HUD_MIN_SCALE = 1.0
+HUD_FLOOR_SCALE = 0.75
+HUD_MAX_SCALE = 2.0
+CARD_WIDTH_BASE = 150  # a sidebar card's width at scale 1 (base px), without the margins
 
 # palette (Endesga)
 BLACK = (0, 0, 0)
 CARD_BG = (19, 19, 19)
 PANEL_BG = (32, 36, 46)
+SIDEBAR_BG = (24, 20, 37)  # Endesga's darkest (the sidebar behind the cards)
 TEXT = (199, 207, 221)
 TEXT_DIM = (150, 150, 150)
 ACCENT = (255, 96, 141)  # debug_red
@@ -36,32 +42,28 @@ def button_fill(hovered=False, selected=False, disabled=False):
 
 
 class Style:
-    """Card metrics, fonts and drawing helpers at one scale (px per base px). Cards stack down the top-right corner."""
+    """Card metrics, fonts and drawing helpers at one scale (px per base px; lengths rounded to whole px)."""
 
     def __init__(self, scale):
-        self.scale = s = scale
-        self.CARD_MARGIN = 4 * s  # px from the surface edges
-        self.CARD_GAP = 4 * s  # px between stacked cards
-        self.CARD_WIDTH = 150 * s
-        self.CARD_PAD = 5 * s
-        self.BORDER = 2 * s  # same as the filled shape view's body borders (2 UI px)
-        self.TEXT_SIZE = 11 * s
-        self.TITLE_SIZE = 12 * s
+        self.set_scale(scale)
+
+    def set_scale(self, scale):
+        self.scale = scale
+        px = self.px
+        self.CARD_MARGIN = px(4)  # px from the surface edges
+        self.CARD_GAP = px(4)  # px between stacked cards
+        self.CARD_WIDTH = px(CARD_WIDTH_BASE)
+        self.CARD_PAD = px(5)
+        self.BORDER = px(2)  # same as the filled shape view's body borders (2 UI px)
+        self.TEXT_SIZE = px(11)
+        self.TITLE_SIZE = px(12)
 
     def px(self, v):
-        """A base-px length at this scale."""
-        return v * self.scale
+        """A base-px length at this scale, in whole px (at least 1 for a positive length)."""
+        return max(round(v * self.scale), 1) if v > 0 else round(v * self.scale)
 
     def font(self, style="regular", size=None):
         return fonts[f"{style}{size or self.TEXT_SIZE}"]
-
-    def column_width(self):
-        """Width of the card column including its margins."""
-        return self.CARD_WIDTH + 2 * self.CARD_MARGIN
-
-    def card_rect(self, surface_width, top, height):
-        """A card in the top-right column, starting at `top` (use the previous card's rect.bottom + CARD_GAP)."""
-        return pygame.Rect(surface_width - self.CARD_MARGIN - self.CARD_WIDTH, top, self.CARD_WIDTH, height)
 
     def draw_frame(self, surface, rect, fill=CARD_BG):
         """Solid fill with a solid black border drawn just inside the rect."""
@@ -84,24 +86,26 @@ class Style:
         """A framed button: Endesga fill, black border, a light inner outline on hover, centered bold label."""
         self.draw_frame(surface, rect, button_fill(hovered, selected, disabled))
         if hovered and not disabled:
-            pygame.draw.rect(surface, TEXT, rect.inflate(-2 * self.BORDER, -2 * self.BORDER), self.scale)
+            pygame.draw.rect(surface, TEXT, rect.inflate(-2 * self.BORDER, -2 * self.BORDER), self.px(1))
         if label:
             self.text(surface, label, rect.center, TEXT_DIM if disabled else WHITE, "bold", size, "center", "middle")
 
 
 UI = Style(1)  # the scaled-down UI surface
-HUD = Style(HUD_SCALE)  # the native-resolution info cards
+HUD = Style(HUD_MIN_SCALE)  # the sidebar's native-resolution cards; HudLayer.fit sets its scale for the screen
 
 
-def hud_column(screen_size, ui_scale):
-    """The native-px rect of the HUD card column (full screen height). Its left edge is a multiple of ui_scale, so
-    UI-surface pixels upscaled into it line up exactly with the upscaled UI surface."""
+def sidebar_rect(screen_size, ui_scale, frac):
+    """The native-px rect of the right-hand sidebar (full screen height): `frac` of the screen width, but at least
+    wide enough for a card at HUD_MIN_SCALE. Its left edge is a multiple of ui_scale, so the world area (left of it)
+    is a whole number of UI-surface px and UI pixels upscaled onto the sidebar line up with the UI surface."""
     w, h = screen_size
-    x = (w - HUD.column_width()) // ui_scale * ui_scale
+    min_w = round((CARD_WIDTH_BASE + 2 * 4) * HUD_MIN_SCALE)
+    x = min(w - round(frac * w), w - min_w) // ui_scale * ui_scale
     return pygame.Rect(x, 0, w - x, h)
 
 
 # UI-surface names (the editor's panels and hints)
 CARD_MARGIN, CARD_GAP, CARD_WIDTH, CARD_PAD, BORDER = UI.CARD_MARGIN, UI.CARD_GAP, UI.CARD_WIDTH, UI.CARD_PAD, UI.BORDER
 TEXT_SIZE, TITLE_SIZE = UI.TEXT_SIZE, UI.TITLE_SIZE
-font, card_rect, draw_frame, text, draw_button = UI.font, UI.card_rect, UI.draw_frame, UI.text, UI.draw_button
+font, draw_frame, text, draw_button = UI.font, UI.draw_frame, UI.text, UI.draw_button
