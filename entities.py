@@ -22,6 +22,9 @@ class EnvConfig:
     grab_stiffness = 0.3  # fraction of the gap to the cursor closed per substep
     grab_max_step = 4.0  # px; max pull per substep
     peg_spacing = 5.0  # px; hooks snap to a grid of pegs this far apart, aligned to the world origin
+    # "cpu": all physics in numpy (fastest for small scenes). "gpu": broad phases + PBD solves on the Apple GPU via
+    # MLX, exact CCD still float64 on the CPU (gpu_backend.py); faster from roughly 500+ points. Read in World.add.
+    backend = "cpu"
 
 
 def rect_points(cx, cy, w, h):

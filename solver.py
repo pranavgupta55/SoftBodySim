@@ -9,6 +9,17 @@ from entities import Body, EnvConfig, RigidBody, SoftBody
 _NO_SECTION = nullcontext()  # stands in for profiler sections when no profiler is attached
 
 
+def _make_backend(world):
+    """Helper object for EnvConfig.backend: None runs everything in this file ("cpu"), "gpu" moves the broad
+    phases and the PBD solves to the Apple GPU (gpu_backend.py)."""
+    if EnvConfig.backend == "cpu":
+        return None
+    if EnvConfig.backend == "gpu":
+        from gpu_backend import GpuBackend
+        return GpuBackend(world)
+    raise ValueError(f"unknown EnvConfig.backend {EnvConfig.backend!r}, expected 'cpu' or 'gpu'")
+
+
 class World:
     """Owns all bodies and steps them. Per substep:
 
@@ -27,6 +38,7 @@ class World:
         self.grab_target = np.zeros(2)
         self.zone_count = 0  # how many substeps needed the rigid impact zone fallback (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
+        self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend)
 
     def add(self, body):
         self.bodies.append(body)
@@ -62,6 +74,7 @@ class World:
         self.point_ring = self.body_counts[self.point_body]
         self.edge_local = self.edges - offsets[self.edge_body]
         self._pack_constraints()
+        self.backend = _make_backend(self)
 
     def _pack_constraints(self):
         """Gather the bodies whose constraints World solves in one batch (stock SoftBody springs, RigidBody shape
@@ -155,30 +168,36 @@ class World:
         h = dt / EnvConfig.substeps
         sec = self._section
         for _ in range(EnvConfig.substeps):
-            with sec("predict+grab"):
-                if self.batched_predict:  # Body.predict for every body at once
-                    self.V += EnvConfig.gravity[:, None] * h * (self.W > 0)
-                    self.PREV[:] = self.P
-                    self.P += self.V * h
-                else:
-                    for b in self.bodies:
-                        b.predict(h)
-                self._apply_grab()
-            with sec("contacts"):
-                candidates = self._candidates()
-                reach = None  # (candidates within reach, positions when they were picked), see _solve_contacts
-            for _ in range(EnvConfig.iterations):
-                with sec("constraints"):
-                    self._solve_body_constraints()
-                    for r in self.ropes:
-                        r.solve_constraints()
-                with sec("contacts"):
-                    reach = self._solve_contacts(candidates, reach)
+            if self.backend is None or not self.backend.pbd_substep(h):  # False: the backend can't run this scene
+                self._pbd_substep(h)
             self.V[:] = (self.P - self.PREV) / h
             with sec("ccd"):
                 self._resolve_ccd(h)
             self.P[:] = self.PREV + self.V * h
             self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
+
+    def _pbd_substep(self, h):
+        """Predict, drag, then iterations of body constraints, ropes and soft contacts (moves P, from PREV)."""
+        sec = self._section
+        with sec("predict+grab"):
+            if self.batched_predict:  # Body.predict for every body at once
+                self.V += EnvConfig.gravity[:, None] * h * (self.W > 0)
+                self.PREV[:] = self.P
+                self.P += self.V * h
+            else:
+                for b in self.bodies:
+                    b.predict(h)
+            self._apply_grab()
+        with sec("contacts"):
+            candidates = self._candidates()
+            reach = None  # (candidates within reach, positions when they were picked), see _solve_contacts
+        for _ in range(EnvConfig.iterations):
+            with sec("constraints"):
+                self._solve_body_constraints()
+                for r in self.ropes:
+                    r.solve_constraints()
+            with sec("contacts"):
+                reach = self._solve_contacts(candidates, reach)
 
     def draw(self, surface, filled=False, zoom=1.0):
         """Bodies in the order they were added (later ones on top). filled: solid polygons instead of points + springs.
@@ -386,6 +405,8 @@ class World:
     def _ccd_pairs(self, D, cells=None):
         """(point, edge) pairs whose swept boxes (start -> start + D) share a grid cell. `cells`: _ccd_cells(D)."""
         cells = self._ccd_cells(D) if cells is None else cells
+        if self.backend is not None:
+            return self.backend.ccd_pairs(cells)
         return self._filter_pairs(*self._cell_pairs(*cells), contact=False)
 
     def _ccd_new_pairs(self, old_cells, cells):
