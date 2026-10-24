@@ -1,7 +1,7 @@
 """Gravity selector: a card in the right-hand sidebar (hud_layer.py) with 8 diamond buttons placed radially around a
-centre button. Clicking a diamond (or pressing the numpad key in the same spot) points gravity that way,
-keeping its magnitude; the centre button (numpad 5) turns gravity off, and clicking it again turns it back on in the
-last direction.
+centre button. Clicking a diamond (or pressing the arrow keys: two held together for a diagonal; or the numpad key in
+the same spot) points gravity that way, keeping its magnitude; the centre button (0, or numpad 5) turns gravity off,
+and pressing it again turns it back on in the last direction.
 
 Gravity is EnvConfig.gravity (px/s^2, +y down). Both physics backends read it every substep (solver.World and
 gpu_backend.GpuBackend add EnvConfig.gravity * h to the velocities), so it's changed in place and takes effect on the
@@ -26,7 +26,8 @@ DIRECTIONS = [("up", (0.0, -1.0), pygame.K_KP8, "N"), ("up-right", (_D, -_D), py
               ("right", (1.0, 0.0), pygame.K_KP6, "E"), ("down-right", (_D, _D), pygame.K_KP3, "SE"),
               ("down", (0.0, 1.0), pygame.K_KP2, "S"), ("down-left", (-_D, _D), pygame.K_KP1, "SW"),
               ("left", (-1.0, 0.0), pygame.K_KP4, "W"), ("up-left", (-_D, -_D), pygame.K_KP7, "NW")]
-ZERO_KEY = pygame.K_KP5
+ZERO_KEYS = (pygame.K_0, pygame.K_KP5)
+ARROWS = {pygame.K_UP: (0, -1), pygame.K_DOWN: (0, 1), pygame.K_LEFT: (-1, 0), pygame.K_RIGHT: (1, 0)}
 ZERO_NAME = "off"
 KEY_DIRECTION = {k: i for i, (_, _, k, _) in enumerate(DIRECTIONS)}
 
@@ -58,6 +59,19 @@ def direction_name(g=None, compass=False):
     if i is not None:
         return DIRECTIONS[i][3 if compass else 0]
     return ZERO_NAME if not np.any(g) else "custom"
+
+
+def arrow_direction(key, held=None):
+    """The DIRECTIONS index for arrow `key` plus any other arrows held (pygame.key.get_pressed), e.g. up + left ->
+    up-left. Opposite held arrows cancel; if everything cancels, `key` alone decides."""
+    held = pygame.key.get_pressed() if held is None else held
+    x, y = ARROWS[key]
+    for k, (dx, dy) in ARROWS.items():
+        if k != key and held[k] and (dx, dy) != (-x, -y):
+            x, y = x + dx, y + dy
+    x, y = max(-1, min(1, x)), max(-1, min(1, y))
+    n = math.hypot(x, y)
+    return direction_index((x / n, y / n))
 
 
 class GravityDial:
@@ -144,13 +158,16 @@ class GravityDial:
 
     # ---------------- Events
     def handle_event(self, event):
-        """Numpad keys and left clicks on the card. True if used; clicks anywhere on the card are used (the rest of the
+        """Arrow / numpad / 0 keys and left clicks on the card. True if used; clicks anywhere on the card are used (the rest of the
         sidebar swallows clicks too, see Editor._card_widgets)."""
         if event.type == pygame.KEYDOWN:
             if event.key in KEY_DIRECTION:
                 self.set_direction(KEY_DIRECTION[event.key])
                 return True
-            if event.key == ZERO_KEY:
+            if event.key in ARROWS:
+                self.set_direction(arrow_direction(event.key))
+                return True
+            if event.key in ZERO_KEYS:
                 self.toggle_zero()
                 return True
             return False

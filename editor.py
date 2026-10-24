@@ -1105,7 +1105,7 @@ class Editor(SelectionTools):
         return [("Sim", [("P", "pause", "paused" if self.paused else "running", True),
                          ("[ ]", "speed", None if self.time is None else self.time.label(), True),
                          ("N", "step", None, self.can_frame_step()),
-                         ("KP1-9", "gravity", direction_name(compass=True), True)] + self._world_hotkeys()
+                         ("arrows", "gravity", direction_name(compass=True), True)] + self._world_hotkeys()
                         + ([] if self._editing() else [("drag", "grab bodies", None, not self.paused)])
                         + [("ESC", "back" if self.active or self._esc_cancels() else "quit", None, True)]),
                 ("View", [("G", "grid", grid, True),
