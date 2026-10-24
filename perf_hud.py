@@ -4,7 +4,9 @@ A card in the right-hand sidebar (hud_layer.py: it implements the sidebar's card
 resolution with ui_style.HUD metrics (every length below is in base px, times HUD.scale). F (or the Controls card's
 [f] button) collapses it to a short summary (title and fps, then the frame times), as does the sidebar when its cards
 don't fit otherwise. Timings come from a profiler.Profiler; see
-that module for the timing and GPU-reporting API.
+that module for the timing and GPU-reporting API. Beside the title: the physics backend of the active world (`world`,
+set by the main loop each frame): "CPU" / "GPU", prefixed "auto" when EnvConfig.backend = "auto" picked it (if the
+fps leaves room).
 
 Bar chart: one stacked bar per frame, newest on the right, scrolling left. A bar's height is that frame's time
 between frames, stacked bottom-up as CPU work (physics / draw / other), GPU time and idle wait, so it sums to the
@@ -18,6 +20,7 @@ from collections import deque
 import pygame
 
 import ui_style as ui
+from entities import EnvConfig
 
 H = ui.HUD  # card style at native resolution
 
@@ -47,6 +50,15 @@ def ms(v, unit=True):
     return f"{text} ms" if unit else text
 
 
+def backend_label(world):
+    """The active world's physics backend for the title row: "CPU" / "GPU", "auto CPU" / "auto GPU" when chosen by
+    EnvConfig.backend = "auto" (solver._backend_kind). None without a world."""
+    if world is None:
+        return None
+    kind = "GPU" if world.backend is not None else "CPU"
+    return f"auto {kind}" if world.env.get("backend", EnvConfig.backend) == "auto" else kind
+
+
 def card_height(summary=False):
     """The card's height in native px at the current HUD scale: the full card, or the summary (its first two rows)."""
     px, pad, line = H.px, H.CARD_PAD, H.font().get_linesize()
@@ -63,6 +75,7 @@ class PerfHUD:
         self.prof = profiler
         self.collapsed = False  # shown as the summary by choice (F), whatever the sidebar's fit
         self.rect = None  # where the sidebar placed it (native screen px)
+        self.world = None  # the active world (main loop), for the backend label
         self._text_cache = {}  # (string, color, style, size) -> rendered surface
         self._segs = deque()  # (frame end, segment seconds) for each frame in prof.frames, in the same order
 
@@ -116,8 +129,16 @@ class PerfHUD:
         y = rect.top + pad - px(1)
 
         # title + fps
-        self._text(surface, "Compute", (x0, y), style="bold", size=H.TITLE_SIZE)
-        self._text(surface, f"{st['fps']:.0f} fps", (x1, y), color=ui.ACCENT, style="bold", size=H.TITLE_SIZE, align="right")
+        title = self._text(surface, "Compute", (x0, y), style="bold", size=H.TITLE_SIZE)
+        fps = self._text(surface, f"{st['fps']:.0f} fps", (x1, y), color=ui.ACCENT, style="bold", size=H.TITLE_SIZE, align="right")
+        label = backend_label(self.world)
+        if label:  # small and dim, bottom-aligned with the title; "auto" is dropped when the fps leaves no room
+            font_small = H.font(size=small)
+            room = fps.left - px(3) - (title.right + px(4))
+            label = next((t for t in (label, label.split()[-1]) if font_small.size(t)[0] <= room), None)
+            if label:
+                self._text(surface, label, (title.right + px(4), title.bottom - font_small.get_height()),
+                           color=ui.TEXT_DIM, size=small)
         y += line + px(1)
 
         # time between frames: newest frame, then the window's mean and worst
@@ -137,8 +158,8 @@ class PerfHUD:
             pygame.draw.rect(surface, col, swatch)
             pygame.draw.rect(surface, ui.BLACK, swatch, px(1))
             self._text(surface, label, (x0 + px(9), y))
-            if key == "gpu" and not prof.gpu_seen:
-                self._text(surface, "no GPU backend", (x1, y), color=ui.TEXT_DIM, align="right")
+            if key == "gpu" and (not prof.gpu_seen or (self.world is not None and self.world.backend is None)):
+                self._text(surface, "not in use", (x1, y), color=ui.TEXT_DIM, align="right")
             else:
                 self._text(surface, f"{st[key] / frame * 100:.0f}%", (x1, y), color=ui.TEXT_DIM, align="right")
                 pct_w = H.font().size("100%")[0] + px(4)  # room for "100%" and a gap
