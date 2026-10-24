@@ -5,6 +5,7 @@ import numpy as np
 import pygame
 
 from entities import Body, EnvConfig, RigidBody, SoftBody
+import looping
 
 _NO_SECTION = nullcontext()  # stands in for profiler sections when no profiler is attached
 
@@ -39,6 +40,14 @@ class World:
         self.zone_count = 0  # how many substeps needed the rigid impact zone fallback (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
         self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend)
+        # Looping (looping.py): a body that fully leaves `bounds` through a looping side re-enters through the opposite
+        # one, same other coordinate and velocities. Done between frames, never inside a substep's CCD-checked motion.
+        # Change it with set_looping, which also removes / re-adds that side's wall.
+        self.looping = {side: False for side in looping.SIDES}
+        self.bounds = None  # (x0, y0, x1, y1) world rectangle bodies wrap around; set by looping.add_world_box
+        self.walls = {}  # side -> its world box wall (a FixedBody), whether or not it's in bodies right now
+        self.pending_walls = set()  # sides whose looping was turned off, waiting for room to re-add the wall
+        self.last_wraps = []  # [(body, (dx, dy))] moved by looping in the last step(), e.g. to break motion trails
 
     def add(self, body, index=None):
         """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
@@ -49,6 +58,11 @@ class World:
             self.bodies.insert(index, body)
             self.grabbed = None
         self._rebuild()
+
+    def set_looping(self, side, on):
+        """Looping for one side ("left", "right", "top", "bottom"): on removes that side's wall now; off re-adds it
+        once nothing is beyond its line (pending until then). True if done now. See looping.py."""
+        return looping.set_looping(self, side, on)
 
     def add_rope(self, rope):
         self.ropes.append(rope)
@@ -176,6 +190,8 @@ class World:
         return _NO_SECTION if self.profiler is None else self.profiler.section(name)
 
     def step(self, dt):
+        # before the substeps, where the state is settled and intersection-free
+        self.last_wraps = looping.loop_step(self) if self.pending_walls or any(self.looping.values()) else []
         dt = min(dt, EnvConfig.max_dt)
         h = dt / EnvConfig.substeps
         sec = self._section
