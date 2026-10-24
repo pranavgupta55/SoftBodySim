@@ -80,12 +80,13 @@ def forms_cup(p, q, side, gap=0.0):
 
 
 def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, margin=10.0, top=20.0, size=None,
-                  gap=0.0):
+                  gap=0.0, spacing=0.0):
     """A seeded random `fraction` of the diamonds (corners, rgb, face) in the playfield: at least `margin` in from the
     side walls (at x = side and world_w - side), at least `top` below the top edge (keeps the band where looping
     bodies re-enter clear), and centered above the bottom edge (there's no floor, so one may hang off the bottom).
     A diamond that would form a cup with one already picked (forms_cup; corners up to `gap` apart count as touching)
-    is skipped and the next random one tried.
+    is skipped and the next random one tried, as is one whose center is closer than `spacing` to a picked one's
+    (spreads them out more evenly than a plain random pick).
     `size`: the tiling's edge length (for the cup test; default: from the first diamond). Returns [(corners, rgb)]
     in tiling order."""
     inside = [d for d in diamonds
@@ -95,10 +96,13 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, m
         return []
     size = float(np.hypot(*(inside[0][0][:, 1] - inside[0][0][:, 0]))) if size is None else size
     count = max(1, int(round(fraction * len(inside))))
+    centers = np.array([d[0].mean(axis=1) for d in inside])
     chosen = []
     for k in np.random.default_rng(seed).permutation(len(inside)):
         if len(chosen) == count:
             break
+        if chosen and np.hypot(*(centers[chosen] - centers[k]).T).min() < spacing:
+            continue
         if not any(forms_cup(inside[k][0], inside[m][0], size, gap) for m in chosen):
             chosen.append(int(k))
     return [inside[k][:2] for k in sorted(chosen)]
