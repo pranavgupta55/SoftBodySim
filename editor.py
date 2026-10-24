@@ -21,6 +21,7 @@ import pygame
 import ui_style as ui
 from ui_style import HUD
 from peg_layer import PegLayer
+from gravity_dial import direction_name
 from entities import (Chain, EnvConfig, FixedBody, Hook, RigidBody, Rope, SoftBody, chain_box_points, chain_counts,
                       chain_layout, draw_border, polygon_points)
 
@@ -31,16 +32,21 @@ POINT_COUNTS = {"soft": (3, 4, 5, 6, 7, 8, 12, 20), "rigid": (3, 4, 5, 6, 7, 8, 
 STRENGTH_RANGE = (0.1, 1.0)  # soft body spring strength and rope stiffness
 ROPE_WIDTHS = (1, 2)
 CHAIN_MAX = 50  # chain segments (ropes + boxes)
-# what a chain starts and ends with: rope...box and box...rope are mirror images (click the ends the other way round),
-# so only three combinations are offered
-CHAIN_ENDS = (("rope", "rope", "Rope-rope"), ("rope", "box", "Rope-box"), ("box", "box", "Box-box"))
+# each chain end (1st / 2nd click) is "fixed" or "free". A fixed end is a rope tied to what it's clicked on: a body
+# point or hook it snaps to, else a world anchor pinned at the click. A free end is the chain's last box, left loose at
+# the click (a rope needs something to hold its end; the box is that weight). So the setting also decides what the end
+# piece is (END_PIECE), which is why it replaced the old Rope-rope / Rope-box / Box-box choice. Clicking a free end on a
+# body point or hook still attaches it: its box gets one more rope, tied there (see Editor._chain_spec).
+END_OPTIONS = ("fixed", "free")
+END_PIECE = {"fixed": "rope", "free": "box"}
+END_LABELS = ("1st end", "2nd end")
 CHAIN_MIN_ROPE = 2 * EnvConfig.contact_radius + 2  # world units: shortest rope a placed chain may have between pieces
 SNAP_UI_PX = 5  # a rope end clicked this close (UI px) to a body point or hook attaches to it
 PICK_UI_PX = 4  # an object clicked this close (UI px) to its outline is picked (inside / around selection)
 HOOK_COLOR = "greyL"  # hooks have no settings panel: a 3 px marker in the demo's colour
 PEG_COL = (255, 255, 255)  # peg grid overlay shown while placing a hook (see peg_layer.py), drawn over the scene
-PEG_ALPHA = 150
-PEG_DOT = 1  # peg dot size in native screen px (1 or 3)
+PEG_ALPHA = 120  # (3 px dots every 15 px: lower than the 1 px dots had, so the grid guides without crowding the scene)
+PEG_DOT = 3  # peg dot size in native screen px (odd: a dot centres on the pixel its peg falls in)
 # placement relations: free (top level, like before), inside one container, or around one or more objects. Only
 # colliding kinds have them (ropes and hooks never collide); a chain is open, so it can't go around anything, and
 # neither can a 2-point fixed segment
@@ -68,7 +74,7 @@ CONFIG_W = 400
 LINE_H = 13  # one hotkey / hint line
 CARD_TITLE_H = 16
 CARD_BTN_H = 20
-KEY_COL_W = 42  # hotkey name column on the info card
+KEY_COL_W = 46  # hotkey name column on the info card (room for ENTER / SPACE in bold)
 
 
 def max_skip_sets(n):
@@ -170,7 +176,7 @@ def peg_positions(lo, hi, spacing):
 class Editor:
     def __init__(self, world, palette, ui_size, world_size, scale, inset, zoom=1.0, view=None, screen_size=None):
         """ui_size: the UI surface size (real screen / scale); scale: real screen px per UI px; zoom: UI px per world
-        unit; view: an object with `show_grid` and `filled` (the G / V states listed on the info card); screen_size:
+        unit; view: an object with `show_grid`, `filled` and `trails` (the G / V / T states listed on the info card); screen_size:
         the real screen (window) size the info card is laid out on (default ui_size * scale)."""
         self.world, self.palette, self.scale, self.inset, self.zoom, self.view = world, palette, scale, inset, zoom, view
         self.W, self.H = ui_size
@@ -182,8 +188,9 @@ class Editor:
                          "fixed": {"n": 4, "color": "grey"},
                          "rope": {"n": 2, "stiffness": 1.0, "width": 1, "color": "light_brown"},  # like the demo ropes
                          "hook": {"n": 1},  # one hook per Finish, like the other kinds; no settings panel
-                         # two ends to place; segments = ropes + boxes, odd for rope...rope (see chain_range)
-                         "chain": {"n": 2, "segments": 3, "start": "rope", "end": "rope", "color": "grey",
+                         # two ends to place, each fixed or free (END_OPTIONS); segments = ropes + boxes, odd when
+                         # both ends are alike (see chain_range)
+                         "chain": {"n": 2, "segments": 3, "start": "fixed", "end": "fixed", "color": "grey",
                                    "rope_color": "light_brown"}}
         self.paused = False
         self.active = False  # editor mode
@@ -203,6 +210,7 @@ class Editor:
         self.show_card = True  # the main loop mirrors its HUD toggle (SPACE) here: a hidden card takes no clicks
         self.show_compute = True  # F / the card's [f] button: the main loop draws the compute card only while set
         self.compute_card = None  # its rect (real screen px), set by the main loop when drawn: clicks on it are swallowed
+        self.gravity_card = None  # the gravity selector's rect (screen px) while shown, set by the main loop: swallowed too
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
         # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
@@ -317,7 +325,8 @@ class Editor:
             return
         if self.kind == "chain":  # boxes and ropes laid out between the ends; every rope starts exactly taut
             ends = [snap if snap is not None else tuple(p) for p, snap in zip(self.points, self.snaps)]
-            self.world.add_chain(Chain(ends[0], ends[1], cfg["segments"], cfg["start"], cfg["end"], box_col=col,
+            segments, start, end = self._chain_spec(self.snaps)
+            self.world.add_chain(Chain(ends[0], ends[1], segments, start, end, box_col=col,
                                        rope_col=self._color(cfg["rope_color"])))
             return
         pts = np.array(self.points, dtype=float).T
@@ -586,26 +595,37 @@ class Editor:
         return (self._snap_pos(snap), snap) if snap is not None else (np.asarray(wp, dtype=float), None)
 
     # ---------------- Chains (world units)
-    def _end_kind(self, i):
-        """What end i (0 = start, 1 = end) of the chain being placed is: "rope" or "box"."""
+    def _end_setting(self, i):
+        """The chosen setting of chain end i (0 = 1st click, 1 = 2nd): "fixed" or "free"."""
         return self._cfg()["start" if i == 0 else "end"]
 
+    def _end_piece(self, i, snap=None):
+        """What chain end i is made of: "rope" (fixed, or attached to the body point / hook `snap`) or "box" (a free
+        end left loose)."""
+        return "rope" if snap is not None else END_PIECE[self._end_setting(i)]
+
+    def _chain_spec(self, snaps):
+        """(segments, start piece, end piece) of the chain with these end snaps (ends not placed yet count as
+        unattached). The segment count is the chosen one, plus one rope per free end attached to a body point or
+        hook: that end's box is tied there by an extra rope."""
+        snaps = list(snaps) + [None] * (2 - len(snaps))
+        extra = sum(snap is not None and self._end_setting(i) == "free" for i, snap in enumerate(snaps))
+        return self._cfg()["segments"] + extra, self._end_piece(0, snaps[0]), self._end_piece(1, snaps[1])
+
     def _end_at(self, i, wp):
-        """(position, snap) for end i of a rope or chain at wp: a rope end snaps to a body point or hook, a chain's
-        box end is just placed (its box is centred there)."""
-        if self.mode == "chain" and self._end_kind(i) == "box":
-            return np.asarray(wp, dtype=float), None
+        """(position, snap) for end i of a rope or chain at wp: on a body point or hook it attaches there (fixed or
+        free alike); elsewhere it's placed at wp: a rope's or fixed chain end's anchor, or a free end's box centre."""
         return self._rope_end(wp)
 
-    def _chain_boxes(self, pts):
+    def _chain_boxes(self, pts, snaps):
         """The boxes ((2, 6) each) and the rope length of the chain over the ends so far. With one end placed only a
-        box end has a box (axis-aligned until the other end sets the direction) and the rope length is None."""
-        cfg = self._cfg()
+        free end has a box (axis-aligned until the other end sets the direction) and the rope length is None."""
+        segments, start, end = self._chain_spec(snaps)
         if len(pts) < 2:
-            if pts and self._end_kind(0) == "box":
+            if pts and start == "box":
                 return [chain_box_points(pts[0], (1.0, 0.0), Chain.BOX_SIZE)], None
             return [], None
-        centers, u, rope = chain_layout(pts[0], pts[1], cfg["segments"], cfg["start"], cfg["end"], Chain.BOX_SIZE)
+        centers, u, rope = chain_layout(pts[0], pts[1], segments, start, end, Chain.BOX_SIZE)
         return [chain_box_points(c, u, Chain.BOX_SIZE) for c in centers], rope
 
     def _boxes_clear(self, boxes):
@@ -644,13 +664,13 @@ class Editor:
         box (end boxes too) follows the rigid clearance rules, and once both ends are down the line is long enough
         for every rope to be at least CHAIN_MIN_ROPE. The ropes themselves may cross bodies."""
         for i, (p, snap) in enumerate(zip(pts, snaps)):
-            if self._end_kind(i) == "rope" and not self._valid_rope([p], [snap]):
+            if self._end_piece(i, snap) == "rope" and not self._valid_rope([p], [snap]):
                 return False
         if len(pts) == 2:
             (sa, sb) = snaps
             if sa is not None and sb is not None and self._same_snap(sa, sb):
                 return False
-        boxes, rope = self._chain_boxes(pts)
+        boxes, rope = self._chain_boxes(pts, snaps)
         if rope is not None and rope < CHAIN_MIN_ROPE:
             return False
         return self._boxes_clear(boxes)
@@ -852,13 +872,19 @@ class Editor:
         v = self.view
         grid = None if v is None else ("on" if v.show_grid else "off")
         look = None if v is None else ("filled" if v.filled else "points")
+        trails = None if v is None else ("on" if getattr(v, "trails", False) else "off")
+        picking = self._row_shown() and not placing  # Enter is Done while picking objects to go around
+        enter = ("done", picking and bool(self.selection)) if picking else ("finish", placing and self._complete())
         return [("P", "pause", "paused" if self.paused else "running", True),
                 ("G", "grid", grid, True),
                 ("V", "view", look, True),
+                ("T", "trails", trails, True),
                 ("F", "compute", "shown" if self.show_compute else "hidden", True),
                 ("SPACE", "HUD", "shown", True),
+                ("KP1-9", "gravity", direction_name(compass=True), True),
                 ("Z", "undo", None, placing and bool(self.undo_stack)),
                 ("X", "redo", None, placing and bool(self.redo_stack)),
+                ("ENTER", enter[0], None, enter[1]),
                 ("ESC", "back" if self.active else "quit", None, True),
                 ("drag", "grab bodies", None, not self.paused)]
 
@@ -893,12 +919,16 @@ class Editor:
             y += LABEL_H
             lay["slider"] = pygame.Rect(x0 + 4, y + 4, 150, 6)
             y += 14 + ROW_GAP
-            bw = 64
-            lay["rows"].append(("Ends", (x0, y)))
-            y += LABEL_H
-            lay["ends"] = [(pygame.Rect(x0 + i * (bw + BTN_GAP), y, bw, BTN_H), start, end, label)
-                           for i, (start, end, label) in enumerate(CHAIN_ENDS)]
-            y += BTN_H + ROW_GAP
+            # 1st end [Fixed][Free]   2nd end [Fixed][Free]: two groups side by side in the settings column
+            group_gap = 10
+            bw = (COL_W - group_gap - 2 * BTN_GAP) // 4
+            lay["ends"] = []
+            for i, label in enumerate(END_LABELS):
+                gx = x0 + i * (2 * bw + BTN_GAP + group_gap)
+                lay["rows"].append((label, (gx, y)))
+                lay["ends"] += [(pygame.Rect(gx + j * (bw + BTN_GAP), y + LABEL_H, bw, BTN_H), i, opt)
+                                for j, opt in enumerate(END_OPTIONS)]
+            y += LABEL_H + BTN_H + ROW_GAP
         else:
             counts = POINT_COUNTS[self.kind]
             cols = 4 if len(counts) == 8 else 3
@@ -1009,6 +1039,8 @@ class Editor:
         ws.append((rect, None, ("blocker",)))  # the rest of the card swallows clicks (no grabs / points under it)
         if self.show_compute and self.compute_card is not None:
             ws.append((self.compute_card, None, ("blocker",)))  # and so does the compute card
+        if self.gravity_card is not None:
+            ws.append((self.gravity_card, None, ("blocker",)))  # and the gravity selector (gravity_dial.py)
         return ws
 
     def _panel_widgets(self):
@@ -1029,9 +1061,9 @@ class Editor:
                 ws.append((rect, lambda n=n: self._set_count(n), ("button", str(n), cfg["n"] == n, False)))
             for rect, s in lay.get("sets", []):
                 ws.append((rect, lambda s=s: cfg.__setitem__("sets", s), ("button", str(s), cfg["sets"] == s, False)))
-            for rect, start, end, label in lay.get("ends", []):
-                ws.append((rect, lambda a=start, b=end: self._set_chain_ends(a, b),
-                           ("button", label, (cfg["start"], cfg["end"]) == (start, end), False)))
+            for rect, i, opt in lay.get("ends", []):
+                ws.append((rect, lambda i=i, o=opt: self._set_chain_end(i, o),
+                           ("button", opt.capitalize(), self._end_setting(i) == opt, False)))
             for rect, rel in lay.get("relations", []):
                 ws.append((rect, lambda r=rel: self.set_relation(r), ("button", rel.capitalize(), self.relation == rel, False)))
             for rect, name, key in lay["swatches"]:
@@ -1065,11 +1097,16 @@ class Editor:
         if self.relation not in self._relations():  # e.g. "around" for a 2-point segment
             self.set_relation("free")
 
-    def _set_chain_ends(self, start, end):
-        """Pick what the chain starts and ends with; the segment count moves to the nearest count that fits."""
+    def _chain_pieces(self):
+        """(start piece, end piece) the chosen end settings give: "rope" for fixed, "box" for free."""
         cfg = self._cfg()
-        cfg["start"], cfg["end"] = start, end
-        cfg["segments"] = fit_chain_count(cfg["segments"], start, end)
+        return END_PIECE[cfg["start"]], END_PIECE[cfg["end"]]
+
+    def _set_chain_end(self, i, option):
+        """Make chain end i fixed or free; the segment count moves to the nearest count that fits the ends."""
+        cfg = self._cfg()
+        cfg["start" if i == 0 else "end"] = option
+        cfg["segments"] = fit_chain_count(cfg["segments"], *self._chain_pieces())
 
     def _set_strength(self, x):
         """Slider drag at UI x: strength / stiffness in 0.1 steps, or a chain's segment count in steps of 2."""
@@ -1084,8 +1121,7 @@ class Editor:
     def _slider_spec(self):
         """(settings key, low, high, step) of the settings panel's slider."""
         if self.kind == "chain":
-            cfg = self._cfg()
-            return ("segments",) + chain_range(cfg["start"], cfg["end"]) + (2,)
+            return ("segments",) + chain_range(*self._chain_pieces()) + (2,)
         return ("stiffness" if self.kind == "rope" else "strength",) + STRENGTH_RANGE + (0.1,)
 
     # ---------------- Events (mouse positions arrive in real screen pixels)
@@ -1108,6 +1144,12 @@ class Editor:
                     return True
                 if event.key == pygame.K_x or (cmd and event.key == pygame.K_y):  # X redo (Ctrl/Cmd+Y too)
                     self.redo()
+                    return True
+                if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):  # Enter: the action row's Finish (or Done)
+                    if self.stage == "place":
+                        self.finish()
+                    elif self._row_shown():  # picking objects to go around
+                        self.done_selecting()
                     return True
             return False
 
@@ -1220,31 +1262,49 @@ class Editor:
         valid = self._valid_chain(pts, snaps) if chain else self._valid_rope(pts, snaps)
         ghost = (200, 200, 200) if valid else tuple(pal.debug_red)
         if chain:
-            self._draw_chain_ghost(surface, ghost_surface, pts, ghost)
+            self._draw_chain_ghost(surface, ghost_surface, pts, snaps, ghost)
         elif len(pts) == 2:
             pygame.draw.line(ghost_surface, ghost, tuple(pts[0] * z), tuple(pts[1] * z), max(1, self._cfg()["width"]))
         if target is not None:
             ring = target.radius + 2 if isinstance(target, Hook) else 4
             pygame.draw.circle(surface, pal.white, tuple(self._snap_pos(target) * z), ring, 1)
         hover = self._near_point(wp)
-        for i, (p, snap) in enumerate(zip(self.points, self.snaps)):
-            col = pal.white if i in (hover, self.drag_idx) else pal.greyL
-            if snap is None:  # free anchor: a small square
-                pygame.draw.rect(surface, col, (int(p[0] * z) - 2, int(p[1] * z) - 2, 5, 5))
-            else:
+        if not chain:
+            for i, (p, snap) in enumerate(zip(self.points, self.snaps)):
+                col = pal.white if i in (hover, self.drag_idx) else pal.greyL
+                if snap is None:  # free anchor: a small square
+                    pygame.draw.rect(surface, col, (int(p[0] * z) - 2, int(p[1] * z) - 2, 5, 5))
+                else:
+                    pygame.draw.circle(surface, col, tuple(np.asarray(p) * z), 3, 1)
+            return
+        # chain end markers, so each end shows what it will be: a ring where it attaches to a body point or hook, a
+        # solid square where a fixed end is pinned, the box outline where a free end is left loose. The end the mouse
+        # would place (or is dragging) next gets its marker too, in the ghost colour
+        u = np.array([1.0, 0.0])
+        if len(pts) == 2 and np.hypot(*(np.asarray(pts[1]) - pts[0])) > 1e-9:
+            u = (np.asarray(pts[1], dtype=float) - pts[0]) / np.hypot(*(np.asarray(pts[1]) - pts[0]))
+        for i, (p, snap) in enumerate(zip(pts, snaps)):
+            placed = i < len(self.points) and i != self.drag_idx
+            col = (pal.white if i == hover else pal.greyL) if placed else ghost
+            if snap is not None:
                 pygame.draw.circle(surface, col, tuple(np.asarray(p) * z), 3, 1)
+            elif self._end_piece(i) == "box":
+                corners = chain_box_points(p, u, Chain.BOX_SIZE)[:, [1, 2, 4, 5]] * z
+                pygame.draw.polygon(surface, col, corners.T.tolist(), 1)
+            else:
+                pygame.draw.rect(surface, col, (int(p[0] * z) - 2, int(p[1] * z) - 2, 5, 5))
 
-    def _draw_chain_ghost(self, surface, ghost_surface, pts, ghost):
+    def _draw_chain_ghost(self, surface, ghost_surface, pts, snaps, ghost):
         """The chain over the ends `pts` on the translucent layer: ropes as lines, boxes as filled squares."""
         z = self.zoom
-        boxes, _ = self._chain_boxes(pts)
+        boxes, _ = self._chain_boxes(pts, snaps)
         if len(pts) == 2:
-            cfg = self._cfg()
+            _, start, end = self._chain_spec(snaps)
             # consecutive pairs of joints are the ropes: each runs from the chain's start (or a box's front midpoint)
             # to the next box's back midpoint (or the chain's end); end boxes have no rope on their outer side
             joints = [p for box in boxes for p in (box[:, 0], box[:, 3])]
-            joints = joints[1:] if cfg["start"] == "box" else [pts[0]] + joints
-            joints = joints[:-1] if cfg["end"] == "box" else joints + [pts[1]]
+            joints = joints[1:] if start == "box" else [pts[0]] + joints
+            joints = joints[:-1] if end == "box" else joints + [pts[1]]
             for a, b in zip(joints[0::2], joints[1::2]):
                 pygame.draw.line(ghost_surface, ghost, tuple(np.asarray(a) * z), tuple(np.asarray(b) * z), 1)
         for box in boxes:
@@ -1312,13 +1372,15 @@ class Editor:
             self._draw_widget(surface, area, spec, area.collidepoint(mouse_ui))
 
     def draw_message(self, surface, origin=(0, 0)):
-        """The current message, centered on the UI surface in large bold debug_red. Call last (over the cards; see
-        HudLayer.overlay). origin: the target surface's top-left in UI px."""
+        """The current message in large bold debug_red, centred left of the card column (shrunk to fit there) so it
+        never covers the cards' text. Call last (over everything else; see HudLayer.overlay). origin: the target
+        surface's top-left in UI px."""
         if not (self.message and time.time() < self.message_until):
             return
-        size = next((s for s in range(MESSAGE_SIZE, ui.TEXT_SIZE, -1) if ui.font("bold", s).size(self.message)[0] <= self.W - 16),
+        area = self._area()  # left of the card column (the whole surface while the HUD is hidden): never over card text
+        size = next((s for s in range(MESSAGE_SIZE, ui.TEXT_SIZE, -1) if ui.font("bold", s).size(self.message)[0] <= area.w - 16),
                     ui.TEXT_SIZE)
-        cx, cy = self.W // 2 - origin[0], self.H // 2 - origin[1]
+        cx, cy = area.centerx - origin[0], self.H // 2 - origin[1]
         ui.text(surface, self.message, (cx + 1, cy + 1), ui.BLACK, "bold", size, "center", "middle")
         ui.text(surface, self.message, (cx, cy), tuple(self.palette.debug_red), "bold", size, "center", "middle")
 
@@ -1327,16 +1389,27 @@ class Editor:
             if self.relation == "inside":
                 return ["Click the object to spawn the new one inside", "Esc back"]
             return [f"Click every object the new one goes around  ({len(self.selection)} picked)",
-                    "click again to unpick  ·  then Done  ·  Esc back"]
+                    "click again to unpick  ·  then Done or Enter  ·  Esc back"]
         n = self._cfg()["n"]
         segment = self.kind == "fixed" and n == 2
-        first = {"custom": "Click both ends of the segment" if segment else "Click to place points in order",
-                 "regular": "Press and drag to size and rotate, or click for the default size",
-                 "rope": "Click both ends: on a body point or hook to attach, elsewhere to anchor",
-                 "hook": "Click a peg to place the hook (it doesn't collide)",
-                 "chain": "Click both ends: a rope end attaches to a body point or hook"}[self.mode]
+        if self.mode == "chain":
+            first = self._chain_hint()
+        else:
+            first = {"custom": "Click both ends of the segment" if segment else "Click to place points in order",
+                     "regular": "Press and drag to size and rotate, or click for the default size",
+                     "rope": "Click both ends: on a body point or hook to attach, elsewhere to anchor",
+                     "hook": "Click a peg to place the hook (it doesn't collide)"}[self.mode]
         what = {"rope": "an end", "chain": "an end", "hook": "the hook"}.get(self.mode, "a placed point")
-        return [f"{first}  ({len(self.points)}/{n})", f"drag {what} to move it  ·  Z undo  ·  X redo  ·  Esc back"]
+        return [f"{first}  ({len(self.points)}/{n})", f"drag {what} to move it  ·  Z undo  ·  X redo  ·  Enter finish  ·  Esc back"]
+
+    def _chain_hint(self):
+        """What clicking the next chain end does, for its fixed / free setting (the first hint line)."""
+        if self._complete():
+            return "Both ends placed: Enter or Finish adds the chain"
+        i = len(self.points)
+        if self._end_setting(i) == "fixed":
+            return f"{END_LABELS[i].capitalize()} (fixed): click a body point or hook to attach, elsewhere to pin"
+        return f"{END_LABELS[i].capitalize()} (free): click to leave a loose box, or a point / hook to attach"
 
     def _hint_box(self):
         w = max(ui.font().size(line)[0] for line in self._hint_lines()) + 2 * ui.CARD_PAD
@@ -1422,10 +1495,16 @@ class Editor:
         draw_border(surface, np.array(pts).T, ui.BLACK, ui.BORDER)
 
     def _draw_chain_icon(self, surface, box, segments, start, end, box_col, rope_col, max_box=12, rope_width=1):
-        """A chain hanging in a sag between its two ends inside the rect `box`: ropes as lines, boxes as bordered
-        squares turned along the chain, a rope end as a black anchor block. Pieces shrink to fit long chains."""
+        """A chain inside the rect `box`, posed the way it would settle: hanging in a sag between two fixed (rope)
+        ends, hanging straight down from its one fixed end (the rest lying on the floor if it's long), or lying on
+        the floor with no fixed end. Ropes as lines, boxes as bordered squares turned along the chain, a fixed end as
+        a black anchor block. Pieces shrink to fit long chains."""
+        if start == "box" and end == "rope":  # hang it from the anchor: the same chain read from its other end
+            start, end = end, start
         ropes, boxes = chain_counts(segments, start, end)
         halves = (start == "box") + (end == "box")  # an end box is centred on its end: half of it is past the ends
+        left, right, top, floor = box.x + 8, box.right - 8, box.y + 12, box.bottom - 12
+        ROW = 20  # floor rows of a chain with no fixed end
 
         def arc(span, sag, k=64):  # the sag curve (a parabola) between the ends, sampled; centred in the box
             t = np.linspace(0.0, 1.0, k)
@@ -1434,8 +1513,20 @@ class Editor:
         def length(curve):
             return float(np.hypot(*np.diff(curve, axis=1)).sum())
 
+        def floor_rows(rows):  # lying on the floor, folded back and forth in rows (bottom row first)
+            pts = []
+            for r in range(rows):
+                y = floor - r * ROW
+                pts += [(left + 6, y), (right - 6, y)] if r % 2 == 0 else [(right - 6, y), (left + 6, y)]
+            return np.array(pts, dtype=float).T
+
         span_max, sag_max = box.w - 16, box.h - 24
-        room = length(arc(span_max, sag_max))
+        if start == end == "rope":
+            room = length(arc(span_max, sag_max))
+        elif start == "rope":  # straight down from the anchor, then along the floor
+            room = (floor - top) + (right - left)
+        else:
+            room = length(floor_rows(max(1, (floor - top) // ROW)))
         size, rope = max_box, max_box
         while boxes * size + ropes * rope - halves * size / 2 > room and (rope > 3 or size > 7):
             if rope > 3:
@@ -1443,14 +1534,24 @@ class Editor:
             else:
                 size -= 1
         total = boxes * size + ropes * rope - halves * size / 2
-        rope = min(rope, (room - boxes * size + halves * size / 2) / ropes)
+        if ropes:
+            rope = min(rope, (room - boxes * size + halves * size / 2) / ropes)
         total = min(total, room)
-        span = min(span_max, total * 0.75)
-        lo, hi = 0.0, sag_max  # the sag that makes the curve as long as the chain
-        for _ in range(30):
-            mid = (lo + hi) / 2
-            lo, hi = (mid, hi) if length(arc(span, mid)) < total else (lo, mid)
-        curve = arc(span, lo, 200)
+        if start == end == "rope":
+            span = min(span_max, total * 0.75)
+            lo, hi = 0.0, sag_max  # the sag that makes the curve as long as the chain
+            for _ in range(30):
+                mid = (lo + hi) / 2
+                lo, hi = (mid, hi) if length(arc(span, mid)) < total else (lo, mid)
+            curve = arc(span, lo, 200)
+        elif start == "rope":
+            drop = floor - top
+            x = box.centerx if total <= drop else max(left, min(box.centerx, right - (total - drop)))
+            curve = np.array([[x, x, right], [top, floor, floor]], dtype=float)
+        else:
+            curve = floor_rows(max(1, (floor - top) // ROW))
+            if total <= right - left - 12:  # one row: centred on the floor
+                curve = np.array([[box.centerx - total / 2, box.centerx + total / 2], [floor, floor]])
         dist = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(curve, axis=1)))])
 
         def at(s):
@@ -1539,7 +1640,7 @@ class Editor:
             label = f"{value:.1f}" if step < 1 else f"{value}  ({lo}-{hi})"
             ui.text(surface, label, (track.right + 10, track.centery), ui.WHITE, "bold", valign="middle")
             if self.kind == "chain":
-                ropes, boxes = chain_counts(value, cfg["start"], cfg["end"])
+                ropes, boxes = chain_counts(value, *self._chain_pieces())
                 ui.text(surface, f"{ropes} ropes, {boxes} boxes", (track.x - 4 + COL_W, track.y - 4 - LABEL_H), ui.TEXT_DIM,
                         align="right")  # on the "Segments" label row
 
@@ -1550,7 +1651,7 @@ class Editor:
         if self.kind == "rope":
             self._draw_rope_icon(surface, box.centerx, box.centery, int(r), col, cfg["width"])
         elif self.kind == "chain":
-            self._draw_chain_icon(surface, box.inflate(-8, -8), cfg["segments"], cfg["start"], cfg["end"], col,
+            self._draw_chain_icon(surface, box.inflate(-8, -8), cfg["segments"], *self._chain_pieces(), col,
                                   self._color(cfg["rope_color"]))
         elif n == 2:
             # a segment: a 2px bar framed in black on every side (a thick line's ends were left unbordered)
