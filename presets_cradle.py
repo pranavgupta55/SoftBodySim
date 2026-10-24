@@ -36,13 +36,9 @@ def build_newtons_cradle(world_width, world_height, balls=BALLS, pulled=PULLED, 
         world.add(FixedBody(np.array([corners[k], corners[(k + 1) % 4]]).T, point_col=Endesga.greyD,
                             stick_col=Endesga.greyD, point_radius=1, stick_width=2, fill_col=Endesga.greyD))
 
-    # Centred in the space left of the HUD card column (world units = native px at the default zoom). Sizes follow
-    # the world height; the ropes are shortened if the swing (plus the frame posts) wouldn't fit the width.
-    try:
-        from ui_style import HUD
-        avail = world_width - HUD.column_width()
-    except Exception:  # the cradle doesn't depend on the HUD; without it, use the whole width
-        avail = world_width
+    # Centred in the world. Sizes follow the world height; the ropes are shortened if the swing (plus the frame
+    # posts) wouldn't fit the width.
+    avail = world_width
     radius = min(0.04 * world_height, 0.035 * avail)
     pitch = 2 * radius + r_contact  # centre spacing: neighbours rest exactly at contact distance
     swing = math.sin(math.radians(max(angle, 10.0)))
