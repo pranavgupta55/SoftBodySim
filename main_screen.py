@@ -9,6 +9,7 @@ from scene import Endesga, FireCols, ViewConfig, INSET, build_scene
 from editor import Editor
 from profiler import Profiler
 from perf_hud import PerfHUD
+from hud_layer import HudLayer
 import ui_style
 
 pygame.init()
@@ -50,12 +51,24 @@ world_center = [world_width / 2, world_height / 2]
 world = build_scene(world_width, world_height)
 inset = INSET
 
-# The editor's UI lives on screenUI; it reads the G / V states from ViewConfig for the info card
+# The editor's UI lives on screenUI, except its info card, which is laid out in real screen px; it reads the G / V
+# states from ViewConfig for the info card
 editor = Editor(world, Endesga, (screen_width, screen_height), (world_width, world_height), scaleDownFactor, inset,
-                ViewConfig.zoom, view=ViewConfig)
+                ViewConfig.zoom, view=ViewConfig, screen_size=screen.get_size())
 profiler = Profiler()  # frame timings for the compute card (sections below; World.step times its own phases)
 world.profiler = profiler
 perf_hud = PerfHUD(profiler)
+hud = HudLayer(screen.get_size(), scaleDownFactor)  # the info + compute cards, at native resolution
+
+
+def draw_top(surface, origin=(0, 0)):
+    """What goes over the HUD cards, at UI-surface px minus origin: the editor message and the cursor."""
+    editor.draw_message(surface, origin)
+    if toggle:
+        cx, cy = mx - origin[0], my - origin[1]
+        pygame.draw.circle(surface, Endesga.black, (cx + 1, cy + 1), 2, 1)
+        pygame.draw.circle(surface, Endesga.white, (cx, cy), 2, 1)
+
 
 # ---------------- Main Game Loop
 last_time = time.time()
@@ -119,17 +132,22 @@ while running:
 
     profiler.switch("ui")
     if toggle:
-        info_card = editor.draw_info_card(screenUI, (mx, my))  # first card of the top-right column
-        perf_hud.draw(screenUI, info_card.bottom + ui_style.CARD_GAP)  # compute card underneath
-    editor.draw_message(screenUI)  # over the cards
-    if toggle:
         pygame.mouse.set_visible(False)
-        pygame.draw.circle(screenUI, Endesga.black, (mx + 1, my + 1), 2, 1)
-        pygame.draw.circle(screenUI, Endesga.white, (mx, my), 2, 1)
+    draw_top(screenUI)  # message + cursor
+    hud.begin()  # HUD cards: native resolution, over the upscaled layers
+    if toggle:
+        info_card = editor.draw_info_card(hud.surface, pygame.mouse.get_pos(), hud.rect.topleft)  # top-right column
+        hud.add(info_card)
+        if editor.show_compute:  # F
+            compute_card = perf_hud.draw(hud.surface, info_card.bottom + ui_style.HUD.CARD_GAP)  # compute card underneath
+            hud.add(compute_card)
+            editor.compute_card = compute_card.move(hud.rect.topleft)  # screen px, so it swallows clicks
+        hud.overlay(draw_top)  # message + cursor stay on top of the cards
     profiler.switch("present")
     screen.blit(pygame.transform.scale(screen2, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (shake[0], shake[1]))
     screen.blit(pygame.transform.scale(screenT, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (shake[0], shake[1]))
     screen.blit(pygame.transform.scale(screenUI, (screen_width * scaleDownFactor, screen_height * scaleDownFactor)), (0, 0))
+    hud.blit_to(screen)
     pygame.display.update()
     profiler.switch("idle", device="idle")  # the frame cap's sleep
     clock.tick(fps)

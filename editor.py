@@ -1,9 +1,12 @@
 """In-game editor: pause/play, a spawn menu with per-body settings, and point placement with validation.
 
-All UI (the info card, panels, buttons, hints, messages) is drawn on the scaled-down UI surface in the shared
-ui_style (Endesga colors, solid black 2px borders, non-antialiased text), so it has the same pixel look as the world.
-UI positions are UI-surface pixels: mouse events arrive in real screen pixels and are divided by the scale-down
-factor; world units are UI pixels / zoom. Placement previews are drawn in world space on the game surfaces.
+The panels, buttons, hints and messages are drawn on the scaled-down UI surface in the shared ui_style (Endesga
+colors, solid black 2px borders, non-antialiased text), so they have the same pixel look as the world. Their positions
+are UI-surface pixels: mouse events arrive in real screen pixels and are divided by the scale-down factor; world units
+are UI pixels / zoom. Placement previews are drawn in world space on the game surfaces.
+
+The info card ("Controls") is the exception: it is drawn at native resolution on the HUD layer (hud_layer.py) with
+ui_style.HUD metrics, so its layout and hit-testing are in real screen pixels.
 """
 import math
 import time
@@ -12,6 +15,7 @@ import numpy as np
 import pygame
 
 import ui_style as ui
+from ui_style import HUD
 from entities import EnvConfig, FixedBody, RigidBody, Rope, SoftBody, polygon_points
 
 KIND_TITLES = {"soft": "Soft body", "rigid": "Rigid body", "fixed": "Fixed body", "rope": "Rope"}
@@ -24,7 +28,7 @@ BAD_SPOT = "you cannot spawn a point there"
 INCOMPLETE = "complete the new object to resume the sim"
 MESSAGE_SIZE = 20  # bold, shrunk to fit narrow surfaces
 
-# layout, in UI-surface pixels
+# layout, in UI-surface pixels (the info card uses the CARD_* / LINE_H / BTN_GAP / KEY_COL_W ones times HUD_SCALE)
 PAD = 8  # panel padding
 HEADER_H = 30  # panel title row
 LABEL_H = 14  # a row label above its controls
@@ -87,11 +91,13 @@ def skip_springs(n, sets):
 
 
 class Editor:
-    def __init__(self, world, palette, ui_size, world_size, scale, inset, zoom=1.0, view=None):
+    def __init__(self, world, palette, ui_size, world_size, scale, inset, zoom=1.0, view=None, screen_size=None):
         """ui_size: the UI surface size (real screen / scale); scale: real screen px per UI px; zoom: UI px per world
-        unit; view: an object with `show_grid` and `filled` (the G / V states listed on the info card)."""
+        unit; view: an object with `show_grid` and `filled` (the G / V states listed on the info card); screen_size:
+        the real screen (window) size the info card is laid out on (default ui_size * scale)."""
         self.world, self.palette, self.scale, self.inset, self.zoom, self.view = world, palette, scale, inset, zoom, view
         self.W, self.H = ui_size
+        self.screen_w, self.screen_h = screen_size or (self.W * scale, self.H * scale)
         self.world_w, self.world_h = world_size
         self.colors = [(name, tuple(col)) for name, col in vars(palette).items() if not name.startswith("_") and isinstance(col, list)]
         self.settings = {"soft": {"n": 6, "sets": 1, "strength": 0.1, "color": "network_green"},  # the hexagon
@@ -111,6 +117,8 @@ class Editor:
         self.slider_drag = False
         self.message, self.message_until = None, 0.0
         self.show_card = True  # the main loop mirrors its HUD toggle (SPACE) here: a hidden card takes no clicks
+        self.show_compute = True  # F / the card's [f] button: the main loop draws the compute card only while set
+        self.compute_card = None  # its rect (real screen px), set by the main loop when drawn: clicks on it are swallowed
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
 
@@ -136,6 +144,9 @@ class Editor:
         return np.array(ui_pos, dtype=float) / self.zoom
 
     # ---------------- Mode changes
+    def toggle_compute(self):
+        self.show_compute = not self.show_compute
+
     def toggle_pause(self):
         if self.active:
             if self.stage == "place":
@@ -382,26 +393,32 @@ class Editor:
 
     # ---------------- Layout (UI surface pixels; rebuilt each call, shared by drawing and click handling)
     def _area(self):
-        """The part of the UI surface left of the card column (all of it while the HUD is hidden)."""
-        reserved = ui.CARD_WIDTH + 2 * ui.CARD_MARGIN if self.show_card else 0
-        return pygame.Rect(0, 0, self.W - reserved, self.H)
+        """The part of the UI surface left of the card column (all of it while the HUD is hidden). The column is
+        laid out in real screen px; its left margin's edge is converted to UI px (rounded down)."""
+        if not self.show_card:
+            return pygame.Rect(0, 0, self.W, self.H)
+        column_left = self.screen_w - HUD.column_width()
+        return pygame.Rect(0, 0, min(self.W, column_left // self.scale), self.H)
 
     def _centered(self, w, h):
         area = self._area()
         return pygame.Rect(max(ui.CARD_MARGIN, area.centerx - w // 2), max(ui.CARD_MARGIN, area.centery - h // 2), w, h)
 
     def _card_layout(self):
-        pad = ui.CARD_PAD
-        top = ui.CARD_MARGIN
-        buttons_y = top + pad + CARD_TITLE_H
-        bw = (ui.CARD_WIDTH - 2 * pad - BTN_GAP) // 2
-        lines_y = buttons_y + CARD_BTN_H + pad
-        if self._placing():  # Undo / Finish / Redo row under the pause / edit buttons
-            lines_y += CARD_BTN_H + BTN_GAP
-        rect = ui.card_rect(self.W, top, lines_y + len(self._hotkeys()) * LINE_H + pad - 1 - top)
-        pause = pygame.Rect(rect.x + pad, buttons_y, bw, CARD_BTN_H)
-        plus = pygame.Rect(pause.right + BTN_GAP, buttons_y, bw, CARD_BTN_H)
-        return rect, pause, plus, lines_y
+        """The info card in real screen px (HUD style): (card, [p] button, edit button, [f] button, hotkey list y)."""
+        px, pad = HUD.px, HUD.CARD_PAD
+        gap, bh = px(BTN_GAP), px(CARD_BTN_H)
+        top = HUD.CARD_MARGIN
+        buttons_y = top + pad + px(CARD_TITLE_H)
+        lines_y = buttons_y + bh + pad
+        if self._placing():  # Undo / Finish / Redo row under the pause / edit / compute buttons
+            lines_y += bh + gap
+        rect = HUD.card_rect(self.screen_w, top, lines_y + len(self._hotkeys()) * px(LINE_H) + pad - px(1) - top)
+        bw = (rect.w - 2 * pad - 2 * gap) // 3
+        pause = pygame.Rect(rect.x + pad, buttons_y, bw, bh)
+        plus = pygame.Rect(pause.right + gap, buttons_y, bw, bh)
+        compute = pygame.Rect(plus.right + gap, buttons_y, rect.right - pad - plus.right - gap, bh)
+        return rect, pause, plus, compute, lines_y
 
     def _placing(self):
         return self.active and self.stage == "place"
@@ -415,6 +432,7 @@ class Editor:
         return [("P", "pause", "paused" if self.paused else "running", True),
                 ("G", "grid", grid, True),
                 ("V", "view", look, True),
+                ("F", "compute", "shown" if self.show_compute else "hidden", True),
                 ("SPACE", "HUD", "shown", True),
                 ("Z", "undo", None, placing and bool(self.undo_stack)),
                 ("X", "redo", None, placing and bool(self.redo_stack)),
@@ -500,32 +518,40 @@ class Editor:
         return ws
 
     def _place_buttons(self):
-        """Undo / Finish / Redo: a row in the info card, or under the hint box while the HUD is hidden."""
+        """Undo / Finish / Redo: a row in the info card (real screen px), or under the hint box while the HUD is hidden
+        (UI px)."""
         if self.show_card:
             pause = self._card_layout()[1]
-            x0, y, total = pause.x, pause.bottom + BTN_GAP, ui.CARD_WIDTH - 2 * ui.CARD_PAD
+            gap, bh = HUD.px(BTN_GAP), HUD.px(CARD_BTN_H)
+            x0, y, total = pause.x, pause.bottom + gap, HUD.CARD_WIDTH - 2 * HUD.CARD_PAD
         else:
             box = self._hint_box()
-            total = 3 * 60 + 2 * BTN_GAP
-            x0, y = box.centerx - total // 2, box.bottom + BTN_GAP
-        bw = (total - 2 * BTN_GAP) // 3
-        rects = [pygame.Rect(x0 + i * (bw + BTN_GAP), y, bw if i < 2 else total - 2 * (bw + BTN_GAP), CARD_BTN_H) for i in range(3)]
+            gap, bh = BTN_GAP, CARD_BTN_H
+            total = 3 * 60 + 2 * gap
+            x0, y = box.centerx - total // 2, box.bottom + gap
+        bw = (total - 2 * gap) // 3
+        rects = [pygame.Rect(x0 + i * (bw + gap), y, bw if i < 2 else total - 2 * (bw + gap), bh) for i in range(3)]
         return [(rects[0], self.undo, ("button", "Undo", False, not self.undo_stack)),
                 (rects[1], self.finish, ("button", "Finish", self._complete(), False)),
                 (rects[2], self.redo, ("button", "Redo", False, not self.redo_stack))]
 
     def _card_widgets(self):
+        """(rect, action or None, draw spec) on the info card, in real screen px."""
         if not self.show_card:
             return []
-        rect, pause, plus, _ = self._card_layout()
+        rect, pause, plus, compute, _ = self._card_layout()
         can_edit = self.paused and not self.active
-        ws = [(pause, self.toggle_pause, ("pause",)), (plus, self.open if can_edit else None, ("plus", not can_edit))]
+        ws = [(pause, self.toggle_pause, ("pause",)), (plus, self.open if can_edit else None, ("plus", not can_edit)),
+              (compute, self.toggle_compute, ("compute",))]
         if self._placing():
             ws += self._place_buttons()
-        return ws + [(rect, None, ("blocker",))]  # the rest of the card swallows clicks (no grabs / points under it)
+        ws.append((rect, None, ("blocker",)))  # the rest of the card swallows clicks (no grabs / points under it)
+        if self.show_compute and self.compute_card is not None:
+            ws.append((self.compute_card, None, ("blocker",)))  # and so does the compute card
+        return ws
 
     def _panel_widgets(self):
-        """(rect, action or None, draw spec) for the editor's panels and buttons (not the info card)."""
+        """(rect, action or None, draw spec) for the editor's panels and buttons (not the info card), in UI px."""
         if not self.active:
             return []
         ws = []
@@ -550,12 +576,20 @@ class Editor:
             ws += self._place_buttons()
         return ws
 
-    def _widgets(self):
-        """Everything clickable right now, in hit-test order (the info card first)."""
-        return self._card_widgets() + self._panel_widgets()
+    def _hit(self, screen_pos):
+        """The clickable widget under a real screen position, (rect, action, spec), or None. The info card (screen px)
+        comes first, then the panels (UI px)."""
+        for widget in self._card_widgets():
+            if widget[0].collidepoint(screen_pos):
+                return widget
+        ui_pos = self.to_ui(screen_pos)
+        for widget in self._panel_widgets():
+            if widget[0].collidepoint(ui_pos):
+                return widget
+        return None
 
-    def _over_ui(self, pos):
-        return any(rect.collidepoint(pos) for rect, _, _ in self._widgets())
+    def _over_ui(self, ui_pos):
+        return self._hit((ui_pos[0] * self.scale, ui_pos[1] * self.scale)) is not None
 
     def _set_count(self, n):
         cfg = self._cfg()
@@ -579,6 +613,9 @@ class Editor:
             if event.key == pygame.K_p:
                 self.toggle_pause()
                 return True
+            if event.key == pygame.K_f:
+                self.toggle_compute()
+                return True
             if self.active:
                 cmd = event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)
                 if event.key == pygame.K_ESCAPE:
@@ -599,11 +636,11 @@ class Editor:
         if event.type == pygame.MOUSEBUTTONDOWN:
             if event.button != 1:
                 return self.paused
-            for rect, action, _ in self._widgets():
-                if rect.collidepoint(pos):
-                    if action is not None:
-                        action()
-                    return True
+            hit = self._hit(event.pos)
+            if hit is not None:  # also swallows clicks on the card's body (no grabs / points under it)
+                if hit[1] is not None:
+                    hit[1]()
+                return True
             if self.active and self.stage == "config" and self.kind in ("soft", "rope"):
                 if self._config_layout()["slider"].inflate(12, 14).collidepoint(pos):
                     self.slider_drag = True
@@ -681,23 +718,27 @@ class Editor:
                 pygame.draw.circle(surface, col, tuple(np.asarray(p) * z), 3, 1)
 
     # ---------------- Drawing: UI surface
-    def draw_info_card(self, surface, mouse_ui):
-        """The first card of the top-right column: pause/play and editor buttons plus every hotkey and its state.
-        Returns the card's rect; the next card goes at rect.bottom + ui_style.CARD_GAP."""
-        rect, _, _, lines_y = self._card_layout()
-        ui.draw_frame(surface, rect)
-        pad = ui.CARD_PAD
-        ui.text(surface, "Controls", (rect.x + pad, rect.y + pad - 1), ui.WHITE, "bold", ui.TITLE_SIZE)
+    def draw_info_card(self, surface, mouse_px, origin=(0, 0)):
+        """The first card of the top-right column, at native resolution (ui_style.HUD): pause/play, editor and compute
+        toggle buttons plus every hotkey and its state. mouse_px: the mouse in real screen px; origin: the surface's
+        top-left in real screen px (the HUD layer's rect.topleft, or (0, 0) for the screen itself). Returns the card's
+        rect on `surface`; the next card goes at rect.bottom + ui_style.HUD.CARD_GAP."""
+        ox, oy = origin
+        screen_rect, *_, lines_y = self._card_layout()
+        rect, lines_y = screen_rect.move(-ox, -oy), lines_y - oy
+        HUD.draw_frame(surface, rect)
+        px, pad, line_h = HUD.px, HUD.CARD_PAD, HUD.px(LINE_H)
+        HUD.text(surface, "Controls", (rect.x + pad, rect.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
         for area, _, spec in self._card_widgets():
             if spec[0] != "blocker":
-                self._draw_widget(surface, area, spec, area.collidepoint(mouse_ui))
+                self._draw_widget(surface, area.move(-ox, -oy), spec, area.collidepoint(mouse_px), HUD)
         for i, (key, label, state, usable) in enumerate(self._hotkeys()):
-            y = lines_y + i * LINE_H + LINE_H // 2
+            y = lines_y + i * line_h + line_h // 2
             dim = ui.TEXT_DIM if not usable else None
-            ui.text(surface, key, (rect.x + pad, y), dim or ui.WHITE, "bold", valign="middle")
-            ui.text(surface, label, (rect.x + pad + KEY_COL_W, y), dim or ui.TEXT, valign="middle")
+            HUD.text(surface, key, (rect.x + pad, y), dim or ui.WHITE, "bold", valign="middle")
+            HUD.text(surface, label, (rect.x + pad + px(KEY_COL_W), y), dim or ui.TEXT, valign="middle")
             if state is not None:
-                ui.text(surface, state, (rect.right - pad, y), dim or ui.ACCENT, "bold", align="right", valign="middle")
+                HUD.text(surface, state, (rect.right - pad, y), dim or ui.ACCENT, "bold", align="right", valign="middle")
         return rect
 
     def draw_ui(self, surface, mouse_ui):
@@ -715,13 +756,14 @@ class Editor:
         for area, _, spec in self._panel_widgets():
             self._draw_widget(surface, area, spec, area.collidepoint(mouse_ui))
 
-    def draw_message(self, surface):
-        """The current message, centered on the surface in large bold debug_red. Call last (over the cards)."""
+    def draw_message(self, surface, origin=(0, 0)):
+        """The current message, centered on the UI surface in large bold debug_red. Call last (over the cards; see
+        HudLayer.overlay). origin: the target surface's top-left in UI px."""
         if not (self.message and time.time() < self.message_until):
             return
         size = next((s for s in range(MESSAGE_SIZE, ui.TEXT_SIZE, -1) if ui.font("bold", s).size(self.message)[0] <= self.W - 16),
                     ui.TEXT_SIZE)
-        cx, cy = self.W // 2, self.H // 2
+        cx, cy = self.W // 2 - origin[0], self.H // 2 - origin[1]
         ui.text(surface, self.message, (cx + 1, cy + 1), ui.BLACK, "bold", size, "center", "middle")
         ui.text(surface, self.message, (cx, cy), tuple(self.palette.debug_red), "bold", size, "center", "middle")
 
@@ -745,7 +787,8 @@ class Editor:
             ui.text(surface, line, (box.centerx, box.y + ui.CARD_PAD - 1 + i * LINE_H + LINE_H // 2),
                     ui.TEXT if i == 0 else ui.TEXT_DIM, align="center", valign="middle")
 
-    def _draw_widget(self, surface, area, spec, hovered):
+    def _draw_widget(self, surface, area, spec, hovered, st=ui.UI):
+        """st: the ui_style.Style the widget is drawn in (HUD for the info card's buttons)."""
         kind = spec[0]
         if kind == "swatch":
             name, selected = spec[1], spec[2]
@@ -753,30 +796,48 @@ class Editor:
             if selected or hovered:
                 pygame.draw.rect(surface, ui.WHITE if selected else ui.TEXT_DIM, area.inflate(4, 4), 1)
         elif kind == "button":
-            ui.draw_button(surface, area, spec[1], hovered, spec[2], spec[3])
+            st.draw_button(surface, area, spec[1], hovered, spec[2], spec[3])
         elif kind == "pause":
-            ui.draw_button(surface, area, None, hovered)
-            self._draw_pause_icon(surface, area.x + 16, area.centery)
-            ui.text(surface, "[p]", (area.x + 28, area.centery), ui.WHITE, "bold", valign="middle")
+            self._icon_button(surface, st, area, hovered, self._draw_pause_icon, "[p]")
         elif kind == "plus":
-            disabled = spec[1]
-            ui.draw_button(surface, area, None, hovered, disabled=disabled)
-            col = ui.TEXT_DIM if disabled else ui.WHITE
-            cx, cy = area.x + 16, area.centery
-            pygame.draw.rect(surface, col, (cx - 4, cy - 1, 9, 2))
-            pygame.draw.rect(surface, col, (cx - 1, cy - 4, 2, 9))
-            ui.text(surface, "edit", (area.x + 28, area.centery), col, "bold", valign="middle")
+            self._icon_button(surface, st, area, hovered, self._draw_plus_icon, "edit", disabled=spec[1])
+        elif kind == "compute":  # selected (lit) while the compute card is shown
+            self._icon_button(surface, st, area, hovered, self._draw_chart_icon, "[f]", selected=self.show_compute)
         elif kind == "kind":
             ui.draw_button(surface, area, None, hovered)
             self._draw_kind_icon(surface, spec[1], area)
             ui.text(surface, KIND_TITLES[spec[1]], (area.centerx, area.bottom - 14), ui.WHITE, "bold", align="center", valign="middle")
 
-    def _draw_pause_icon(self, surface, cx, cy):
+    @staticmethod
+    def _icon_button(surface, st, area, hovered, icon, label, disabled=False, selected=False):
+        """A button with an icon (8 base px wide, drawn by icon(surface, st, cx, cy, col)) and a bold label, centered."""
+        st.draw_button(surface, area, None, hovered, selected, disabled)
+        col = ui.TEXT_DIM if disabled else ui.WHITE
+        icon_w, gap = st.px(8), st.px(4)
+        x = area.centerx - (icon_w + gap + st.font("bold").size(label)[0]) // 2
+        icon(surface, st, x + icon_w // 2, area.centery, col)
+        st.text(surface, label, (x + icon_w + gap, area.centery), col, "bold", valign="middle")
+
+    def _draw_pause_icon(self, surface, st, cx, cy, col):
+        px = st.px
         if self.paused:  # paused: show play
-            pygame.draw.polygon(surface, ui.WHITE, [(cx - 3, cy - 5), (cx - 3, cy + 5), (cx + 3, cy)])
+            pygame.draw.polygon(surface, col, [(cx - px(3), cy - px(5)), (cx - px(3), cy + px(5)), (cx + px(3), cy)])
         else:
-            pygame.draw.rect(surface, ui.WHITE, (cx - 4, cy - 4, 3, 9))
-            pygame.draw.rect(surface, ui.WHITE, (cx + 1, cy - 4, 3, 9))
+            pygame.draw.rect(surface, col, (cx - px(4), cy - px(4), px(3), px(9)))
+            pygame.draw.rect(surface, col, (cx + px(1), cy - px(4), px(3), px(9)))
+
+    @staticmethod
+    def _draw_plus_icon(surface, st, cx, cy, col):
+        px = st.px
+        pygame.draw.rect(surface, col, (cx - px(4), cy - px(1), px(9), px(2)))
+        pygame.draw.rect(surface, col, (cx - px(1), cy - px(4), px(2), px(9)))
+
+    @staticmethod
+    def _draw_chart_icon(surface, st, cx, cy, col):
+        """Three bars, like the compute card's chart."""
+        px = st.px
+        for i, h in enumerate((5, 9, 7)):
+            pygame.draw.rect(surface, col, (cx - px(4) + i * px(3), cy + px(5) - px(h), px(2), px(h)))
 
     @staticmethod
     def _shape(surface, fill, pts, springs=()):
