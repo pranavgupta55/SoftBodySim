@@ -18,8 +18,9 @@ through that side keeps working meanwhile so whatever is out there can come back
 No-intersection guarantee: World.step calls loop_step once per frame, before the substeps, so a wrap is never part
 of a substep's straight-line motion that CCD checks. A body is only moved into a spot with no edge crossings, no
 containment and every point at least clearance() from other bodies' edges (and theirs from its edges). If the spot
-is taken, up to STACK further spots (one body size + clearance apart, away from the screen, or further inside when
-placing inside a wall) are tried; if all are taken the body is left where it is and retried next frame.
+is taken, further spots (half a body size + clearance apart, away from the screen, or further inside when placing
+inside a wall, up to half the band's length) are tried in order; if all are taken the body is left where it is and
+retried next frame.
 
 Ropes / chains: bodies tied together by ropes form a group that wraps together by one offset (rope lengths
 unchanged), once the whole group is past the edge. A group with any fixed end (rope to a Hook, (x, y) anchor or
@@ -31,7 +32,8 @@ from entities import EnvConfig, FixedBody
 
 SIDES = ("left", "right", "top", "bottom")
 OPPOSITE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
-STACK = 4  # destination spots tried per wrap
+REACH = 0.5  # destination spots are searched up to this fraction of the band's length past the first one
+MAX_SPOTS = 64
 
 
 def clearance():
@@ -220,9 +222,31 @@ def spot_free(world, members, shift, gap=None):
         if k in member_set:
             continue
         other = world.bodies[k]
+        if _parallel_wall_ok(other, members, world, d):
+            continue
         if not all(bodies_clear(m, other.points, gap) for m in moved):
             return False
     return True
+
+
+def _parallel_wall_ok(wall, members, world, d):
+    """A wall along the wrap direction (e.g. a side wall for a vertical wrap): a body sliding past it in contact
+    is closer than the clearance and always would be, so instead of the gap rule check that every point of the group
+    is on the box side of the wall's line (strictly, more than ccd_gap): a move parallel to the line keeps each
+    point's distance to it, and the wall spans the whole loop band, so the moved group stays clear of it too."""
+    side = getattr(wall, "wall_side", None)
+    if side is None or world.walls.get(side) is not wall:
+        return False
+    axis, c = _wall_line(wall)
+    if d[axis] != 0:
+        return False  # not a parallel move
+    coords = np.concatenate([world.bodies[k].points[axis] for k in members])
+    lo_end, hi_end = wall.points[1 - axis].min(), wall.points[1 - axis].max()
+    span = np.concatenate([world.bodies[k].points[1 - axis] for k in members]) + d[1 - axis]
+    if span.min() < lo_end or span.max() > hi_end:
+        return False  # the destination runs past the wall's end: use the general check
+    gap = EnvConfig.ccd_gap
+    return bool(np.all(coords > c + gap)) if side in ("left", "top") else bool(np.all(coords < c - gap))
 
 
 def _exit_side(lo, hi, vel, bounds, active):
@@ -243,7 +267,7 @@ def _exit_side(lo, hi, vel, bounds, active):
 def _spots(world, entry, lo, hi, gap):
     """Candidate translations along the entry side's axis that put the box lo..hi just past the `entry` side:
     outside the screen edge when that side has no wall, else just inside its wall; then further from the screen
-    (or deeper inside) one box size + gap at a time."""
+    (or deeper inside) half a box size + gap at a time, up to REACH of the band's length."""
     axis = 0 if entry in ("left", "right") else 1
     size = hi[axis] - lo[axis] + gap
     wall = world.walls.get(entry)
@@ -257,8 +281,10 @@ def _spots(world, entry, lo, hi, gap):
         edge = world.bounds[axis] if near_side else world.bounds[axis + 2]
         base = (edge - hi[axis]) if near_side else (edge - lo[axis])
         step = -size if near_side else size  # further off screen
+    step /= 2  # half a body apart, so gaps in a stream of bodies are found
+    reach = REACH * (world.bounds[axis + 2] - world.bounds[axis])
     out = []
-    for k in range(STACK):
+    for k in range(int(min(MAX_SPOTS, reach // abs(step) + 1))):
         d = np.zeros(2)
         d[axis] = base + k * step
         out.append(d)
