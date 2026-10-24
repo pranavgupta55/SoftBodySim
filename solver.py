@@ -4,7 +4,7 @@ from contextlib import nullcontext
 import numpy as np
 import pygame
 
-from entities import EnvConfig
+from entities import Body, EnvConfig, RigidBody, SoftBody
 
 _NO_SECTION = nullcontext()  # stands in for profiler sections when no profiler is attached
 
@@ -57,6 +57,67 @@ class World:
         self.body_fixed = np.array([b.fixed for b in bodies])
         self.body_self = np.array([b.self_collide for b in bodies])
         self.body_counts = np.array(counts)
+        # per point / per edge lookups for the broad phase filters (index within the body, body size, endpoints)
+        self.point_local = np.arange(self.P.shape[1]) - offsets[self.point_body]
+        self.point_ring = self.body_counts[self.point_body]
+        self.edge_local = self.edges - offsets[self.edge_body]
+        self._pack_constraints()
+
+    def _pack_constraints(self):
+        """Gather the bodies whose constraints World solves in one batch (stock SoftBody springs, RigidBody shape
+        matching, Body.predict). Bodies whose class overrides those methods keep getting called one by one.
+        The batches copy stiffness / rest shapes when a body is added, so change those before World.add."""
+        bodies, offsets, n_pts = self.bodies, self.offsets, self.P.shape[1]
+        self.batched_predict = all(type(b).predict is Body.predict for b in bodies)
+        soft = [k for k, b in enumerate(bodies) if type(b).solve_constraints is SoftBody.solve_constraints]
+        rigid = [k for k, b in enumerate(bodies) if type(b).solve_constraints is RigidBody.solve_constraints]
+        batched = set(soft) | set(rigid)
+        self.solo_bodies = [b for k, b in enumerate(bodies) if k not in batched
+                            and type(b).solve_constraints is not Body.solve_constraints]
+
+        # all springs as one Jacobi pass; the averaging count is 1 for points without springs (they get + 0)
+        springs = [bodies[k].springs + offsets[k] for k in soft]
+        self.springs = np.concatenate(springs, axis=1) if springs else np.empty((2, 0), dtype=int)
+        self.spring_rest = np.concatenate([bodies[k].rest_len for k in soft]) if soft else np.empty(0)
+        self.spring_stiffness = np.concatenate([np.full(bodies[k].springs.shape[1], float(bodies[k].stiffness))
+                                                for k in soft]) if soft else np.empty(0)
+        self.spring_count = np.ones(n_pts)
+        for k in soft:
+            self.spring_count[offsets[k]:offsets[k + 1]] = bodies[k].spring_count
+
+        # rigid bodies grouped by point count, so each group is a (bodies, points) block
+        groups = defaultdict(list)
+        for k in rigid:
+            groups[self.body_counts[k]].append(k)
+        self.rigid_groups = [(np.array([np.arange(offsets[k], offsets[k + 1]) for k in ks]),  # (B, n) point ids
+                              np.array([bodies[k].rest for k in ks]),  # (B, 2, n)
+                              np.array([float(bodies[k].stiffness) for k in ks]))
+                             for ks in groups.values()]
+
+    def _solve_body_constraints(self):
+        """Every body's own constraints, as if each body's solve_constraints ran (bodies don't share points)."""
+        P, W = self.P, self.W
+        if self.springs.shape[1]:  # SoftBody.solve_constraints for all soft bodies at once
+            i, j = self.springs
+            d = P[:, j] - P[:, i]
+            dist = np.maximum(np.hypot(d[0], d[1]), 1e-9)
+            wi, wj = W[i], W[j]
+            corr = self.spring_stiffness * (dist - self.spring_rest) / (dist * (wi + wj)) * d
+            ij = np.concatenate([i, j])
+            for k in range(2):  # bincount adds in input order: i's shares then j's, like the per-body np.add.at
+                acc = np.bincount(ij, np.concatenate([wi * corr[k], -wj * corr[k]]), minlength=P.shape[1])
+                P[k] += acc / self.spring_count
+        for idx, rest, stiffness in self.rigid_groups:  # RigidBody.solve_constraints, one group of same-size bodies
+            pts = P[:, idx]  # (2, B, n)
+            com = pts.mean(axis=2, keepdims=True)
+            a = np.matmul((pts - com).transpose(1, 0, 2), rest.transpose(0, 2, 1))  # (B, 2, 2) covariances
+            theta = np.arctan2(a[:, 1, 0] - a[:, 0, 1], a[:, 0, 0] + a[:, 1, 1])
+            c, s = np.cos(theta), np.sin(theta)
+            rot = np.array([[c, -s], [s, c]]).transpose(2, 0, 1)  # (B, 2, 2)
+            goal = np.matmul(rot, rest).transpose(1, 0, 2) + com
+            P[:, idx] += stiffness[:, None] * (goal - pts)
+        for b in self.solo_bodies:
+            b.solve_constraints()
 
     # ---------------- Mouse dragging
     def grab(self, pos):
@@ -95,19 +156,24 @@ class World:
         sec = self._section
         for _ in range(EnvConfig.substeps):
             with sec("predict+grab"):
-                for b in self.bodies:
-                    b.predict(h)
+                if self.batched_predict:  # Body.predict for every body at once
+                    self.V += EnvConfig.gravity[:, None] * h * (self.W > 0)
+                    self.PREV[:] = self.P
+                    self.P += self.V * h
+                else:
+                    for b in self.bodies:
+                        b.predict(h)
                 self._apply_grab()
             with sec("contacts"):
-                pts, edge_ids = self._candidates()
+                candidates = self._candidates()
+                reach = None  # (candidates within reach, positions when they were picked), see _solve_contacts
             for _ in range(EnvConfig.iterations):
                 with sec("constraints"):
-                    for b in self.bodies:
-                        b.solve_constraints()
+                    self._solve_body_constraints()
                     for r in self.ropes:
                         r.solve_constraints()
                 with sec("contacts"):
-                    self._solve_contacts(pts, edge_ids)
+                    reach = self._solve_contacts(candidates, reach)
             self.V[:] = (self.P - self.PREV) / h
             with sec("ccd"):
                 self._resolve_ccd(h)
@@ -165,52 +231,85 @@ class World:
             y = int(np.floor(j * cell_px))
             pygame.draw.line(surface, line_col, (0, y), (w - 1, y))
 
-    # ---------------- Broad phase: spatial hash grid
-    def _edge_grid(self, pad):
-        """Spatial hash: cell -> ids of edges whose AABB (grown by pad) touches that cell."""
-        cell = EnvConfig.cell_size
-        a, b = self.P[:, self.edges[0]], self.P[:, self.edges[1]]
-        lo = np.floor((np.minimum(a, b) - pad) / cell).astype(int)
-        hi = np.floor((np.maximum(a, b) + pad) / cell).astype(int)
-        grid = defaultdict(list)
-        for e in range(self.edges.shape[1]):
-            for cx in range(lo[0, e], hi[0, e] + 1):
-                for cy in range(lo[1, e], hi[1, e] + 1):
-                    grid[(cx, cy)].append(e)
-        return grid
+    # ---------------- Broad phase: spatial hash grid (vectorized: cells are sorted keys instead of a dict)
+    @staticmethod
+    def _cells(lo, hi, origin, rows):
+        """Every grid cell of the cell-index boxes lo..hi (inclusive, shape (2, m)): (box id, cell key) per cell.
+        Keys number the cells column by column from `origin`, `rows` cells per column."""
+        span = hi - lo + 1
+        counts = span[0] * span[1]
+        owner = np.repeat(np.arange(counts.size), counts)
+        k = np.arange(owner.size) - np.repeat(np.cumsum(counts) - counts, counts)  # cell number within its box
+        cx = lo[0, owner] + k % span[0, owner]
+        cy = lo[1, owner] + k // span[0, owner]
+        return owner, (cx - origin[0]) * rows + (cy - origin[1])
+
+    def _cell_pairs(self, pt_lo, pt_hi, edge_lo, edge_hi):
+        """(point, edge) pairs whose cell boxes share at least one cell, sorted by (point, edge), no duplicates."""
+        if pt_lo.shape[1] == 0 or edge_lo.shape[1] == 0:
+            return np.empty(0, dtype=int), np.empty(0, dtype=int)
+        origin = np.minimum(pt_lo.min(axis=1), edge_lo.min(axis=1))
+        rows = max(pt_hi[1].max(), edge_hi[1].max()) - origin[1] + 1
+        pt_owner, pt_keys = self._cells(pt_lo, pt_hi, origin, rows)
+        edge_owner, edge_keys = self._cells(edge_lo, edge_hi, origin, rows)
+        n_edges = edge_lo.shape[1]
+        # edge cells sorted by (cell, edge id): one sort of a combined key is faster than a stable argsort
+        edge_keys, edge_owner = np.divmod(np.sort(edge_keys * n_edges + edge_owner), n_edges)
+        start = np.searchsorted(edge_keys, pt_keys, "left")
+        hits = np.searchsorted(edge_keys, pt_keys, "right") - start  # edges sharing each point cell
+        first = np.repeat(start - (np.cumsum(hits) - hits), hits)
+        i, e = np.repeat(pt_owner, hits), edge_owner[first + np.arange(first.size)]
+        if pt_owner.size == pt_lo.shape[1]:
+            return i, e  # one cell per point: already in (point, edge) order, and a pair can't repeat
+        # a pair sharing several cells shows up once per cell: sort and dedupe
+        code = np.sort(i * n_edges + e)
+        code = code[np.r_[True, code[1:] != code[:-1]]]
+        return np.divmod(code, n_edges)
+
+    def _filter_pairs(self, i, e, contact):
+        """Drop pairs that can't or needn't collide. Different bodies always pair unless both are fixed. Same body
+        only if it self-collides, and not the point's own edges; for contacts (contact=True) also not its
+        neighbors' edges, which are always close."""
+        pb, eb = self.point_body[i], self.edge_body[e]
+        keep = (pb != eb) & ~(self.body_fixed[pb] & self.body_fixed[eb])
+        s = np.flatnonzero((pb == eb) & self.body_self[pb])  # self-collision candidates (usually few)
+        si, se = i[s], e[s]
+        if contact:
+            li, n = self.point_local[si], self.point_ring[si]
+            va, vb = self.edge_local[0, se], self.edge_local[1, se]
+            gap_a = np.minimum((li - va) % n, (va - li) % n)
+            gap_b = np.minimum((li - vb) % n, (vb - li) % n)
+            keep[s] = (gap_a > 1) & (gap_b > 1)
+        else:
+            keep[s] = (si != self.edges[0, se]) & (si != self.edges[1, se])
+        return i[keep], e[keep]
 
     def _candidates(self):
         """(point, edge) pairs that share a grid cell. Edges are registered in every cell their padded AABB touches."""
-        cell = EnvConfig.cell_size
-        grid = self._edge_grid(2 * EnvConfig.contact_radius)
-
-        point_cells = np.floor(self.P / cell).astype(int)
-        pairs = set()
-        for i in range(self.P.shape[1]):
-            for e in grid.get((point_cells[0, i], point_cells[1, i]), ()):
-                pb, eb = self.point_body[i], self.edge_body[e]
-                if pb != eb:
-                    if not (self.body_fixed[pb] and self.body_fixed[eb]):  # no static-vs-static
-                        pairs.add((i, e))
-                elif self.body_self[pb]:
-                    # self-collision: skip edges touching the point or its immediate neighbors (they're always close)
-                    n, base = self.body_counts[pb], self.offsets[pb]
-                    li = i - base  # point index within its body
-                    ring_gap = lambda v: min((li - v) % n, (v - li) % n)
-                    if ring_gap(self.edges[0, e] - base) > 1 and ring_gap(self.edges[1, e] - base) > 1:
-                        pairs.add((i, e))
-        if not pairs:
-            return np.empty(0, dtype=int), np.empty(0, dtype=int)
-        pts, edge_ids = np.array(sorted(pairs)).T
-        return pts, edge_ids
+        cell, pad = EnvConfig.cell_size, 2 * EnvConfig.contact_radius
+        a, b = self.P[:, self.edges[0]], self.P[:, self.edges[1]]
+        lo = np.floor((np.minimum(a, b) - pad) / cell).astype(np.int64)
+        hi = np.floor((np.maximum(a, b) + pad) / cell).astype(np.int64)
+        point_cells = np.floor(self.P / cell).astype(np.int64)
+        return self._filter_pairs(*self._cell_pairs(point_cells, point_cells, lo, hi), contact=True)
 
     # ---------------- Narrow phase + resolution: point vs edge capsule
-    def _solve_contacts(self, pts, edge_ids):
-        if pts.size == 0:
-            return
+    def _solve_contacts(self, candidates, reach=None):
+        """One Jacobi pass over the (pts, edge_ids) candidates. Returns a `reach` to pass to the next pass of the
+        same substep: the candidates within contact_radius + slack, and P when they were picked. A point's distance
+        to a segment changes by at most its own motion plus the farther endpoint's, so while no point has moved
+        slack / 2 since then, the other candidates are out of range and are skipped (same result, less work)."""
         r, mu = EnvConfig.contact_radius, EnvConfig.friction
-        ia, ib = self.edges[0, edge_ids], self.edges[1, edge_ids]
         P, PREV, W = self.P, self.PREV, self.W
+        slack = r
+        if reach is not None and np.hypot(*(P - reach[2])).max() < 0.5 * slack - 1e-6:
+            pts, edge_ids = reach[0], reach[1]
+        else:
+            pts, edge_ids = candidates
+            reach = None
+        if pts.size == 0:
+            return reach
+        ia, ib = self.edges[0, edge_ids], self.edges[1, edge_ids]
 
         p, a, b = P[:, pts], P[:, ia], P[:, ib]
         e = b - a
@@ -219,6 +318,16 @@ class World:
         c = a + t * e
         d = p - c
         dist = np.hypot(d[0], d[1])
+        if reach is None:
+            keep = dist < r + slack
+            reach = (pts[keep], edge_ids[keep], P.copy())
+
+        # most candidates are out of range: keep only the touching ones (everything below is per pair)
+        near = np.flatnonzero(dist < r)
+        if near.size == 0:
+            return reach
+        pts, edge_ids, ia, ib, t, len2, dist = (x[near] for x in (pts, edge_ids, ia, ib, t, len2, dist))
+        p, c, d, e = (x[:, near] for x in (p, c, d, e))
 
         # Edge normal facing the side the point started this substep on. CCD guarantees no point ever crosses an
         # edge, so that's always the free side: outside for neighboring bodies, inside for a body's contents.
@@ -236,9 +345,9 @@ class World:
 
         wp, wa, wb = W[pts], W[ia], W[ib]
         denom = wp + wa * (1 - t) ** 2 + wb * t ** 2
-        active = (dist < r) & (denom > 1e-12)
+        active = denom > 1e-12
         if not active.any():
-            return
+            return reach
 
         # friction: cancel part of the point's sliding relative to the contact point on the edge
         c_prev = PREV[:, ia] + t * (PREV[:, ib] - PREV[:, ia])
@@ -249,45 +358,45 @@ class World:
         delta = depth * n - tang * fric
 
         lam = delta / np.where(active, denom, 1.0)
-        acc = np.zeros_like(P)
-        count = np.zeros(P.shape[1])
-        for idx, share in ((pts, wp), (ia, -wa * (1 - t)), (ib, -wb * t)):
-            for k in range(2):
-                np.add.at(acc[k], idx[active], (share * lam[k])[active])
-            np.add.at(count, idx[active], 1.0)
-        P += acc / np.maximum(count, 1.0)  # Jacobi: average when a point is hit by several contacts
+        # Jacobi: average when a point is hit by several contacts. bincount sums in input order (the point's
+        # shares, then edge start, then edge end), the same order as one np.add.at per term
+        idx = np.concatenate([pts[active], ia[active], ib[active]])
+        shares = [s[active] for s in (wp, -wa * (1 - t), -wb * t)]
+        count = np.maximum(np.bincount(idx, minlength=P.shape[1]), 1.0)
+        for k in range(2):
+            acc = np.bincount(idx, np.concatenate([s * lam[k][active] for s in shares]), minlength=P.shape[1])
+            P[k] += acc / count
+        return reach
 
     # ---------------- Continuous collision detection (the no-intersection guarantee)
-    def _ccd_pairs(self, D):
-        """(point, edge) pairs whose swept boxes (start -> start + D) share a grid cell."""
-        cell, X0 = EnvConfig.cell_size, self.PREV
+    def _ccd_boxes(self, D):
+        """Swept boxes of the straight-line paths PREV -> PREV + D: (point lo, point hi, edge lo, edge hi), each
+        (2, m). Edge boxes are grown by 1.0 px, which also covers the ccd_gap end check."""
+        X0 = self.PREV
         X1 = X0 + D
-        lo_pt = np.floor(np.minimum(X0, X1) / cell).astype(int)
-        hi_pt = np.floor(np.maximum(X0, X1) / cell).astype(int)
         a0, b0, a1, b1 = X0[:, self.edges[0]], X0[:, self.edges[1]], X1[:, self.edges[0]], X1[:, self.edges[1]]
-        lo = np.floor((np.minimum(np.minimum(a0, b0), np.minimum(a1, b1)) - 1.0) / cell).astype(int)
-        hi = np.floor((np.maximum(np.maximum(a0, b0), np.maximum(a1, b1)) + 1.0) / cell).astype(int)
-        grid = defaultdict(list)
-        for e in range(self.edges.shape[1]):
-            for cx in range(lo[0, e], hi[0, e] + 1):
-                for cy in range(lo[1, e], hi[1, e] + 1):
-                    grid[(cx, cy)].append(e)
+        return (np.minimum(X0, X1), np.maximum(X0, X1),
+                np.minimum(np.minimum(a0, b0), np.minimum(a1, b1)) - 1.0,
+                np.maximum(np.maximum(a0, b0), np.maximum(a1, b1)) + 1.0)
 
-        pairs = set()
-        for i in range(X0.shape[1]):
-            for cx in range(lo_pt[0, i], hi_pt[0, i] + 1):
-                for cy in range(lo_pt[1, i], hi_pt[1, i] + 1):
-                    for e in grid.get((cx, cy), ()):
-                        pb, eb = self.point_body[i], self.edge_body[e]
-                        if pb != eb:
-                            if not (self.body_fixed[pb] and self.body_fixed[eb]):
-                                pairs.add((i, e))
-                        elif self.body_self[pb] and i != self.edges[0, e] and i != self.edges[1, e]:
-                            pairs.add((i, e))
-        if not pairs:
-            return np.empty(0, dtype=int), np.empty(0, dtype=int)
-        pts, edge_ids = np.array(sorted(pairs)).T
-        return pts, edge_ids
+    def _ccd_cells(self, D):
+        """Grid cell ranges of the swept boxes: (point lo, point hi, edge lo, edge hi) cell indices."""
+        return [np.floor(box / EnvConfig.cell_size).astype(int) for box in self._ccd_boxes(D)]
+
+    def _ccd_pairs(self, D, cells=None):
+        """(point, edge) pairs whose swept boxes (start -> start + D) share a grid cell. `cells`: _ccd_cells(D)."""
+        cells = self._ccd_cells(D) if cells is None else cells
+        return self._filter_pairs(*self._cell_pairs(*cells), contact=False)
+
+    def _ccd_new_pairs(self, old_cells, cells):
+        """The pairs among _ccd_pairs for `cells` that may be missing from the pairs for `old_cells`: a pair can
+        only be new if its point's or its edge's cell range grew, so pair just those against everything."""
+        p_lo, p_hi, e_lo, e_hi = cells
+        grew_p = np.flatnonzero(((p_lo < old_cells[0]) | (p_hi > old_cells[1])).any(axis=0))
+        grew_e = np.flatnonzero(((e_lo < old_cells[2]) | (e_hi > old_cells[3])).any(axis=0))
+        i1, e1 = self._cell_pairs(p_lo[:, grew_p], p_hi[:, grew_p], e_lo, e_hi)
+        i2, e2 = self._cell_pairs(p_lo, p_hi, e_lo[:, grew_e], e_hi[:, grew_e])
+        return self._filter_pairs(np.concatenate([grew_p[i1], i2]), np.concatenate([e1, grew_e[e2]]), contact=False)
 
     def _ccd_detect(self, D, pairs=None):
         """Points that touch an edge at some time in the substep, moving in straight lines from PREV by D.
@@ -299,10 +408,25 @@ class World:
         """
         pts, eids = self._ccd_pairs(D) if pairs is None else pairs
         empty = np.empty(0)
+        X0 = self.PREV
+        if pts.size:
+            # Cheap pre-reject: a hit puts the point on the edge at some time t, so the point's swept box and the
+            # edge's swept box (grown by 1.0 px, more than ccd_gap) overlap. Grid cells are much coarser than that,
+            # so this drops most broad phase pairs before the quadratic, without changing any result. Except: an edge
+            # that shrinks to (nearly) zero length mid-substep makes the cross product vanish for every point, which
+            # the math below reports as hits even for far points; keep those pairs so the results stay the same.
+            p_lo, p_hi, e_lo, e_hi = self._ccd_boxes(D)
+            ea, eb = self.edges
+            e0, de = X0[:, eb] - X0[:, ea], D[:, eb] - D[:, ea]
+            t_min = np.clip(-np.sum(e0 * de, axis=0) / np.maximum(np.sum(de * de, axis=0), 1e-300), 0.0, 1.0)
+            shortest = e0 + t_min * de  # each edge at its shortest during the substep
+            collapses = np.sum(shortest * shortest, axis=0) < 1e-6
+            overlap = np.all((p_lo[:, pts] <= e_hi[:, eids]) & (p_hi[:, pts] >= e_lo[:, eids]), axis=0)
+            keep = overlap | collapses[eids]
+            pts, eids = pts[keep], eids[keep]
         if pts.size == 0:
             return pts, eids, empty, empty, empty
         ia, ib = self.edges[0, eids], self.edges[1, eids]
-        X0 = self.PREV
         e0, de = X0[:, ib] - X0[:, ia], D[:, ib] - D[:, ia]
         q0, dq = X0[:, pts] - X0[:, ia], D[:, pts] - D[:, ia]
 
@@ -348,24 +472,58 @@ class World:
         """Make the straight-line motion PREV -> PREV + V h collision-free by editing V."""
         V, sec = self.V, self._section
         with sec("broad"):
-            pairs = self._ccd_pairs(V * h)
+            D = V * h
+            cells = self._ccd_cells(D)
+            pairs = self._ccd_pairs(D, cells)
+        with sec("narrow+impulses"):
+            hits = self._ccd_detect(D, pairs)
+        fresh = True  # V hasn't changed since the broad phase
         for _ in range(EnvConfig.ccd_passes):
-            with sec("narrow+impulses"):
-                pts, eids, ts, ss, sides = self._ccd_detect(V * h, pairs)
-            if pts.size == 0:
-                # impulses changed the paths, so confirm with a fresh broad phase before declaring the substep clean
+            if hits[0].size == 0:
+                if fresh:
+                    return
+                # Impulses changed the paths, so confirm with a fresh broad phase before declaring the substep clean.
+                # Every current pair already in `pairs` was just checked (no hits), so first look only at the pairs
+                # the fresh broad phase could add; if none of them hits either, the fresh check would come up empty.
+                D = V * h
                 with sec("broad"):
-                    pairs = self._ccd_pairs(V * h)
+                    new_cells = self._ccd_cells(D)
+                    extra = self._ccd_new_pairs(cells, new_cells)
                 with sec("narrow+impulses"):
-                    pts, eids, ts, ss, sides = self._ccd_detect(V * h, pairs)
-                if pts.size == 0:
+                    if self._ccd_detect(D, extra)[0].size == 0:
+                        return
+                with sec("broad"):
+                    cells = new_cells
+                    pairs = self._ccd_pairs(D, cells)
+                with sec("narrow+impulses"):
+                    hits = self._ccd_detect(D, pairs)
+                if hits[0].size == 0:
                     return
             with sec("narrow+impulses"):
-                self._ccd_impulses(pts, eids, ts, ss, sides, h)
+                V_before = V.copy()
+                self._ccd_impulses(*hits, h)
+                hits = self._ccd_redetect(V * h, pairs, hits, (V != V_before).any(axis=0))
+            fresh = False
 
         self.zone_count += 1
         with sec("impact zones"):
             self._impact_zones(h)
+
+    def _ccd_redetect(self, D, pairs, hits, changed):
+        """_ccd_detect(D, pairs) after impulses that changed only the `changed` points' velocities. A pair's result
+        depends only on its three points, so pairs not touching a changed point keep their result from `hits`."""
+        E = self.edges
+
+        def touches(pts, eids):
+            return changed[pts] | changed[E[0, eids]] | changed[E[1, eids]]
+
+        pts, eids = pairs
+        moved = touches(pts, eids)
+        new = self._ccd_detect(D, (pts[moved], eids[moved]))
+        kept = ~touches(hits[0], hits[1])
+        merged = [np.concatenate([old[kept], fresh]) for old, fresh in zip(hits, new)]
+        order = np.argsort(merged[0] * E.shape[1] + merged[1], kind="stable")  # back to (point, edge) order
+        return tuple(a[order] for a in merged)
 
     def _ccd_impulses(self, pts, eids, ts, ss, sides, h):
         """One pass of sequential (Gauss-Seidel) impulses over detected collisions, earliest first, editing V."""
