@@ -21,6 +21,8 @@ import pygame
 import ui_style as ui
 from ui_style import HUD
 from peg_layer import PegLayer
+from scene_io import WorldHistory
+from scene_menu import SceneMenus
 from entities import (Chain, EnvConfig, FixedBody, Hook, RigidBody, Rope, SoftBody, chain_box_points, chain_counts,
                       chain_layout, draw_border, polygon_points)
 
@@ -207,6 +209,8 @@ class Editor:
         self._dim.fill((0, 0, 0, 140))
         # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
         self.pegs = PegLayer((self.screen_w, self.screen_h), PEG_DOT)
+        self.history = WorldHistory()  # world-level undo / redo (snapshots pushed by before_world_change)
+        self.scenes = SceneMenus(self)  # the save (Ctrl/Cmd+S) and open (Ctrl/Cmd+O) dialogs
 
     # ---------------- Small utilities
     def _color(self, name):
@@ -305,8 +309,9 @@ class Editor:
         self.kind, self.mode, self.stage, self.relation, self.selection = None, None, "menu", "free", []
 
     def _spawn(self):
-        """Add the complete object being placed to the world."""
+        """Add the complete object being placed to the world (one world undo step)."""
         cfg = self._cfg()
+        self.before_world_change(f"spawn {self.kind}")
         if self.kind == "hook":
             self.world.add_hook(Hook(self.points[0], col=self._color(HOOK_COLOR)))
             return
@@ -364,6 +369,35 @@ class Editor:
         else:
             self.points[action[1]], self.snaps[action[1]] = action[3], action[5]
         self.undo_stack.append(action)
+
+    # ---------------- World undo / redo (whole-world snapshots, scene_io.WorldHistory)
+    def before_world_change(self, label, env=False):
+        """Call right BEFORE any edit that changes the world (spawn, delete, move, paste, rotate, load, ...): pushes
+        a snapshot of the world for Z to go back to, and clears the redo steps. env: also restore gravity and the
+        other scene settings on undo (a load, which sets them)."""
+        self.history.push(self.world, label, env)
+
+    def world_replaced(self):
+        """The world's bodies were swapped for new objects (undo / redo / load): drop everything that pointed at the
+        old ones."""
+        self._tree_key, self._tree = None, None
+        self.selection = []
+        if self.active and self.stage == "select":
+            self.stage = "config"
+        self.world.release()
+
+    def world_undo(self):
+        """Z outside placement (while paused): restore the world as it was before the last change."""
+        if self.history.undo(self.world) is None:
+            self._say("nothing to undo")
+            return
+        self.world_replaced()
+
+    def world_redo(self):
+        if self.history.redo(self.world) is None:
+            self._say("nothing to redo")
+            return
+        self.world_replaced()
 
     # ---------------- Containment hierarchy (inside / around), world units
     def _is_wall(self, body):
@@ -857,10 +891,19 @@ class Editor:
                 ("V", "view", look, True),
                 ("F", "compute", "shown" if self.show_compute else "hidden", True),
                 ("SPACE", "HUD", "shown", True),
-                ("Z", "undo", None, placing and bool(self.undo_stack)),
-                ("X", "redo", None, placing and bool(self.redo_stack)),
+                self._undo_hotkey("Z", "undo", self.undo_stack, self.history.undo_stack),
+                self._undo_hotkey("X", "redo", self.redo_stack, self.history.redo_stack),
+                ("^S/^O", "save / open", None, not (placing and self.points)),  # Ctrl/Cmd+S, Ctrl/Cmd+O scenes
                 ("ESC", "back" if self.active else "quit", None, True),
                 ("drag", "grab bodies", None, not self.paused)]
+
+    def _undo_hotkey(self, key, label, point_stack, world_stack):
+        """Z / X on the info card: while placing they step through the object's points (state "point"); otherwise
+        through world changes, only while paused (state: how many steps are available)."""
+        if self._placing():
+            return key, label, "point", bool(point_stack)
+        n = len(world_stack) if self.history.world is self.world else 0
+        return key, label, f"{n} step{'' if n == 1 else 's'}" if n else "none", self.paused and n > 0
 
     def _menu_layout(self):
         n, cols = len(KIND_TITLES), MENU_COLS
@@ -1091,24 +1134,38 @@ class Editor:
     # ---------------- Events (mouse positions arrive in real screen pixels)
     def handle_event(self, event):
         """Returns True if the editor used the event (the main loop should then ignore it)."""
+        if self.scenes.state is not None:  # the save / open dialog is modal
+            return self.scenes.handle_event(event)
         if event.type == pygame.KEYDOWN:
+            cmd = event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)
+            if cmd and event.key == pygame.K_s:
+                self.scenes.open_save()
+                return True
+            if cmd and event.key == pygame.K_o:
+                self.scenes.open_load()
+                return True
             if event.key == pygame.K_p:
                 self.toggle_pause()
                 return True
             if event.key == pygame.K_f:
                 self.toggle_compute()
                 return True
-            if self.active:
-                cmd = event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)
-                if event.key == pygame.K_ESCAPE:
-                    self.back()
+            undo_key = event.key == pygame.K_z
+            redo_key = event.key == pygame.K_x or (cmd and event.key == pygame.K_y)  # X redo (Ctrl/Cmd+Y too)
+            if undo_key and cmd and event.mod & pygame.KMOD_SHIFT:  # Ctrl/Cmd+Shift+Z also redoes
+                undo_key, redo_key = False, True
+            if undo_key or redo_key:
+                if self._placing():  # the object being placed: its own point undo / redo
+                    self.undo() if undo_key else self.redo()
                     return True
-                if event.key == pygame.K_z:  # Z undo (Ctrl/Cmd+Shift+Z also redoes)
-                    self.redo() if cmd and event.mod & pygame.KMOD_SHIFT else self.undo()
+                if self.paused:  # otherwise whole-world changes (spawns, loads, ...), only while paused
+                    self.world_undo() if undo_key else self.world_redo()
                     return True
-                if event.key == pygame.K_x or (cmd and event.key == pygame.K_y):  # X redo (Ctrl/Cmd+Y too)
-                    self.redo()
-                    return True
+                self._say("pause (P) to undo / redo")
+                return False
+            if self.active and event.key == pygame.K_ESCAPE:
+                self.back()
+                return True
             return False
 
         if event.type not in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
@@ -1310,6 +1367,7 @@ class Editor:
             self._draw_hint(surface, mouse_ui)
         for area, _, spec in self._panel_widgets():
             self._draw_widget(surface, area, spec, area.collidepoint(mouse_ui))
+        self.scenes.draw(surface, mouse_ui)  # the save / open dialog, over everything else
 
     def draw_message(self, surface, origin=(0, 0)):
         """The current message, centered on the UI surface in large bold debug_red. Call last (over the cards; see
