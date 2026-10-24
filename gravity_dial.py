@@ -1,5 +1,5 @@
-"""Gravity selector: a small native-resolution card in the bottom-left corner with 8 diamond buttons placed radially
-around a centre button. Clicking a diamond (or pressing the numpad key in the same spot) points gravity that way,
+"""Gravity selector: a card in the right-hand sidebar (hud_layer.py) with 8 diamond buttons placed radially around a
+centre button. Clicking a diamond (or pressing the numpad key in the same spot) points gravity that way,
 keeping its magnitude; the centre button (numpad 5) turns gravity off, and clicking it again turns it back on in the
 last direction.
 
@@ -7,9 +7,8 @@ Gravity is EnvConfig.gravity (px/s^2, +y down). Both physics backends read it ev
 gpu_backend.GpuBackend add EnvConfig.gravity * h to the velocities), so it's changed in place and takes effect on the
 next step, running or paused.
 
-Drawn on its own small per-pixel-alpha surface (`surface`, at `rect` in native screen px) in the HUD style
-(ui_style.HUD), which main_opengl.py blends over the frame like the HUD cards. The surface is only redrawn (and
-`version` bumped, so the presenter re-uploads it) when the hover or the direction changes.
+It's a sidebar card provider (card_height / place / draw_card, see hud_layer.py), drawn at native resolution in the
+HUD style (ui_style.HUD) on the sidebar layer: the title row names the direction, the dial is centred below it.
 """
 import math
 
@@ -32,14 +31,12 @@ ZERO_NAME = "off"
 KEY_DIRECTION = {k: i for i, (_, _, k, _) in enumerate(DIRECTIONS)}
 
 # layout in base (UI-style) px; HUD.px scales them to native px
-CARD_W = 72
 TITLE_H = 16
 DIAL_R = 28  # dial radius incl. the diamonds' outer tips
 INNER = 8  # centre -> a diamond's inner tip
 OUTER = 27  # centre -> its outer tip
 HALF_W = 5  # half of a diamond's short axis (about half the long one, so the diagonal ones still read as diamonds)
 CENTRE = 5  # the centre button's half diagonal
-LINE_H = 13
 
 
 def direction_index(g=None):
@@ -64,25 +61,22 @@ def direction_name(g=None, compass=False):
 
 
 class GravityDial:
-    def __init__(self, screen_size, ui_scale=2):
-        """screen_size: native screen (window) px; ui_scale: native px per UI-surface px. The card sits in the
-        bottom-left corner, its top-left on a multiple of ui_scale so the UI-res cursor drawn over it lines up."""
-        px = HUD.px
-        w = px(CARD_W)
-        h = HUD.CARD_PAD + px(TITLE_H) + 2 * px(DIAL_R) + px(LINE_H) + HUD.CARD_PAD
-        y = (screen_size[1] - HUD.CARD_MARGIN - h) // ui_scale * ui_scale
-        self.rect = pygame.Rect(HUD.CARD_MARGIN // ui_scale * ui_scale, y, w, h)
-        self.ui_scale = ui_scale
-        self._top = pygame.Surface((-(-w // ui_scale), -(-h // ui_scale)), pygame.SRCALPHA)  # UI-res overlay
-        self.surface = pygame.Surface(self.rect.size, pygame.SRCALPHA)
-        self.visible = True  # the main loop hides it with the HUD (SPACE) and behind the editor's modal panels
-        self.version = 0  # bumped whenever the surface is redrawn
+    def __init__(self):
         n = float(np.hypot(*EnvConfig.gravity))
         self.magnitude = n or DEFAULT_MAGNITUDE
         self.last = direction_index() if direction_index() is not None else 4  # where the centre button turns it back on
-        self._drawn_key = None
-        # dial centre, native screen px
-        self.centre = np.array([self.rect.centerx, self.rect.y + HUD.CARD_PAD + px(TITLE_H) + px(DIAL_R)], dtype=float)
+        self.rect = pygame.Rect(0, 0, 0, 0)  # native screen px, set by the sidebar (place)
+        self.centre = np.zeros(2)  # dial centre, native screen px
+
+    # ---------------- Sidebar card provider (hud_layer.py)
+    @staticmethod
+    def card_height(compact=False):
+        px = HUD.px
+        return HUD.CARD_PAD + px(TITLE_H) + 2 * px(DIAL_R) + HUD.CARD_PAD
+
+    def place(self, rect):
+        self.rect = pygame.Rect(rect)
+        self.centre = np.array([rect.centerx, rect.y + HUD.CARD_PAD + HUD.px(TITLE_H) + HUD.px(DIAL_R)], dtype=float)
 
     # ---------------- State
     def set_direction(self, i):
@@ -133,7 +127,7 @@ class GravityDial:
 
     def button_at(self, pos):
         """'zero', a DIRECTIONS index, or None for a screen position (native px)."""
-        if not self.visible or not self.rect.collidepoint(pos):
+        if not self.rect.collidepoint(pos):
             return None
         if self._inside(self._centre_diamond(), pos):
             return "zero"
@@ -150,8 +144,8 @@ class GravityDial:
 
     # ---------------- Events
     def handle_event(self, event):
-        """Numpad keys (always) and left clicks on the card (while visible). True if used; clicks anywhere on the card
-        are swallowed so they don't grab bodies or place points under it."""
+        """Numpad keys and left clicks on the card. True if used; clicks anywhere on the card are used (the rest of the
+        sidebar swallows clicks too, see Editor._card_widgets)."""
         if event.type == pygame.KEYDOWN:
             if event.key in KEY_DIRECTION:
                 self.set_direction(KEY_DIRECTION[event.key])
@@ -160,7 +154,7 @@ class GravityDial:
                 self.toggle_zero()
                 return True
             return False
-        if event.type == pygame.MOUSEBUTTONDOWN and self.visible and self.rect.collidepoint(event.pos):
+        if event.type == pygame.MOUSEBUTTONDOWN and self.rect.collidepoint(event.pos):
             if event.button == 1:
                 hit = self.button_at(event.pos)
                 if hit == "zero":
@@ -171,38 +165,20 @@ class GravityDial:
         return False
 
     # ---------------- Drawing
-    def draw(self, mouse_px, overlay=None):
-        """Redraw the surface if the hover or the direction changed. mouse_px: the mouse in native screen px.
-        overlay(surface, origin): draws what goes over the HUD (the cursor) at UI px minus origin, as for
-        HudLayer.overlay; while the mouse is near the card it's redrawn every frame with that on top."""
+    def draw_card(self, surface, origin, mouse_px, compact=False):
+        """Draw the card at its placed rect minus origin. mouse_px: the mouse in native screen px (hover)."""
         hover = self.button_at(mouse_px)
         current = direction_index()
-        near = overlay is not None and self.rect.inflate(8 * self.ui_scale, 8 * self.ui_scale).collidepoint(mouse_px)
-        key = (hover, current, not np.any(EnvConfig.gravity), direction_name(), tuple(mouse_px) if near else None)
-        if key == self._drawn_key:
-            return
-        self._drawn_key = key
-        self.version += 1
-        s, (ox, oy) = self.surface, self.rect.topleft
-        s.fill((0, 0, 0, 0))
-        local = pygame.Rect(0, 0, *self.rect.size)
-        HUD.draw_frame(s, local)
+        local = self.rect.move(-origin[0], -origin[1])
+        HUD.draw_frame(surface, local)
         pad, px = HUD.CARD_PAD, HUD.px
-        HUD.text(s, "Gravity", (pad, pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
-        off = np.array([ox, oy], dtype=float)
+        HUD.text(surface, "Gravity", (local.x + pad, local.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
+        HUD.text(surface, direction_name(), (local.right - pad, local.y + pad), ui.ACCENT, "bold", align="right")
+        off = np.array(origin, dtype=float)
         zero = not np.any(EnvConfig.gravity)
         for i in range(len(DIRECTIONS)):
-            self._draw_rhombus(s, lambda inset, i=i: self._diamond(i, inset), off, hover == i, current == i)
-        self._draw_rhombus(s, self._centre_diamond, off, hover == "zero", zero)
-        HUD.text(s, direction_name(), (local.centerx, local.bottom - pad - px(LINE_H) // 2), ui.ACCENT, "bold",
-                 align="center", valign="middle")
-        if near:
-            k = self.ui_scale
-            self._top.fill((0, 0, 0, 0))
-            overlay(self._top, (ox // k, oy // k))
-            if self._top.get_bounding_rect().h:
-                top = pygame.transform.scale(self._top, (self._top.get_width() * k, self._top.get_height() * k))
-                s.blit(top, (0, 0))
+            self._draw_rhombus(surface, lambda inset, i=i: self._diamond(i, inset), off, hover == i, current == i)
+        self._draw_rhombus(surface, self._centre_diamond, off, hover == "zero", zero)
 
     @staticmethod
     def _draw_rhombus(surface, shape, off, hovered, selected):
@@ -213,6 +189,6 @@ class GravityDial:
         pygame.draw.polygon(surface, ui.BLACK, poly(0))
         if hovered:
             pygame.draw.polygon(surface, ui.TEXT, poly(border))
-            pygame.draw.polygon(surface, ui.button_fill(True, selected), poly(border + HUD.scale))
+            pygame.draw.polygon(surface, ui.button_fill(True, selected), poly(border + HUD.px(1)))
         else:
             pygame.draw.polygon(surface, ui.button_fill(False, selected), poly(border))

@@ -9,12 +9,15 @@ colors, solid black 2px borders, non-antialiased text), so they have the same pi
 are UI-surface pixels: mouse events arrive in real screen pixels and are divided by the scale-down factor; world units
 are UI pixels / zoom. Placement previews are drawn in world space on the game surfaces.
 
-The info card ("Controls") is the exception: it is drawn at native resolution on the HUD layer (hud_layer.py) with
-ui_style.HUD metrics, so its layout and hit-testing are in real screen pixels.
+The editor's panels and hints centre in the world area, left of the right-hand sidebar. The Controls card is the
+sidebar's first card (the editor is its card provider, see hud_layer.py): drawn at native resolution with
+ui_style.HUD metrics, so its layout and hit-testing are in real screen pixels. Clicks anywhere in the sidebar go to
+the sidebar (its buttons, or swallowed), never to the world.
 """
 import math
 import time
 import weakref
+from typing import NamedTuple
 
 import numpy as np
 import pygame
@@ -76,7 +79,7 @@ MIRROR_LOCKED = "undo the placed points to toggle mirror"
 SNAP_STEP_DEG = 15.0  # S: a new point's direction from the previous one snaps to multiples of this
 POLYGON_MODES = ("regular", "custom", "freehand")
 
-# layout, in UI-surface pixels (the info card uses the CARD_* / LINE_H / BTN_GAP / KEY_COL_W ones times HUD_SCALE)
+# layout, in UI-surface pixels (the Controls card uses the CARD_* / KEY_* / SECTION_* / BTN_GAP ones times HUD.scale)
 PAD = 8  # panel padding
 HEADER_H = 30  # panel title row
 LABEL_H = 14  # a row label above its controls
@@ -87,14 +90,22 @@ MODE_H = 22
 COL_W = 232  # settings column of the config panel; the shape preview fills the rest
 CONFIG_W = 400
 LINE_H = 13  # one hotkey / hint line
-MIN_LINE_H = 11  # info card hotkey rows are packed down to this when the card column is short (see _card_rows)
 CARD_TITLE_H = 16
 CARD_BTN_H = 20
-KEY_COL_W = 46  # hotkey name column on the info card (room for ENTER / SPACE in bold)
-# hotkeys listed side by side in one row of the info card (short, related ones), so the card stays short enough for
-# the compute card to fit under it on small screens
-PAIRED_HOTKEYS = {"Z": "X", "S": "M", "[ ]": "N"}
-PAIR_GAP = 4  # base px between a paired hotkey's key, label and state
+KEY_COL_W = 46  # hotkey name column on the Controls card (room for ENTER in bold; a wider key pushes its label right)
+KEY_LINE_H = 12  # one hotkey row on the Controls card (a little denser than LINE_H: ~30 rows fit the sidebar)
+SECTION_H = 10  # a section heading (Sim / View / Edit ...) above its hotkey rows
+SECTION_SIZE = 8  # its font size
+
+
+class CardLayout(NamedTuple):
+    """Editor._card_layout(): the Controls card in the sidebar, in real screen px."""
+    card: pygame.Rect
+    pause: pygame.Rect  # its [p] / edit / [f] buttons
+    plus: pygame.Rect
+    compute: pygame.Rect
+    action: pygame.Rect  # the action row: Undo / Finish / Redo, or Done while picking objects to go around
+    rows: list  # [(kind, y, data)]: ("section", y, title) or ("key", y, (key, label, state, usable))
 
 
 def max_skip_sets(n):
@@ -194,14 +205,18 @@ def peg_positions(lo, hi, spacing):
 
 
 class Editor:
-    def __init__(self, world, palette, ui_size, world_size, scale, inset, zoom=1.0, view=None, screen_size=None):
+    def __init__(self, world, palette, ui_size, world_size, scale, inset, zoom=1.0, view=None, screen_size=None,
+                 sidebar=None):
         """ui_size: the UI surface size (real screen / scale); scale: real screen px per UI px; zoom: UI px per world
-        unit; view: an object with `show_grid`, `filled` and `trails` (the G / V / T states listed on the info card); screen_size:
-        the real screen (window) size the info card is laid out on (default ui_size * scale)."""
+        unit; view: an object with `show_grid`, `filled` and `trails` (the G / V / T states listed on the Controls
+        card); screen_size: the real screen (window) size (default ui_size * scale); sidebar: the sidebar's rect in
+        real screen px (default ui_style.sidebar_rect at 10%); the world area is left of it."""
         self.world, self.palette, self.scale, self.inset, self.zoom, self.view = world, palette, scale, inset, zoom, view
         self.W, self.H = ui_size
         self.screen_w, self.screen_h = screen_size or (self.W * scale, self.H * scale)
         self.world_w, self.world_h = world_size
+        self.sidebar = pygame.Rect(sidebar) if sidebar is not None else ui.sidebar_rect((self.screen_w, self.screen_h), scale, 0.1)
+        self._card_pos = None  # the Controls card's top-left (screen px) as placed by the sidebar
         self.colors = [(name, tuple(col)) for name, col in vars(palette).items() if not name.startswith("_") and isinstance(col, list)]
         self.settings = {"soft": {"n": 6, "sets": 1, "strength": 0.1, "color": "network_green"},  # the hexagon
                          "rigid": {"n": 4, "color": "debug_red"},  # the square
@@ -231,11 +246,8 @@ class Editor:
         self.reg_start = None  # press position while dragging out a regular polygon
         self.slider_drag = False
         self.message, self.message_until = None, 0.0
-        self.show_card = True  # the main loop mirrors its HUD toggle (SPACE) here: a hidden card takes no clicks
-        self.show_compute = True  # F / the card's [f] button: the main loop draws the compute card only while set
-        self.compute_card = None  # its rect (real screen px), set by the main loop when drawn: clicks on it are swallowed
-        self.gravity_card = None  # the gravity selector's rect (screen px) while shown, set by the main loop: swallowed too
-        # set by the main loop, for the info card's states: debug_overlay.DebugOverlays (keys 1-4) and
+        self.show_compute = True  # F / the card's [f] button: the Compute card in full (else its short summary)
+        # set by the main loop, for the Controls card's states: debug_overlay.DebugOverlays (keys 1-4) and
         # timectl.TimeControl ([ / ] speed, N frame step); None leaves those rows without a state
         self.overlays = None
         self.time = None
@@ -1033,58 +1045,69 @@ class Editor:
 
     # ---------------- Layout (UI surface pixels; rebuilt each call, shared by drawing and click handling)
     def _area(self):
-        """The part of the UI surface left of the card column (all of it while the HUD is hidden). The column is
-        laid out in real screen px; its left margin's edge is converted to UI px (rounded down)."""
-        if not self.show_card:
-            return pygame.Rect(0, 0, self.W, self.H)
-        column_left = self.screen_w - HUD.column_width()
-        return pygame.Rect(0, 0, min(self.W, column_left // self.scale), self.H)
+        """The world area of the UI surface: everything left of the sidebar (the editor's panels and hints centre in
+        it). The sidebar's left edge is a whole number of UI px (ui_style.sidebar_rect)."""
+        return pygame.Rect(0, 0, min(self.W, self.sidebar.x // self.scale), self.H)
 
     def _centered(self, w, h):
         area = self._area()
         return pygame.Rect(max(ui.CARD_MARGIN, area.centerx - w // 2), max(ui.CARD_MARGIN, area.centery - h // 2), w, h)
 
+    # ---------------- The Controls card: a sidebar card provider (hud_layer.py)
+    def card_height(self, compact=False):
+        """Native px at the current HUD scale. The card has no compact form, and its height doesn't depend on the
+        editor's state (the action row is always there), so the sidebar's cards never move."""
+        return self._card_layout().card.h
+
+    def place(self, rect):
+        """The sidebar puts the card at `rect` (native screen px; it's first, so normally the sidebar's top-left)."""
+        self._card_pos = rect.topleft
+
+    def draw_card(self, surface, origin, mouse_px, compact=False):
+        self.draw_info_card(surface, mouse_px, origin)
+
+    def _key_rows(self):
+        """[(section, (key, label, state, usable))] for every hotkey: the rows of _hotkeys(), grouped by
+        _hotkey_sections() (in its order; rows found in no section go last, under "More")."""
+        sections = self._hotkey_sections()
+        where = {row[0]: title for title, rows in sections for row in rows}
+        order = [title for title, _ in sections] + ["More"]
+        rows = [(where.get(row[0], "More"), tuple(row[:4])) for row in self._hotkeys()]
+        return sorted(rows, key=lambda e: order.index(e[0]))  # stable: rows keep their order within a section
+
     def _card_layout(self):
-        """The info card in real screen px (HUD style): (card, [p] button, edit button, [f] button, hotkey list y)."""
+        """The Controls card in real screen px (HUD style), as a CardLayout: the card, its [p] / edit / [f] buttons,
+        the action row (Undo / Finish / Redo, or Done while picking objects to go around) and the hotkey rows
+        [(kind, y, data)]: a heading per section, then its rows."""
         px, pad = HUD.px, HUD.CARD_PAD
-        gap, bh = px(BTN_GAP), px(CARD_BTN_H)
-        top = HUD.CARD_MARGIN
+        gap, bh, line = px(BTN_GAP), px(CARD_BTN_H), px(KEY_LINE_H)
+        x, top = self._card_pos if self._card_pos is not None else (self.sidebar.x + HUD.CARD_MARGIN, HUD.CARD_MARGIN)
+        w = self.sidebar.right - HUD.CARD_MARGIN - x
         buttons_y = top + pad + px(CARD_TITLE_H)
-        lines_y = buttons_y + bh + pad
-        if self._row_shown():  # Undo / Finish / Redo (or Done) row under the pause / edit / compute buttons
-            lines_y += bh + gap
-        rows, line_h = self._card_rows(lines_y)
-        rect = HUD.card_rect(self.screen_w, top, lines_y + len(rows) * line_h + pad - px(1) - top)
-        bw = (rect.w - 2 * pad - 2 * gap) // 3
-        pause = pygame.Rect(rect.x + pad, buttons_y, bw, bh)
+        action_y = buttons_y + bh + gap
+        y = action_y + bh + pad
+        entries, last = [], None
+        for title, row in self._key_rows():
+            if title != last:
+                entries.append(("section", y, title))
+                y += px(SECTION_H)
+                last = title
+            entries.append(("key", y, row))
+            y += line
+        rect = pygame.Rect(x, top, w, y + pad - px(1) - top)
+        bw = (w - 2 * pad - 2 * gap) // 3
+        pause = pygame.Rect(x + pad, buttons_y, bw, bh)
         plus = pygame.Rect(pause.right + gap, buttons_y, bw, bh)
         compute = pygame.Rect(plus.right + gap, buttons_y, rect.right - pad - plus.right - gap, bh)
-        return rect, pause, plus, compute, lines_y
-
-    def _card_rows(self, lines_y):
-        """The hotkey rows the info card shows and their line height (screen px), given where the list starts. All of
-        _hotkey_rows() at LINE_H when the card and the compute card under it fit on the screen; on a short screen the
-        rows that can't be used right now (dimmed) are left out, bottom up, and if that's not enough the rest are
-        packed closer, down to MIN_LINE_H."""
-        rows, px = self._hotkey_rows(), HUD.px
-        below = HUD.CARD_GAP + self.compute_card.h if self.show_compute and self.compute_card is not None else 0
-        room = self.screen_h - below - (lines_y + HUD.CARD_PAD - px(1))  # screen px left for the rows
-        line_h = px(LINE_H)
-        for k in reversed(range(len(rows))):
-            if len(rows) * line_h <= room:
-                break
-            if not any(usable for *_, usable in rows[k]):
-                del rows[k]
-        if len(rows) * line_h > room:
-            line_h = max(px(MIN_LINE_H), room // max(len(rows), 1))
-        return rows, line_h
+        action = pygame.Rect(x + pad, action_y, w - 2 * pad, bh)
+        return CardLayout(rect, pause, plus, compute, action, entries)
 
     def _placing(self):
         return self.active and self.stage == "place"
 
     def _row_shown(self):
-        """Is there a row of action buttons (Undo / Finish / Redo while placing, Done while picking objects to go
-        around)?"""
+        """Is the action row live (Undo / Finish / Redo while placing, Done while picking objects to go around)? Its
+        buttons are drawn disabled otherwise."""
         return self._placing() or (self.active and self.stage == "select" and self.relation == "around")
 
     def _relations(self):
@@ -1094,59 +1117,53 @@ class Editor:
             options = tuple(r for r in options if r != "around")
         return options
 
-    def _hotkeys(self):
-        """(key, what it does, current state or None, usable now) for every hotkey, as listed on the info card."""
+    def _hotkey_sections(self):
+        """Every hotkey, grouped into the Controls card's sections: [(title, rows)], a row being
+        (key, what it does, current state or None, usable now). The sidebar fits any number of rows (see
+        hud_layer.HudLayer.fit): to add a hotkey, add its row to its section here (or a new section)."""
         placing = self._placing()
-        # speed and frame stepping don't apply while picking objects / placing points (physics is paused and N is
-        # off), so those two rows make room for that stage's button row
-        positioning = self.active and self.stage in ("select", "place")
         v = self.view
         grid = None if v is None else ("on" if v.show_grid else "off")
         look = None if v is None else ("filled" if v.filled else "points")
         trails = None if v is None else ("on" if getattr(v, "trails", False) else "off")
         picking = self._row_shown() and not placing  # Enter is Done while picking objects to go around
         enter = ("done", picking and bool(self.selection)) if picking else ("finish", placing and self._complete())
-        return [("P", "pause", "paused" if self.paused else "running", True),
-                ("G", "grid", grid, True),
-                ("V", "view", look, True),
-                ("T", "trails", trails, True),
-                ("F", "compute", "shown" if self.show_compute else "hidden", True),
-                ("SPACE", "HUD", "shown", True),
-                ("KP1-9", "gravity", direction_name(compass=True), True),
-                self._undo_hotkey(),
-                ("ENTER", enter[0], None, enter[1]),
-                ("^S/^O", "save, open", None, not (placing and self.points)),  # Ctrl/Cmd+S, Ctrl/Cmd+O scenes
-                ("S", "snap", "on" if self.snap else "off", not placing or self.mode in POLYGON_MODES),
-                ("M", "mirror", "on" if self.mirror else "off",
-                 not placing or self.mode == "freehand" or (self.mode == "custom" and self._cfg()["n"] >= 3)),
-                ("ESC", "back" if self.active else "quit", None, True),
-                ("drag", "grab bodies", None, not self.paused),
-                ("1-4", "overlays", None if self.overlays is None else self.overlays.state(), True)] + ([] if positioning else [
-                ("[ ]", "speed", None if self.time is None else self.time.label(), True),
-                ("N", "step", None, self.can_frame_step())])
+        return [("Sim", [("P", "pause", "paused" if self.paused else "running", True),
+                         ("[ ]", "speed", None if self.time is None else self.time.label(), True),
+                         ("N", "step", None, self.can_frame_step()),
+                         ("KP1-9", "gravity", direction_name(compass=True), True),
+                         ("drag", "grab bodies", None, not self.paused),
+                         ("ESC", "back" if self.active else "quit", None, True)]),
+                ("View", [("G", "grid", grid, True),
+                          ("V", "view", look, True),
+                          ("T", "trails", trails, True),
+                          ("F", "compute", "full" if self.show_compute else "short", True),
+                          ("1-4", "overlays", None if self.overlays is None else self.overlays.state(), True)]),
+                ("Edit", [self._undo_hotkey("Z", "undo", self.undo_stack, self.history.undo_stack),
+                          self._undo_hotkey("X", "redo", self.redo_stack, self.history.redo_stack),
+                          ("ENTER", enter[0], None, enter[1]),
+                          ("S", "snap", "on" if self.snap else "off", not placing or self.mode in POLYGON_MODES),
+                          ("M", "mirror", "on" if self.mirror else "off",
+                           not placing or self.mode == "freehand" or (self.mode == "custom" and self._cfg()["n"] >= 3))]),
+                ("Scene", [("^S", "save", None, True),  # Ctrl/Cmd+S: the save dialog (scene_menu.py)
+                           ("^O", "open", None, not (placing and self.points))])]
 
-    def _hotkey_rows(self):
-        """The info card's hotkey rows: one hotkey each, or two (PAIRED_HOTKEYS) side by side."""
-        rows, keys = [], self._hotkeys()
-        i = 0
-        while i < len(keys):
-            pair = i + 1 < len(keys) and PAIRED_HOTKEYS.get(keys[i][0]) == keys[i + 1][0]
-            rows.append(keys[i:i + 2] if pair else keys[i:i + 1])
-            i += 2 if pair else 1
-        return rows
+    def _hotkeys(self):
+        """(key, what it does, current state or None, usable now) for every hotkey on the Controls card."""
+        return [row for _, rows in self._hotkey_sections() for row in rows]
 
-    def _undo_hotkey(self):
-        """Z / X (one card line): while placing they step through the object's points (state "point"); otherwise
-        through world changes, only while paused (state: undo / redo steps available, e.g. "3 / 1")."""
+    def _undo_hotkey(self, key, label, point_stack, world_stack):
+        """Z / X on the Controls card: while placing they step through the object's points (state "point");
+        otherwise through world changes, only while paused (state: how many steps are available)."""
         if self._placing():
-            return "Z/X", "undo, redo", "point", bool(self.undo_stack or self.redo_stack)
-        nu, nr = len(self.history.undo_stack), len(self.history.redo_stack)
-        return "Z/X", "undo, redo", f"{nu} / {nr}" if nu or nr else "none", self.paused and nu + nr > 0
+            return key, label, "point", bool(point_stack)
+        n = len(world_stack)
+        return key, label, f"{n} step{'' if n == 1 else 's'}" if n else "none", self.paused and n > 0
 
     def _menu_layout(self):
         n, cols = len(KIND_TITLES), MENU_COLS
         rows = -(-n // cols)
-        room = self._area().w - 2 * ui.CARD_MARGIN  # narrow surfaces shrink the tiles so the grid stays clear of the card
+        room = self._area().w - 2 * ui.CARD_MARGIN  # narrow world areas shrink the tiles
         bw = min(100, (room - (cols + 1) * PAD) // cols)
         bh = min(104, (self.H - 2 * ui.CARD_MARGIN - HEADER_H - rows * PAD) // rows)
         panel = self._centered(cols * (bw + PAD) + PAD, HEADER_H + rows * (bh + PAD))
@@ -1262,45 +1279,34 @@ class Editor:
         return ws
 
     def _place_buttons(self):
-        """Undo / Finish / Redo while placing, or Done while picking objects to go around: a row in the info card
-        (real screen px), or under the hint box while the HUD is hidden (UI px)."""
-        if self.show_card:
-            pause = self._card_layout()[1]
-            gap, bh = HUD.px(BTN_GAP), HUD.px(CARD_BTN_H)
-            x0, y, total = pause.x, pause.bottom + gap, HUD.CARD_WIDTH - 2 * HUD.CARD_PAD
-        else:
-            box = self._hint_box()
-            gap, bh = BTN_GAP, CARD_BTN_H
-            total = 3 * 60 + 2 * gap
-            x0, y = box.centerx - total // 2, box.bottom + gap
-        if self.stage == "select":
+        """The Controls card's action row (real screen px): Undo / Finish / Redo while placing, Done while picking
+        objects to go around, else Undo / Finish / Redo disabled (the row keeps its place, so nothing moves)."""
+        row = self._card_layout().action
+        gap = HUD.px(BTN_GAP)
+        if self.active and self.stage == "select" and self.relation == "around":
             label = f"Done ({len(self.selection)} picked)"
-            return [(pygame.Rect(x0, y, total, bh), self.done_selecting, ("button", label, bool(self.selection), not self.selection))]
-        bw = (total - 2 * gap) // 3
-        rects = [pygame.Rect(x0 + i * (bw + gap), y, bw if i < 2 else total - 2 * (bw + gap), bh) for i in range(3)]
+            return [(row, self.done_selecting, ("button", label, bool(self.selection), not self.selection))]
+        bw = (row.w - 2 * gap) // 3
+        rects = [pygame.Rect(row.x + i * (bw + gap), row.y, bw if i < 2 else row.w - 2 * (bw + gap), row.h) for i in range(3)]
+        if not self._placing():
+            return [(r, None, ("button", label, False, True)) for r, label in zip(rects, ("Undo", "Finish", "Redo"))]
         return [(rects[0], self.undo, ("button", "Undo", False, not self.undo_stack)),
                 (rects[1], self.finish, ("button", "Finish", self._complete(), False)),
                 (rects[2], self.redo, ("button", "Redo", False, not self.redo_stack))]
 
     def _card_widgets(self):
-        """(rect, action or None, draw spec) on the info card, in real screen px."""
-        if not self.show_card:
-            return []
-        rect, pause, plus, compute, _ = self._card_layout()
+        """(rect, action or None, draw spec) on the Controls card, in real screen px, then the whole sidebar as a
+        blocker: clicks anywhere in it (other cards handle theirs first, see main_opengl) never reach the world."""
+        lay = self._card_layout()
         can_edit = self.paused and not self.active
-        ws = [(pause, self.toggle_pause, ("pause",)), (plus, self.open if can_edit else None, ("plus", not can_edit)),
-              (compute, self.toggle_compute, ("compute",))]
-        if self._row_shown():
-            ws += self._place_buttons()
-        ws.append((rect, None, ("blocker",)))  # the rest of the card swallows clicks (no grabs / points under it)
-        if self.show_compute and self.compute_card is not None:
-            ws.append((self.compute_card, None, ("blocker",)))  # and so does the compute card
-        if self.gravity_card is not None:
-            ws.append((self.gravity_card, None, ("blocker",)))  # and the gravity selector (gravity_dial.py)
+        ws = [(lay.pause, self.toggle_pause, ("pause",)), (lay.plus, self.open if can_edit else None, ("plus", not can_edit)),
+              (lay.compute, self.toggle_compute, ("compute",))]
+        ws += self._place_buttons()
+        ws.append((self.sidebar, None, ("blocker",)))
         return ws
 
     def _panel_widgets(self):
-        """(rect, action or None, draw spec) for the editor's panels and buttons (not the info card), in UI px."""
+        """(rect, action or None, draw spec) for the editor's panels and buttons (not the sidebar), in UI px."""
         if not self.active:
             return []
         ws = []
@@ -1326,12 +1332,10 @@ class Editor:
                 ws.append((rect, lambda c=name, k=key: cfg.__setitem__(k, c), ("swatch", name, cfg[key] == name)))
             for rect, mode, label in lay["modes"]:
                 ws.append((rect, lambda m=mode: self.start_place(m), ("button", label, False, False)))
-        elif self._row_shown() and not self.show_card:
-            ws += self._place_buttons()
         return ws
 
     def _hit(self, screen_pos):
-        """The clickable widget under a real screen position, (rect, action, spec), or None. The info card (screen px)
+        """The clickable widget under a real screen position, (rect, action, spec), or None. The sidebar (screen px)
         comes first, then the panels (UI px)."""
         for widget in self._card_widgets():
             if widget[0].collidepoint(screen_pos):
@@ -1651,52 +1655,38 @@ class Editor:
 
     # ---------------- Drawing: UI surface
     def draw_info_card(self, surface, mouse_px, origin=(0, 0)):
-        """The first card of the top-right column, at native resolution (ui_style.HUD): pause/play, editor and compute
-        toggle buttons plus every hotkey and its state. mouse_px: the mouse in real screen px; origin: the surface's
-        top-left in real screen px (the HUD layer's rect.topleft, or (0, 0) for the screen itself). Returns the card's
-        rect on `surface`; the next card goes at rect.bottom + ui_style.HUD.CARD_GAP."""
+        """The sidebar's first card, at native resolution (ui_style.HUD): pause/play, editor and compute buttons, the
+        action row, then every hotkey and its state, in sections. mouse_px: the mouse in real screen px; origin: the
+        surface's top-left in real screen px (the sidebar layer's rect.topleft, or (0, 0) for the screen itself).
+        Returns the card's rect on `surface`."""
         ox, oy = origin
-        screen_rect, *_, lines_y = self._card_layout()
-        rows, line_h = self._card_rows(lines_y)
-        rect, lines_y = screen_rect.move(-ox, -oy), lines_y - oy
+        lay = self._card_layout()
+        rect = lay.card.move(-ox, -oy)
         HUD.draw_frame(surface, rect)
-        px, pad = HUD.px, HUD.CARD_PAD
+        px, pad, line_h = HUD.px, HUD.CARD_PAD, HUD.px(KEY_LINE_H)
         HUD.text(surface, "Controls", (rect.x + pad, rect.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
         for area, _, spec in self._card_widgets():
             if spec[0] != "blocker":
                 self._draw_widget(surface, area.move(-ox, -oy), spec, area.collidepoint(mouse_px), HUD)
-        for i, row in enumerate(rows):
-            y = lines_y + i * line_h + line_h // 2
-            if len(row) == 2:
-                self._draw_hotkey_pair(surface, rect, row, y)
+        for kind, y, data in lay.rows:
+            y -= oy
+            if kind == "section":  # small dim title, then a rule to the card's right edge
+                mid = y + px(SECTION_H) // 2 + px(1)
+                t = HUD.text(surface, data.upper(), (rect.x + pad, mid), ui.TEXT_DIM, "bold", HUD.px(SECTION_SIZE), valign="middle")
+                surface.fill(ui.BUTTON, (t.right + px(4), mid, rect.right - pad - t.right - px(4), px(1)))
                 continue
-            key, label, state, usable = row[0]
+            key, label, state, usable = data
+            y += line_h // 2
             dim = ui.TEXT_DIM if not usable else None
-            HUD.text(surface, key, (rect.x + pad, y), dim or ui.WHITE, "bold", valign="middle")
-            HUD.text(surface, label, (rect.x + pad + px(KEY_COL_W), y), dim or ui.TEXT, valign="middle")
+            k = HUD.text(surface, key, (rect.x + pad, y), dim or ui.WHITE, "bold", valign="middle")
+            x = max(rect.x + pad + px(KEY_COL_W), k.right + px(4))  # a key wider than the column pushes its label right
+            HUD.text(surface, label, (x, y), dim or ui.TEXT, valign="middle")
             if state is not None:
                 HUD.text(surface, state, (rect.right - pad, y), dim or ui.ACCENT, "bold", align="right", valign="middle")
         return rect
 
-    @staticmethod
-    def _draw_hotkey_pair(surface, rect, row, y):
-        """Two hotkeys in one card row: the first from the key column's left edge, the second from the card's
-        middle (or right after the first if that's wider), each as key, label, state."""
-        px, pad = HUD.px, HUD.CARD_PAD
-        x = rect.x + pad
-        for n, (key, label, state, usable) in enumerate(row):
-            if n == 1:
-                x = max(x + px(3 * PAIR_GAP), rect.centerx)
-            dim = ui.TEXT_DIM if not usable else None
-            for text, col, style in ((key, ui.WHITE, "bold"), (label, ui.TEXT, "regular"), (state, ui.ACCENT, "bold")):
-                if text is None:
-                    continue
-                HUD.text(surface, text, (x, y), dim or col, style, valign="middle")
-                x += HUD.font(style).size(text)[0] + px(PAIR_GAP)
-            x -= px(PAIR_GAP)
-
     def draw_ui(self, surface, mouse_ui):
-        """Panels, buttons and hints (not the info card or the message). Call before the HUD cards."""
+        """Panels, buttons and hints (not the sidebar or the message). Call before the sidebar."""
         if self.active and self.stage in ("menu", "config"):
             surface.blit(self._dim, (0, 0))
             panel = self._menu_layout()[0] if self.stage == "menu" else self._config_layout()["panel"]
@@ -1712,12 +1702,12 @@ class Editor:
         self.scenes.draw(surface, mouse_ui)  # the save / open dialog, over everything else
 
     def draw_message(self, surface, origin=(0, 0)):
-        """The current message in large bold debug_red, centred left of the card column (shrunk to fit there) so it
-        never covers the cards' text. Call last (over everything else; see HudLayer.overlay). origin: the target
-        surface's top-left in UI px."""
+        """The current message in large bold debug_red, centred in the world area (shrunk to fit there) so it never
+        covers the sidebar. Call last (over everything else; see HudLayer.overlay). origin: the target surface's
+        top-left in UI px."""
         if not (self.message and time.time() < self.message_until):
             return
-        area = self._area()  # left of the card column (the whole surface while the HUD is hidden): never over card text
+        area = self._area()  # the world area: never over the sidebar
         size = next((s for s in range(MESSAGE_SIZE, ui.TEXT_SIZE, -1) if ui.font("bold", s).size(self.message)[0] <= area.w - 16),
                     ui.TEXT_SIZE)
         cx, cy = area.centerx - origin[0], self.H // 2 - origin[1]
@@ -1781,7 +1771,7 @@ class Editor:
         surface.blit(card, box.topleft)
 
     def _draw_widget(self, surface, area, spec, hovered, st=ui.UI):
-        """st: the ui_style.Style the widget is drawn in (HUD for the info card's buttons)."""
+        """st: the ui_style.Style the widget is drawn in (HUD for the Controls card's buttons)."""
         kind = spec[0]
         if kind == "swatch":
             name, selected = spec[1], spec[2]
