@@ -29,7 +29,7 @@ Objects ("units"): a body (not a wall), a rope, a hook, or a whole chain (its bo
   settings would build it (a chain is laid out straight again, its segment count fitted to the ends like the settings
   panel does; it keeps its chain_id, colours and rope stiffness; a rope keeps its slack), and validated like spawning:
   a rejected drag shows red and snaps back, a rejected toggle doesn't happen.
-Every change calls before_world_change(label) first (world-level undo).
+Every change calls Editor.before_world_change(label) first: one world undo step (Z / X while paused).
 """
 import copy
 import math
@@ -115,10 +115,6 @@ class SelectionTools:
         self.edit_drag = None  # {"pose", "start", "new", "valid", "moved"}
         self.band = None  # [start wp, current wp, additive]
         self.end_drag = None  # {"line": see _line, "i": end index, "start", "ends": new ends, "valid", "moved"}
-
-    def before_world_change(self, label):
-        """Called right before any edit that changes the world (spawn, delete, move, paste, rotate, load...), so a
-        world-level undo can snapshot it. A no-op until that undo exists."""
 
     def _editing(self):
         """Selection editing is on while paused with the spawn editor closed."""

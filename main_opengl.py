@@ -363,10 +363,11 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            if session.handle_event(event):  # W, the Worlds card and the world selector panel (may switch worlds)
-                world, editor = session.world, session.editor
+            if editor.scenes.state is None and session.handle_event(event):  # W, the Worlds card and panel
+                world, editor = session.world, session.editor  # (may switch worlds)
                 continue
-            if gravity_dial.handle_event(event):  # arrow / 0 / numpad keys, and clicks on the gravity card
+            # arrow / 0 / numpad keys, and clicks on the gravity card (not while the modal save / open dialog is up)
+            if editor.scenes.state is None and gravity_dial.handle_event(event):
                 continue
             if editor.handle_event(event):  # the Controls card, the rest of the sidebar, editor panels and placement
                 continue
