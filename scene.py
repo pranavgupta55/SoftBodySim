@@ -79,21 +79,24 @@ class ViewConfig:
 INSET = 5  # the world box walls sit this many world units in from each edge
 
 
-def add_world_box(world, world_width, world_height, inset=INSET):
-    """World box: four 2-point fixed walls (segments) sitting `inset` in from each edge, recorded in world.walls."""
-    corners = [(inset, inset), (world_width - inset, inset), (world_width - inset, world_height - inset), (inset, world_height - inset)]
+def add_world_box(world, width, height, inset, col=Endesga.greyD):
+    """STAND-IN for looping.add_world_box (same signature, minus ext): world.bounds and four 2-point fixed walls
+    `inset` in from each edge, kept in world.walls; sides already looping get no wall."""
+    world.bounds = (0.0, 0.0, float(width), float(height))
+    corners = [(inset, inset), (width - inset, inset), (width - inset, height - inset), (inset, height - inset)]
     for side, k in zip(("top", "right", "bottom", "left"), range(4)):
-        wall = FixedBody(np.array([corners[k], corners[(k + 1) % 4]]).T, point_col=Endesga.greyD, stick_col=Endesga.greyD,
-                         point_radius=1, stick_width=2, fill_col=Endesga.greyD)
-        world.add(wall)
+        wall = FixedBody(np.array([corners[k], corners[(k + 1) % 4]]).T, point_col=col, stick_col=col,
+                         point_radius=1, stick_width=2, fill_col=col)
         world.walls[side] = wall
+        if not world.looping[side]:
+            world.add(wall)
 
 
 def build_scene(world_width, world_height, inset=INSET):
     """Test scene: world box, ground platform, rigid square, soft pentagon and dodecagons, ropes and a hollow box."""
     world_center = [world_width / 2, world_height / 2]
     world = World()
-    add_world_box(world, world_width, world_height, inset)
+    add_world_box(world, world_width, world_height, inset, col=Endesga.greyD)
     ground_top = world_height - 40
     ground_thickness = 6
     world.add(FixedBody(rect_points(world_center[0], ground_top + ground_thickness / 2, world_width * 0.5, ground_thickness),

@@ -113,10 +113,10 @@ def _drop_bodies(world_width, world_height, inset, cols):
 
 def build_blank(world_width, world_height):
     """A completely blank world: just the four world box walls."""
-    from scene import add_world_box
+    from scene import Endesga, INSET, add_world_box
     world = World()
-    add_world_box(world, world_width, world_height)
     _set_looping(world, ())
+    add_world_box(world, world_width, world_height, INSET, col=Endesga.greyD)
     return world
 
 
@@ -125,23 +125,24 @@ def build_random_walls(world_width, world_height, seed=0, bodies=True):
     rigid bodies along the top that fall through them."""
     from scene import Endesga, INSET, add_world_box
     world = World()
-    add_world_box(world, world_width, world_height)
+    _set_looping(world, ())
+    add_world_box(world, world_width, world_height, INSET, col=Endesga.greyD)
     for seg in random_wall_segments(world_width, world_height, seed=seed, inset=INSET):
         world.add(FixedBody(seg.T, point_radius=2, stick_width=2, **_style(Endesga.steel_grey)))
     if bodies:
         cols = [Endesga.cream, Endesga.debug_red, Endesga.network_green, Endesga.sky_blue, Endesga.orchid]
         for body in _drop_bodies(world_width, world_height, INSET, cols):
             world.add(body)
-    _set_looping(world, ())
     return world
 
 
 def build_looping(world_width, world_height):
     """No walls and every side looping: a few bodies fall forever (reaching terminal velocity), some drifting
     sideways so the left / right wrap shows too."""
-    from scene import Endesga, INSET
+    from scene import Endesga, INSET, add_world_box
     world = World()
     _set_looping(world, SIDES)
+    add_world_box(world, world_width, world_height, INSET, col=Endesga.greyD)  # bounds; no walls, every side loops
     cols = [Endesga.cream, Endesga.debug_red, Endesga.network_green, Endesga.sky_blue, Endesga.orchid]
     drift = [-150.0, 0.0, 120.0, -60.0, 200.0]  # px/s sideways
     for body, vx in zip(_drop_bodies(world_width, world_height, INSET, cols), drift):
