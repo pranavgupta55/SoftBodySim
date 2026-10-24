@@ -35,6 +35,16 @@ GRAPH_H = 44  # base px
 SMALL = 8  # base font size for graph labels and legend
 
 
+def ms(v, unit=True):
+    """A time given in ms, short enough that a slow frame's numbers still fit beside each other on the card: one
+    decimal below 100 ms, whole ms below 1 s, else seconds ("2.5 s"). unit=False drops " ms" (the avg / max pair, whose
+    unit is implied), but seconds keep their "s"."""
+    if v >= 999.5:
+        return f"{v / 1e3:.1f} s" if unit else f"{v / 1e3:.1f}s"
+    text = f"{v:.1f}" if v < 99.95 else f"{v:.0f}"
+    return f"{text} ms" if unit else text
+
+
 class PerfHUD:
     def __init__(self, profiler):
         self.prof = profiler
@@ -87,8 +97,10 @@ class PerfHUD:
 
         # time between frames: newest frame, then the window's mean and worst
         last = prof.last.wall * 1e3 if prof.last else 0.0
-        self._text(surface, f"{last:.1f} ms", (x0, y))
-        self._text(surface, f"avg {st['frame'] * 1e3:.1f}  max {st['frame_max'] * 1e3:.0f}", (x1, y), color=ui.TEXT_DIM, align="right")
+        self._text(surface, ms(last), (x0, y))
+        worst = st["frame_max"] * 1e3
+        avg, worst = ms(st["frame"] * 1e3, False), (f"{worst:.0f}" if worst < 999.5 else ms(worst, False))
+        self._text(surface, f"avg {avg}  max {worst}", (x1, y), color=ui.TEXT_DIM, align="right")
         y += line
 
         # CPU / GPU / idle per frame (3 s means)
@@ -102,7 +114,7 @@ class PerfHUD:
                 self._text(surface, "no GPU backend", (x1, y), color=ui.TEXT_DIM, align="right")
             else:
                 self._text(surface, f"{st[key] / frame * 100:.0f}%", (x1, y), color=ui.TEXT_DIM, align="right")
-                self._text(surface, f"{st[key] * 1e3:.1f} ms", (x1 - px(30), y), align="right")  # room for "100%"
+                self._text(surface, ms(st[key] * 1e3), (x1 - px(30), y), align="right")  # room for "100%"
             y += line
         y += px(3)
 

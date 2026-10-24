@@ -7,15 +7,18 @@ instead of three pygame.transform.scale calls and blits on the CPU. The HUD card
 small layer covering just the card column (hud_layer.py); only its used rows are uploaded, to their own texture, and
 drawn as a blended quad over the composite (shaders/hud.frag), in both modes. While the editor places a hook, its peg
 grid overlay (peg_layer.py, native resolution) is drawn the same way between the two (shaders/pegs.frag); it's
-uploaded only when it changes.
+uploaded only when it changes. The gravity selector (gravity_dial.py, bottom-left) is another small native-res layer,
+drawn last with the HUD shader and uploaded only when it changes.
 
     python3 main_opengl.py                      fullscreen, GPU compositing
     python3 main_opengl.py --window 1280x800    windowed
+    python3 main_opengl.py --scene diamonds     a preset scene (scene.PRESETS; default "default")
     python3 main_opengl.py --basic              the Framework pipeline as-is: layers composited on the CPU into one
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
-GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, P pause, ESC quit.
+GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, T motion trails, P pause,
+numpad 1-9 gravity (direction = numpad layout, 5 = off/on), ESC quit.
 
 Timing: the compute card's "present" section is split into upload / render / gpu wait / flip. "gpu wait" is a
 GPU-tagged section around ctx.finish(): the time the CPU blocks until the GPU has finished this frame's texture
@@ -33,11 +36,13 @@ from collections import namedtuple
 import moderngl
 import pygame
 
-from scene import Endesga, ViewConfig, INSET, build_scene
+from scene import Endesga, ViewConfig, INSET, PRESETS
 from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
 from perf_hud import PerfHUD
 from hud_layer import HudLayer
+from trails import Trails
+from gravity_dial import GravityDial
 import ui_style
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
@@ -134,6 +139,13 @@ class GLPresenter:
             self.hud_prog["u_origin"].value = (hud.rect.x * hud_scale, hud.rect.y * hud_scale)
             self.hud_rows = 0  # rows uploaded this frame
         self.peg_tex, self.peg_version = None, None  # the peg overlay's texture (made on first use) and its version
+        # small native-res overlays (the gravity selector): the HUD shader with its own uniforms, a texture per layer
+        self.overlay_prog = load_shader(ctx, "basic.vert", "hud.frag")
+        self.overlay_vao = ctx.vertex_array(self.overlay_prog, [(self.quad, "2f 8x", "in_vert")])
+        self.overlay_prog["u_hud"].value = 0
+        self.overlay_prog["u_scale"].value = hud_scale
+        self.overlay_prog["u_fb_height"].value = fb_size[1]
+        self.overlays = {}  # id(layer) -> [texture, uploaded version]
         self.peg_prog = load_shader(ctx, "basic.vert", "pegs.frag")
         self.peg_vao = ctx.vertex_array(self.peg_prog, [(self.quad, "2f 8x", "in_vert")])
         self.peg_prog["u_pegs"].value = 0
@@ -209,6 +221,32 @@ class GLPresenter:
         self.peg_vao.render(mode=moderngl.TRIANGLE_STRIP)
         ctx.disable(moderngl.BLEND)
 
+    def render_overlay(self, layer):
+        """Blend a small native-res layer over the frame: anything with `surface`, `rect` (window px), `visible` and
+        `version` (e.g. gravity_dial.GravityDial). Its surface is re-uploaded only when `version` changed."""
+        if layer is None or not layer.visible:
+            return
+        entry = self.overlays.get(id(layer))
+        if entry is None or entry[0].size != layer.surface.get_size():
+            tex = self.ctx.texture(layer.surface.get_size(), 4)
+            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            tex.swizzle = surface_swizzle(layer.surface)
+            entry = self.overlays[id(layer)] = [tex, None]
+        tex = entry[0]
+        if entry[1] != layer.version:
+            self._write(tex, layer.surface)
+            entry[1] = layer.version
+        ctx, (fb_w, fb_h), k, rect = self.ctx, self.fb_size, self.hud_scale, layer.rect
+        x0, y0, x1, y1 = round(rect.x * k), round(rect.y * k), round(rect.right * k), round(rect.bottom * k)
+        self.overlay_prog["u_origin"].value = (rect.x * k, rect.y * k)
+        ctx.viewport = (x0, fb_h - y1, x1 - x0, y1 - y0)
+        ctx.enable(moderngl.BLEND)
+        ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        tex.use(location=0)
+        self.overlay_vao.render(mode=moderngl.TRIANGLE_STRIP)
+        ctx.disable(moderngl.BLEND)
+        ctx.viewport = (0, 0, fb_w, fb_h)
+
     def upload_hud(self):
         """Upload the HUD layer's used rows (the top `hud.used` rows; texture row 0 is the surface's top row)."""
         hud = self.hud
@@ -247,6 +285,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--window", help="windowed mode at WxH screen px instead of fullscreen, e.g. 1280x800")
     parser.add_argument("--basic", action="store_true", help="the Framework pipeline: CPU composite, one texture")
+    parser.add_argument("--scene", default="default", choices=sorted(PRESETS), help="preset scene to start with")
     args = parser.parse_args(argv)
 
     pygame.init()
@@ -280,12 +319,18 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
 
     # The world is measured in its own units; the render surfaces above are its size times the zoom
     world_width, world_height = screen_width / ViewConfig.zoom, screen_height / ViewConfig.zoom
-    world = build_scene(world_width, world_height)
+    world = PRESETS[args.scene](world_width, world_height)
     editor = Editor(world, Endesga, (screen_width, screen_height), (world_width, world_height), scaleDownFactor, INSET,
                     ViewConfig.zoom, view=ViewConfig, screen_size=display.window_size)
     profiler = Profiler()
     world.profiler = profiler
     perf_hud = PerfHUD(profiler)
+    trails = Trails()  # T: fading paths behind moving bodies, drawn under them
+    gravity_dial = GravityDial(display.window_size, scaleDownFactor)  # bottom-left gravity selector, native res (numpad 1-9 too)
+
+    def dial_shown():
+        """The gravity selector shows with the HUD (SPACE), but not over the editor's modal menu / settings panels."""
+        return toggle and not (editor.active and editor.stage in ("menu", "config"))
 
     def draw_top(surface, origin=(0, 0)):
         """What goes over the HUD cards, at UI-surface px minus origin: the editor message and the cursor."""
@@ -322,6 +367,10 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            gravity_dial.visible = dial_shown()
+            editor.gravity_card = gravity_dial.rect if gravity_dial.visible else None
+            if gravity_dial.handle_event(event):  # numpad keys, and clicks on the selector (swallowed)
+                continue
             if editor.handle_event(event):  # info card buttons, editor panels and placement come first
                 continue
             if event.type == pygame.MOUSEBUTTONDOWN:
@@ -340,15 +389,22 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     ViewConfig.show_grid = not ViewConfig.show_grid
                 if event.key == pygame.K_v:
                     ViewConfig.filled = not ViewConfig.filled
+                if event.key == pygame.K_t:
+                    ViewConfig.trails = not ViewConfig.trails
 
         # ---------------- Updating Screen
         profiler.switch("physics")
         world.drag_to((wx, wy))
-        if not editor.paused:
+        stepped = not editor.paused
+        if stepped:
             world.step(dt / fps)  # dt is in frames here, World wants seconds
         profiler.switch("draw")
         if ViewConfig.show_grid:
             world.draw_grid(screen2, zoom=ViewConfig.zoom)
+        with profiler.section("trails"):
+            trails.set_enabled(ViewConfig.trails)
+            trails.update(world, dt / fps, stepped)
+            trails.draw(screen2, zoom=ViewConfig.zoom)  # under the bodies
         world.draw(screen2, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
         editor.draw_world(screen2, screenT, (mx, my))
         editor.draw_ui(screenUI, (mx, my))  # panels, buttons and hints, under the HUD cards
@@ -366,6 +422,10 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 hud.add(compute_card)
                 editor.compute_card = compute_card.move(hud.rect.topleft)  # screen px, so it swallows clicks
             hud.overlay(draw_top)  # message + cursor stay on top of the cards
+        gravity_dial.visible = dial_shown()
+        editor.gravity_card = gravity_dial.rect if gravity_dial.visible else None
+        if gravity_dial.visible:
+            gravity_dial.draw(pygame.mouse.get_pos(), draw_top)  # redraws its surface only when the hover / direction changed
 
         # ---------------- Present: textures -> one shader pass (+ the HUD quad) -> swap
         profiler.switch("present")
@@ -378,6 +438,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
             presenter.render_pegs(editor.peg_layer())  # native-res peg grid while placing a hook
             with profiler.section("hud"):
                 presenter.render_hud()
+                presenter.render_overlay(gravity_dial)
         if MEASURE_GPU:
             with profiler.section("gpu wait", device="gpu"):
                 ctx.finish()

@@ -28,7 +28,7 @@ class EnvConfig:
     grab_radius = 15.0  # px; how close the cursor must be to a point to pick it up
     grab_stiffness = 0.3  # fraction of the gap to the cursor closed per substep
     grab_max_step = 4.0  # px; max pull per substep
-    peg_spacing = 10.0  # world units (= screen px at the default zoom); hooks snap to a grid of pegs this far apart, aligned to the world origin
+    peg_spacing = 15.0  # world units (= screen px at the default zoom); hooks snap to a grid of pegs this far apart, aligned to the world origin
     # "cpu": all physics in numpy (fastest for small scenes). "gpu": broad phases + PBD solves on the Apple GPU via
     # MLX, exact CCD still float64 on the CPU (gpu_backend.py); faster from roughly 600 points (M4). Read in World.add.
     backend = "gpu"
