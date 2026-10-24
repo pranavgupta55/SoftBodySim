@@ -46,8 +46,21 @@ FORMAT = "softbodysim-scene"
 VERSION = 1
 SCENES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scenes")
 HISTORY_LIMIT = 64  # world undo snapshots kept (oldest dropped first)
-DEFAULT_ENV = {"gravity": [float(v) for v in EnvConfig.gravity], "friction": float(EnvConfig.friction),
-               "damping": float(EnvConfig.damping)}  # applied when a preset (which has no env of its own) is loaded
+ENV_SCALARS = ("friction", "damping", "terminal_velocity")  # EnvConfig settings a scene stores (with gravity)
+
+
+def current_env():
+    """The scene-wide EnvConfig settings: gravity (as set by the gravity selector), friction, damping and terminal
+    velocity (when this build has it; None = no limit)."""
+    env = {"gravity": [float(v) for v in EnvConfig.gravity]}
+    for name in ENV_SCALARS:
+        if hasattr(EnvConfig, name):
+            v = getattr(EnvConfig, name)
+            env[name] = None if v is None else float(v)
+    return env
+
+
+DEFAULT_ENV = current_env()  # applied when a preset (which has no env of its own) is loaded
 _KINDS = ((SoftBody, "soft"), (RigidBody, "rigid"), (FixedBody, "fixed"), (Body, "body"))
 _CLASSES = {"soft": SoftBody, "rigid": RigidBody, "fixed": FixedBody, "body": Body}
 BODY_EXTRAS = ("restitution", "wall_side")  # optional per-body settings (numbers / strings), saved when present
@@ -450,8 +463,10 @@ def apply_env(env):
     if g.shape != (2,) or not np.isfinite(g).all():
         raise SceneError("malformed scene (gravity)")
     EnvConfig.gravity[:] = g  # in place: the gravity selector (gravity_dial.py) edits this same array
-    EnvConfig.friction = float(env["friction"])
-    EnvConfig.damping = float(env["damping"])
+    for name in ENV_SCALARS:  # a setting the file lacks (older file) goes back to its default
+        if hasattr(EnvConfig, name):
+            v = env.get(name, DEFAULT_ENV.get(name))
+            setattr(EnvConfig, name, None if v is None else float(v))
 
 
 def load_data(world, data, box, view=None):
@@ -460,8 +475,8 @@ def load_data(world, data, box, view=None):
     parsed = parse(data, box)
     env = data.get("env", DEFAULT_ENV)
     try:
-        env = {"gravity": [float(v) for v in env["gravity"]][:2], "friction": float(env["friction"]),
-               "damping": float(env["damping"])}
+        env = {"gravity": [float(v) for v in env["gravity"]][:2],
+               **{k: (None if env[k] is None else float(env[k])) for k in ENV_SCALARS if k in env}}
     except (KeyError, TypeError, ValueError):
         raise SceneError("malformed scene (env)") from None
     install(world, *parsed)
@@ -547,11 +562,6 @@ def snapshot_bytes(snap):
             if "anchor" in e:
                 total += e["anchor"].nbytes
     return total
-
-
-def current_env():
-    return {"gravity": [float(v) for v in EnvConfig.gravity], "friction": float(EnvConfig.friction),
-            "damping": float(EnvConfig.damping)}
 
 
 class WorldHistory:
