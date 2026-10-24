@@ -24,7 +24,7 @@ class EnvConfig:
     peg_spacing = 10.0  # world units (= screen px at the default zoom); hooks snap to a grid of pegs this far apart, aligned to the world origin
     # "cpu": all physics in numpy (fastest for small scenes). "gpu": broad phases + PBD solves on the Apple GPU via
     # MLX, exact CCD still float64 on the CPU (gpu_backend.py); faster from roughly 600 points (M4). Read in World.add.
-    backend = "cpu"
+    backend = "gpu"
 
 
 def rect_points(cx, cy, w, h):
