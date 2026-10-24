@@ -35,7 +35,7 @@ AUTO_CPU_POINTS = 650
 def _backend_kind(world):
     """"cpu" or "gpu": this world's backend setting (world.env, else EnvConfig.backend), with "auto" decided from the
     scene. Scenes GpuBackend.pbd_substep can't run (ropes, custom predict / solve_constraints, no edges) are "cpu"."""
-    kind = world.env.get("backend", EnvConfig.backend)
+    kind = getattr(world, "env", {}).get("backend", EnvConfig.backend)
     if kind != "auto":
         return kind
     if world.ropes or world.solo_bodies or not world.batched_predict or world.edges.shape[1] == 0:
