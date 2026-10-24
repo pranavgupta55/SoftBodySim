@@ -21,4 +21,20 @@ Deep-research program on simulation speed and accuracy for this machine (started
 
 ## Ranked build plans
 
-(Filled in after cycle 1.)
+Ranked by expected gain for the risk, across all ten cycle 1 reports. "Exact" means results stay bit-identical to today.
+
+| Rank | Build | Source | Expected gain | Risk |
+|---|---|---|---|---|
+| 1 | numba port of the CPU solver loops (exact) | 05 | 4.5-13x CPU physics; beats the GPU backend at every measured size | low |
+| 2 | Default backend: CPU (numba) instead of GPU, or auto by scene size | 09, 05 | removes the ~2 ms/frame fixed GPU cost on every shipped preset | low |
+| 3 | Frame-level CCD and contact broad phase (`ccd_stride`), per-second grab settings | 01, 02 F7 | -30-50% CPU physics; makes small steps cheap | low-medium |
+| 4 | Fat-box cached pair list, and fix the latent `_cell_pairs` IndexError | 03 | 25-35% CPU, ~2x GPU broad phase | low |
+| 5 | Robust float64 CCD root (closes the endpoint-miss hole) and an inelastic fallback | 02 | correctness | low |
+| 6 | Small-steps default (8x1, then 16x1) | 01, 10 F8 | better energy, stretch and stacking accuracy | medium (pile-drag fallbacks) |
+| 7 | XPBD springs (mass-splitting Jacobi, Rayleigh damping) and shape-matching shape memory | 01, 06 | soft materials stop depending on the schedule; no flattening | low |
+| 8 | Shared contact scale (momentum fix), rigid-aware ropes, per-body sleeping | 10, 07 | up to 31% momentum loss fixed; chain stretch and jitter fixed | low-medium |
+| 9 | Draw-path optimisation | 09 | drawing is a top hotspot | low |
+| 10 | Pipelined physics worker process | 08 | ~1.3x end to end | medium |
+| 11 | GPU: CCD pair set built on the GPU, all substeps in one command buffer | 04, 01 | 1.8-3x on piles (GPU path only) | medium |
+
+Every build is gated on research 10's benchmark (`compare.py`) and the brute-force overlap checker staying at 0.
