@@ -203,6 +203,10 @@ class Editor:
         self.show_card = True  # the main loop mirrors its HUD toggle (SPACE) here: a hidden card takes no clicks
         self.show_compute = True  # F / the card's [f] button: the main loop draws the compute card only while set
         self.compute_card = None  # its rect (real screen px), set by the main loop when drawn: clicks on it are swallowed
+        # set by the main loop, for the info card's states: debug_overlay.DebugOverlays (keys 1-4) and
+        # timectl.TimeControl ([ / ] speed, N frame step); None leaves those rows without a state
+        self.overlays = None
+        self.time = None
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
         # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
@@ -248,6 +252,11 @@ class Editor:
             self.paused = not self.paused
             if self.paused:
                 self.world.release()
+
+    def can_frame_step(self):
+        """N steps one physics frame while paused: with the editor closed or on its spawn menu / settings panel, not
+        while picking objects or placing points (those are validated against where the bodies are now)."""
+        return self.paused and not (self.active and self.stage in ("select", "place"))
 
     def open(self):
         self.active, self.stage = True, "menu"
@@ -849,6 +858,9 @@ class Editor:
     def _hotkeys(self):
         """(key, what it does, current state or None, usable now) for every hotkey, as listed on the info card."""
         placing = self._placing()
+        # speed and frame stepping don't apply while picking objects / placing points (physics is paused and N is
+        # off), so those two rows make room for that stage's button row
+        picking = self.active and self.stage in ("select", "place")
         v = self.view
         grid = None if v is None else ("on" if v.show_grid else "off")
         look = None if v is None else ("filled" if v.filled else "points")
@@ -860,7 +872,10 @@ class Editor:
                 ("Z", "undo", None, placing and bool(self.undo_stack)),
                 ("X", "redo", None, placing and bool(self.redo_stack)),
                 ("ESC", "back" if self.active else "quit", None, True),
-                ("drag", "grab bodies", None, not self.paused)]
+                ("drag", "grab bodies", None, not self.paused),
+                ("1-4", "overlays", None if self.overlays is None else self.overlays.state(), True)] + ([] if picking else [
+                ("[ ]", "speed", None if self.time is None else self.time.label(), True),
+                ("N", "step frame", None, self.can_frame_step())])
 
     def _menu_layout(self):
         n, cols = len(KIND_TITLES), MENU_COLS

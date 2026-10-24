@@ -15,7 +15,8 @@ uploaded only when it changes.
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
-GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, P pause, ESC quit.
+GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, P pause, ESC quit, 1-4 debug
+overlays (debug_overlay.py), [ / ] physics speed 0.25x-2x and N one physics frame while paused (timectl.py).
 
 Timing: the compute card's "present" section is split into upload / render / gpu wait / flip. "gpu wait" is a
 GPU-tagged section around ctx.finish(): the time the CPU blocks until the GPU has finished this frame's texture
@@ -38,12 +39,15 @@ from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
 from perf_hud import PerfHUD
 from hud_layer import HudLayer
+from debug_overlay import DebugOverlays
+from timectl import TimeControl
 import ui_style
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
 FPS = 60
 SCALE_DOWN = 2  # real screen px per render surface px
 GHOST_ALPHA = 100  # opacity of the translucent ghost layer (screenT)
+OVERLAY_LEGEND_PX = 6  # the debug overlay legend's top-left corner, UI px in from the top-left of the screen
 MEASURE_GPU = True  # ctx.finish() before the flip so the compute card can show GPU time
 
 # ---------------- moderngl plumbing
@@ -286,6 +290,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     profiler = Profiler()
     world.profiler = profiler
     perf_hud = PerfHUD(profiler)
+    overlays = DebugOverlays()  # keys 1-4
+    time_ctl = TimeControl()  # [ / ] physics speed, N frame step
+    editor.overlays, editor.time = overlays, time_ctl
 
     def draw_top(surface, origin=(0, 0)):
         """What goes over the HUD cards, at UI-surface px minus origin: the editor message and the cursor."""
@@ -340,17 +347,37 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     ViewConfig.show_grid = not ViewConfig.show_grid
                 if event.key == pygame.K_v:
                     ViewConfig.filled = not ViewConfig.filled
+                if pygame.K_1 <= event.key <= pygame.K_4:
+                    overlays.toggle(event.key - pygame.K_1)
+                if event.key == pygame.K_LEFTBRACKET:
+                    time_ctl.slower()
+                if event.key == pygame.K_RIGHTBRACKET:
+                    time_ctl.faster()
+                if event.key == pygame.K_n and editor.can_frame_step():
+                    time_ctl.request_step()
 
         # ---------------- Updating Screen
         profiler.switch("physics")
         world.drag_to((wx, wy))
+        overlays.attach(world)  # World.debug: a step recorder while overlay 2 or 4 is on, else None
+        # dt is in frames here, World wants seconds; the time scale applies to the physics only (timectl.py)
         if not editor.paused:
-            world.step(dt / fps)  # dt is in frames here, World wants seconds
+            world.step(*time_ctl.step_args(dt / fps))
+            overlays.after_step(world)
+        for _ in range(time_ctl.take_steps() if editor.paused else 0):  # N: one nominal frame per press
+            world.step(*time_ctl.step_args(1 / fps))
+            overlays.after_step(world)
+        time_ctl.pending = 0  # a step requested just before resuming is dropped
         profiler.switch("draw")
         if ViewConfig.show_grid:
             world.draw_grid(screen2, zoom=ViewConfig.zoom)
         world.draw(screen2, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
+        if overlays.any():
+            with profiler.section("overlays"):
+                overlays.draw(screen2, world, ViewConfig.zoom)
         editor.draw_world(screen2, screenT, (mx, my))
+        if toggle and overlays.any():
+            overlays.draw_legend(screenUI, world, (OVERLAY_LEGEND_PX, OVERLAY_LEGEND_PX))
         editor.draw_ui(screenUI, (mx, my))  # panels, buttons and hints, under the HUD cards
 
         profiler.switch("ui")

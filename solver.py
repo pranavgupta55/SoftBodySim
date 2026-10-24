@@ -39,6 +39,9 @@ class World:
         self.zone_count = 0  # how many substeps needed the rigid impact zone fallback (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
         self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend)
+        # Optional debug recorder (debug_overlay.StepRecorder), set only while an overlay needs solver data. It is
+        # told about each step's CCD hits and impact zone points; None (the default) costs one attribute check
+        self.debug = None
 
     def add(self, body, index=None):
         """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
@@ -175,11 +178,16 @@ class World:
         """A profiler timing section, or a shared no-op context when no profiler is attached."""
         return _NO_SECTION if self.profiler is None else self.profiler.section(name)
 
-    def step(self, dt):
-        dt = min(dt, EnvConfig.max_dt)
-        h = dt / EnvConfig.substeps
+    def step(self, dt, substeps=None, max_dt=None):
+        """Advance dt seconds (clamped to max_dt) in `substeps` equal substeps. substeps / max_dt default to
+        EnvConfig's; slow motion (timectl.py) passes smaller ones, so the substep length stays the same."""
+        dt = min(dt, EnvConfig.max_dt if max_dt is None else max_dt)
+        n = EnvConfig.substeps if substeps is None else substeps
+        h = dt / n
         sec = self._section
-        for _ in range(EnvConfig.substeps):
+        if self.debug is not None:
+            self.debug.begin_step(self)
+        for _ in range(n):
             if self.backend is None or not self.backend.pbd_substep(h):  # False: the backend can't run this scene
                 self._pbd_substep(h)
             self.V[:] = (self.P - self.PREV) / h
@@ -511,6 +519,8 @@ class World:
             pairs = self._ccd_pairs(D, cells)
         with sec("narrow+impulses"):
             hits = self._ccd_detect(D, pairs)
+        if self.debug is not None:
+            self.debug.ccd_hits(self, hits, D)
         fresh = True  # V hasn't changed since the broad phase
         for _ in range(EnvConfig.ccd_passes):
             if hits[0].size == 0:
@@ -533,6 +543,8 @@ class World:
                     hits = self._ccd_detect(D, pairs)
                 if hits[0].size == 0:
                     return
+                if self.debug is not None:
+                    self.debug.ccd_hits(self, hits, D)
             with sec("narrow+impulses"):
                 V_before = V.copy()
                 self._ccd_impulses(*hits, h)
@@ -619,6 +631,8 @@ class World:
             roots = np.array([find(x) for x in range(n_pts)])
             for root in np.unique(roots[pts]):
                 members = np.flatnonzero(roots == root)
+                if self.debug is not None:
+                    self.debug.zone_points(self, members)
                 if (W[members] == 0).any():  # touching something fixed: the zone holds still this substep
                     V[:, members] = 0.0
                     continue
@@ -632,3 +646,5 @@ class World:
             if not merged:
                 break  # collisions inside a rigid zone can only be rounding; stop everything below
         V[:, W > 0] = 0.0  # last resort: no motion this substep, i.e. the (valid) start positions
+        if self.debug is not None:
+            self.debug.zone_points(self, np.flatnonzero(W > 0))
