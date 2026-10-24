@@ -39,7 +39,8 @@ other agents loaded the machine. They are ~15x slower than P-core numbers, so re
      `TAU = 1e-6 px` of the *clamped* segment at that time, instead of testing `0 <= s <= 1` exactly.
      - Results: 0 false negatives in 16,500 adversarial cases, 0 far false positives. All remaining FPs are within
        1e-6 px of an edge, so they are harmless.
-     - It is identical to the current code on 127 real snapshots (96 hits).
+     - It gives the same hit sets as the current code on 127 real snapshots (96 hits) and at every call of a whipped
+       pile200 run. It is not bit-identical: the roots differ in the last bits.
      - It is 17% faster, because the collapsing-edge exception and its per-edge pass go away.
 3. **The impact-zone fallbacks that do fire (47/2,400 substeps in research-10's aggressive `ccd_demo`) are one
    chronic GS ping-pong, not missed physics.**
@@ -268,8 +269,53 @@ How the inelastic projection works (Harmon, Vouga, Tamstorf, Grinspun 2008,
 
 ### F5. End-to-end checker runs of the candidates
 
-(pending: robust detect alone and robust + projection on `ccd_demo` and `random walls`; Harmon 16 rounds / small
-target)
+All runs: CPU, research-10's independent checker on every substep, random whip from 1 s (`zones.py`).
+
+| variant | scene | overlaps / checks | min gap px | zones | substeps with hits | notes |
+|---|---|---|---|---|---|---|
+| base | ccd_demo (10 s) | 0 / 2400 | 0.0213 | 47 | 145 | |
+| robust detect | ccd_demo | 0 / 2400 | 0.0213 | 47 | 145 | every statistic identical to base |
+| robust + projection | ccd_demo | 0 / 2400 | 0.0213 | **6** | 115 | |
+| projection, 16 rounds | ccd_demo | 0 / 2400 | 0.0213 | 6 | 115 | the round count is not the limit |
+| projection, target 0.2 x push | ccd_demo | 0 / 2400 | 0.0213 | 8 | 99 | a smaller target doesn't help |
+| base | random walls (10 s) | 0 / 2400 | 2.07 | 0 | 48 | |
+| robust / robust + projection | random walls | 0 / 2400 | 2.07 | 0 | 48 | identical to base |
+| base | pile200 (4 s) | 0 / 960 | 0.0116 | 0 | 641 | |
+| robust + projection | pile200 | 0 / 960 | 0.0248 | 0 | 641 | trajectory diverges (see below) |
+
+- **Why pile200 diverges.** A side-by-side check over the same run (`diverge.py`) found the robust and current hit
+  sets identical at every call. The divergence comes from the stable roots differing from the naive ones in the last
+  bits, which feeds through t and s into the impulses, and a whipped pile is chaotic.
+  - So the robust detect makes the same *decisions*, but it is not bit-identical.
+  - Judge it on research-10's aggregate metrics, as 10 already prescribes for 05's FMA case.
+- **The 6 leftover projection failures** don't respond to more rounds or a smaller target. Likely causes:
+  - the fixed (s, n) linearization of a constraint whose edge rotates fast inside the wedge;
+  - resetting only zone members to their pre-CCD velocities while neighbours keep their impulse-pass velocities.
+
+  Worth a day of tuning in the build, e.g. re-linearizing s and n each round, or evaluating normals at the TOI as
+  Harmon does ("the gradients we use are evaluated at the time of collision"). RIZ still catches them.
+
+### F7. What frame-level CCD (01, 04 F7) would face, measured from the CCD side
+
+01 and 04 propose running CCD once per frame on the start -> end chord instead of per substep. The CCD-side risk:
+the chord can cut corners that the 4 substep paths went around, which would add hits. `chord.py` runs the normal sim
+and, after every frame, tests the chord of the already-valid frame motion with the same `_ccd_detect` (fresh broad
+phase):
+
+| scene | frames | per-substep CCD hits (PBD proposals) | chord hits of the valid frame motion | p99 max point displacement / frame |
+|---|---|---|---|---|
+| default, no drag | 600 | 0 | 0 | 11.7 px |
+| default, whip | 600 | 157 | 1 (1 frame) | 17.1 px |
+| diamonds | 92 (looping frames skipped) | 79 | 0 | 16.7 px |
+| pile200, whip | 240 | 1479 | 4 (3 frames) | 16.8 px |
+
+- Chord corner-cutting is negligible: 0-4 hits per run. The chord's deviation from the substep path, R(1 - cos(θ/2))
+  for spin θ per frame, stays far below the 3 px contact skin unless bodies spin faster than ~40 rad/s.
+- So frame-level CCD should face about the per-substep hit count, or fewer, since PBD gets 4 substeps to undo a
+  proposal before anything is checked.
+- With 4x longer sweeps, though, each hit is resolved with a 4x longer h. GS ping-pong cases (F4) would then freeze
+  4 substeps' worth of motion at once. That makes the projection fallback (and the robust endpoint test, with 4x
+  longer paths) more valuable once 01 lands.
 
 ### F6. Smaller items (literature + reasoning; not prototyped)
 
@@ -345,7 +391,9 @@ target)
     - identical results on real snapshots.
   - Risk: TAU too small. Real root errors are <= 1.5e-10 px, so 1e-6 has 4 orders of margin. FPs within 1e-6 px get
     a 0.25 px push, which is harmless and very rare.
-  - Determinism: end states can change only where the old and new tests disagree, which no benchmark showed.
+  - Determinism: the hit sets matched the old test at every call in every run. The stable roots still differ in the
+    last bits, so chaotic scenes (whipped pile200) end in different but equally valid states (F5). Not
+    bit-identical.
 - **Inelastic projection fallback.**
   - Gains:
     - `ccd_demo` zones 47 -> 6, with no fallback energy loss;
@@ -366,9 +414,75 @@ target)
 | CCD friction + split impulse | ~25 | 0.5 + accuracy-suite tuning |
 | rigid-aware projection (with 07) | ~60 more | 1-2 |
 
+## Cross-links and contradictions
+
+- **10.** My earlier "zones never fire" was true only for gentler drags. 10's `ccd_demo` fires 47. F4 shows all 47
+  are one chronic wedge configuration in a crushed soft 12-gon, which explains why 10's variant C and 07's A2 (both
+  PBD-side changes that crush bodies less) take them to 0.
+- **03 / 04.** Pair-list reuse (03) and the GPU-verified box set (04 F3) are the speed items for CCD. F2
+  independently confirms 03, with bit-identical end states. 04 notes that a global max-displacement rule is nearly
+  useless for *contacts* in moving piles. That matches my drag result (348 rebuilds / 480) and is why 03 adds motion
+  look-ahead.
+- **05.** The robust detect must be ported into 05's numba narrow phase together, or the two will disagree.
+  04 measured a compressed 1000-body pile with 66-127 hits per substep, where `_ccd_impulses` and the redetects
+  dominate (25.6 of 44 ms). There 05's numba impulses are the fix. The projection fallback is also a Python loop and
+  would need the same port if such states became common.
+- **06.** 06 notes that un-folding a soft body may require an outline point to cross an outline edge, which CCD
+  forbids. F4 is that situation in the wild. Its cause is that `_filter_pairs(contact=True)` leaves neighbour edges
+  to CCD alone. A soft-body-side fix would let PBD see point i vs edges (i+1, i+2) / (i-2, i-1) when the angle at the
+  shared vertex is sharp. That is 06's area.
+- **07.** A3's rigid projection fights per-point impulses (28 zones in a 100:1 stack). Doing the rigid projection
+  inside the inelastic-projection LCP in reduced coordinates is the clean version (F4).
+- **01.** F7: chord corner-cutting is negligible, and the projection fallback matters more under frame-level CCD.
+
 ## Build plan
 
-(Final ranking after F5 lands.)
+Ranked. All four can be prototyped in parallel worktrees. Gate every one with research-10's suite:
+
+```
+taskpolicy -b .venv/bin/python3 /private/tmp/claude-501/research-10/bench/run_bench.py --code <worktree> --skip-perf --jobs 6
+compare.py base_acc.json new.json
+```
+
+Rules: no FAIL; `overlap_substeps` = 0 everywhere. My scripts in `/private/tmp/claude-501/research-02/` (`zones.py`,
+`robust.py`, `detect_bench.py`) take `REPO=<worktree>` (or edit the path).
+
+1. **Robust float64 point-edge test** (highest value per line of code).
+   - *Change:* `solver.py` `_ccd_detect` as in "Applicability" item 1, plus `EnvConfig.ccd_tau = 1e-6`. Reference:
+     `variants.robust`.
+   - *Success:*
+     - `robust.py` shows 0 FN across all families (seeds 0, 1, 7; N >= 2000) and 0 far FPs;
+     - research-10 suite: 0 overlaps, aggregate metrics within noise. Bit-identical end states are *not* expected
+       (last-bit root differences, F5);
+     - `_ccd_detect` >= 10% faster (`detect_bench.py`).
+   - *Expected gain:* closes a real (if tiny) hole in the guarantee; removes spurious collapsing-edge hits; -17%
+     narrow phase.
+   - *Risk:* very low. *Effort:* 0.5 day. Coordinate with whoever builds 05's numba narrow phase.
+2. **Inelastic-projection fallback before RIZ** (Harmon 2008).
+   - *Change:* new `World._inelastic_zones(h)` between the impulse passes and `_impact_zones`; save pre-CCD
+     velocities in `_resolve_ccd`. Reference: `make_harmon` in `zone_variants.py`. Then try TOI-time normals and
+     re-linearizing s and n each round, to close the last 6 failures.
+   - *Success:*
+     - `ccd_demo` zone fallbacks 47 -> <= 6 (stretch: 0) with no overlaps;
+     - fallback KE removal ~0;
+     - `ccd_demo` wall time not worse;
+     - accuracy suite unchanged, since the fallback is inactive elsewhere.
+   - *Expected gain:* no locked creases or frozen sliding when the fallback triggers. It also becomes the host for
+     07's rigid-aware CCD.
+   - *Risk:* low (RIZ remains the terminating last resort). *Effort:* 1-2 days.
+3. **Friction + split impulse in `_ccd_impulses`** (Bridson 2002 sec. 7.3; split impulse).
+   - *Change:* about 25 lines in `_ccd_impulses`; the split part also touches the end of the substep loop in
+     `_step`.
+   - *Success:* research-10 `collisions` (dP, dL), `stacks` jitter and `cradle` transfer not worse; a new
+     "fast slide into a wall" check shows tangential speed reduced by mu x dv_n; 0 overlaps.
+   - *Expected gain:* small today (rare hits), larger under frame-level CCD.
+   - *Risk:* low (velocity-only, re-verified). *Effort:* 0.5-1 day.
+4. **Pair-list reuse for CCD.** Build 03's fat-box list rather than my CCD-only certificate (F2).
+   - *Success:* CCD ms/frame down >= 2.5x at rest (demo, pile200); 0 overlaps; bit-identical end states in rest
+     scenes.
+   - Listed so the CCD owner knows it is the cost lever, not something to build twice. Effort is in 03.
+
+Not recommended: IPC barriers, global conservative advancement, exact root-parity CCD, edge-edge CCD (F6).
 
 ## Sources
 
