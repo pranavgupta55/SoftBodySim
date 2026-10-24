@@ -15,7 +15,10 @@ uploaded only when it changes.
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
-GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, P pause, ESC quit.
+GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, P pause, W worlds, ESC quit.
+
+Worlds: `session` (world_selector.WorldSession) holds the Custom world and the preset worlds; `world` and `editor`
+are always its active world and that world's editor (rebound whenever the selector switches or resets a world).
 
 Timing: the compute card's "present" section is split into upload / render / gpu wait / flip. "gpu wait" is a
 GPU-tagged section around ctx.finish(): the time the CPU blocks until the GPU has finished this frame's texture
@@ -33,11 +36,12 @@ from collections import namedtuple
 import moderngl
 import pygame
 
-from scene import Endesga, ViewConfig, INSET, build_scene
+from scene import Endesga, ViewConfig, INSET, PRESETS
 from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
 from perf_hud import PerfHUD
 from hud_layer import HudLayer
+from world_selector import WorldSession
 import ui_style
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
@@ -280,11 +284,16 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
 
     # The world is measured in its own units; the render surfaces above are its size times the zoom
     world_width, world_height = screen_width / ViewConfig.zoom, screen_height / ViewConfig.zoom
-    world = build_scene(world_width, world_height)
-    editor = Editor(world, Endesga, (screen_width, screen_height), (world_width, world_height), scaleDownFactor, INSET,
-                    ViewConfig.zoom, view=ViewConfig, screen_size=display.window_size)
     profiler = Profiler()
-    world.profiler = profiler
+
+    def make_editor(w):
+        return Editor(w, Endesga, (screen_width, screen_height), (world_width, world_height), scaleDownFactor, INSET,
+                      ViewConfig.zoom, view=ViewConfig, screen_size=display.window_size)
+
+    # Custom (the default scene at launch, kept for the session) + the presets; only the active world steps, and it
+    # alone has the profiler attached (the session moves it)
+    session = WorldSession(PRESETS, (world_width, world_height), make_editor, profiler)
+    world, editor = session.world, session.editor
     perf_hud = PerfHUD(profiler)
 
     def draw_top(surface, origin=(0, 0)):
@@ -322,6 +331,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            if session.handle_event(event):  # W / the world selector panel (may switch the active world)
+                world, editor = session.world, session.editor
+                continue
             if editor.handle_event(event):  # info card buttons, editor panels and placement come first
                 continue
             if event.type == pygame.MOUSEBUTTONDOWN:
@@ -352,6 +364,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         world.draw(screen2, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
         editor.draw_world(screen2, screenT, (mx, my))
         editor.draw_ui(screenUI, (mx, my))  # panels, buttons and hints, under the HUD cards
+        session.draw(screenUI, (mx, my))  # the world selector panel (W), over the editor's panels
 
         profiler.switch("ui")
         if toggle:

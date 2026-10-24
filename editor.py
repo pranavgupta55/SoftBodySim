@@ -203,6 +203,7 @@ class Editor:
         self.show_card = True  # the main loop mirrors its HUD toggle (SPACE) here: a hidden card takes no clicks
         self.show_compute = True  # F / the card's [f] button: the main loop draws the compute card only while set
         self.compute_card = None  # its rect (real screen px), set by the main loop when drawn: clicks on it are swallowed
+        self.world_selector = None  # world_selector.WorldSession: adds the World button and W to the card when set
         self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         self._dim.fill((0, 0, 0, 140))
         # the peg grid overlay, at native screen resolution (drawn by the main loop over the composite)
@@ -825,11 +826,26 @@ class Editor:
         if self._row_shown():  # Undo / Finish / Redo (or Done) row under the pause / edit / compute buttons
             lines_y += bh + gap
         rect = HUD.card_rect(self.screen_w, top, lines_y + len(self._hotkeys()) * px(LINE_H) + pad - px(1) - top)
-        bw = (rect.w - 2 * pad - 2 * gap) // 3
-        pause = pygame.Rect(rect.x + pad, buttons_y, bw, bh)
-        plus = pygame.Rect(pause.right + gap, buttons_y, bw, bh)
-        compute = pygame.Rect(plus.right + gap, buttons_y, rect.right - pad - plus.right - gap, bh)
+        if self.world_selector is None:
+            bw = (rect.w - 2 * pad - 2 * gap) // 3
+            widths = [bw, bw]
+        else:  # a fourth button ([w], the world selector): each button its content's width plus an equal share
+            labels = ("[p]", "edit", "[f]", "[w]")
+            content = [HUD.font("bold").size(t)[0] + px(12) for t in labels]  # icon (8) + gap (4) + label
+            spare = (rect.w - 2 * pad - 3 * gap - sum(content)) // 4
+            widths = [c + spare for c in content[:3]]
+        pause = pygame.Rect(rect.x + pad, buttons_y, widths[0], bh)
+        plus = pygame.Rect(pause.right + gap, buttons_y, widths[1], bh)
+        right = rect.right - pad if self.world_selector is None else plus.right + gap + widths[2]
+        compute = pygame.Rect(plus.right + gap, buttons_y, right - plus.right - gap, bh)
         return rect, pause, plus, compute, lines_y
+
+    def _world_button(self):
+        """The info card's [w] button (real screen px), right of [f]; None without a world selector."""
+        if self.world_selector is None:
+            return None
+        rect, _, _, compute, _ = self._card_layout()
+        return pygame.Rect(compute.right + HUD.px(BTN_GAP), compute.y, rect.right - HUD.CARD_PAD - compute.right - HUD.px(BTN_GAP), compute.h)
 
     def _placing(self):
         return self.active and self.stage == "place"
@@ -860,7 +876,16 @@ class Editor:
                 ("Z", "undo", None, placing and bool(self.undo_stack)),
                 ("X", "redo", None, placing and bool(self.redo_stack)),
                 ("ESC", "back" if self.active else "quit", None, True),
-                ("drag", "grab bodies", None, not self.paused)]
+                ("drag", "grab bodies", None, not self.paused)] + self._world_hotkeys()
+
+    def _world_hotkeys(self):
+        sel = self.world_selector
+        if sel is None:
+            return []
+        name, room = sel.name, HUD.CARD_WIDTH - 2 * HUD.CARD_PAD - HUD.px(KEY_COL_W) - HUD.font().size("worlds ")[0]
+        while len(name) > 1 and HUD.font("bold").size(name)[0] > room:  # the active world's name, cut to fit
+            name = name.rstrip(".")[:-1].rstrip() + ".."
+        return [("W", "worlds", name, True)]
 
     def _menu_layout(self):
         n, cols = len(KIND_TITLES), MENU_COLS
@@ -1006,6 +1031,10 @@ class Editor:
               (compute, self.toggle_compute, ("compute",))]
         if self._row_shown():
             ws += self._place_buttons()
+        world_btn = self._world_button()
+        if world_btn is not None:
+            sel = self.world_selector
+            ws.append((world_btn, sel.toggle, ("worlds",)))
         ws.append((rect, None, ("blocker",)))  # the rest of the card swallows clicks (no grabs / points under it)
         if self.show_compute and self.compute_card is not None:
             ws.append((self.compute_card, None, ("blocker",)))  # and so does the compute card
@@ -1374,6 +1403,9 @@ class Editor:
             self._icon_button(surface, st, area, hovered, self._draw_plus_icon, "edit", disabled=spec[1])
         elif kind == "compute":  # selected (lit) while the compute card is shown
             self._icon_button(surface, st, area, hovered, self._draw_chart_icon, "[f]", selected=self.show_compute)
+        elif kind == "worlds":  # selected (lit) while the world selector panel is open
+            self._icon_button(surface, st, area, hovered, self._draw_worlds_icon, "[w]",
+                              selected=self.world_selector.open)
         elif kind == "kind":
             ui.draw_button(surface, area, None, hovered)
             self._draw_kind_icon(surface, spec[1], area)
@@ -1402,6 +1434,13 @@ class Editor:
         px = st.px
         pygame.draw.rect(surface, col, (cx - px(4), cy - px(1), px(9), px(2)))
         pygame.draw.rect(surface, col, (cx - px(1), cy - px(4), px(2), px(9)))
+
+    @staticmethod
+    def _draw_worlds_icon(surface, st, cx, cy, col):
+        """Two stacked frames: several worlds."""
+        px = st.px
+        pygame.draw.rect(surface, col, (cx - px(2), cy - px(5), px(7), px(7)), px(1))
+        pygame.draw.rect(surface, col, (cx - px(5), cy - px(2), px(7), px(7)))
 
     @staticmethod
     def _draw_chart_icon(surface, st, cx, cy, col):

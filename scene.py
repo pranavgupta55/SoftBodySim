@@ -125,3 +125,6 @@ def build_scene(world_width, world_height, inset=INSET):
     world.add(SoftBody(polygon_points(box_cx, box_cy, 20, 12), stiffness=hexagon_stiffness, skip_sets=2,
                        point_col=Endesga.network_red, stick_col=Endesga.very_light_blue, point_radius=3))
     return world
+
+
+PRESETS = {"default": build_scene}
