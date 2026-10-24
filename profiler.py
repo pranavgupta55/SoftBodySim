@@ -45,7 +45,7 @@ A backend finds the profiler as `world.profiler` (None when nothing is profiling
 How a frame is split: GPU time is assumed to have blocked the CPU (true for both recipes above), so it is taken out
 of the enclosing CPU sections. Frame wall time = cpu + gpu + idle, where cpu also holds untracked loop time; if a
 backend adds GPU time that overlapped CPU work, cpu is clamped at 0. Until any GPU time is reported, `gpu_seen` is
-False and the card says "no GPU backend".
+False and the card says "not in use".
 """
 from collections import deque, namedtuple
 from time import perf_counter

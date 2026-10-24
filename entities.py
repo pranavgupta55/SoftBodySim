@@ -38,8 +38,9 @@ class EnvConfig:
     grab_max_speed = 960.0  # px/s; fastest the hand pulls a point (4 px per 1/240 s substep)
     peg_spacing = 15.0  # world units (= screen px at the default zoom); hooks snap to a grid of pegs this far apart, aligned to the world origin
     # "cpu": all physics in numpy (fastest for small scenes). "gpu": broad phases + PBD solves on the Apple GPU via
-    # MLX, exact CCD still float64 on the CPU (gpu_backend.py); faster from roughly 600 points (M4). Read in World.add.
-    backend = "gpu"
+    # MLX, exact CCD still float64 on the CPU (gpu_backend.py). "auto": each World picks from its scene (point count,
+    # ropes) whenever bodies / ropes change, with hysteresis (solver.AUTO_GPU_POINTS). A world's env can override it.
+    backend = "auto"
     # True: the CPU physics' hot paths run as numba kernels (solver_jit.py), bit-identical to the numpy code and
     # several times faster; ignored (numpy) when numba can't be imported. Per world via World.env like the rest.
     jit = True

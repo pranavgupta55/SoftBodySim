@@ -269,6 +269,7 @@ def draw_sidebar(hud, editor, perf_hud, mouse_px, draw_top):
     """The sidebar for this frame: every card at native resolution (hud.cards, in order), then the cursor on top.
     mouse_px: the mouse in window px; draw_top(surface, origin): the main loop's message + cursor drawer."""
     perf_hud.collapsed = not editor.show_compute  # F / [f]: the Compute card as its short summary
+    perf_hud.world = editor.world  # its backend label
     hud.draw(mouse_px)
     hud.overlay(draw_top)
 

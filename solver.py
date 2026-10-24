@@ -18,15 +18,42 @@ def _jit():
     return EnvConfig.jit and solver_jit.enabled()
 
 
+# EnvConfig.backend = "auto": a world runs on the GPU once it has AUTO_GPU_POINTS movable points (inverse mass > 0),
+# and goes back to the CPU only below AUTO_CPU_POINTS (hysteresis, so spawning / deleting near the line doesn't flip
+# it). Re-measured 2026-10-24 with the numba CPU path (solver_jit.py) and frame-level CCD on both backends, Apple M4
+# (10-core GPU), world 2244x1440, physics ms/frame CPU / GPU (best of 2 interleaved runs, 120 frames from 0.5 s in;
+# fluidN = the fluid preset with N hexagons):
+#   random walls 35 movable pts 0.55 / 2.16, fluid30 114 0.68 / 2.11, fluid60 324 1.12 / 2.23, fluid100 528
+#   1.55 / 2.63, fluid150 774 2.16 / 2.40, diamonds 840 4.15 / 3.27, fluid450 2478 9.5 / 4.4, fluid1000 5766
+#   45.6 / 11.4, fluid2000 11592 191 / 44
+# The GPU has a ~2 ms floor per frame; it pulls ahead between ~780 and ~840 movable points and wins 2-4x on big
+# scenes. (The first numpy-vs-GPU measurement put the line at 900: dense piles crossed at ~550, diamonds lost.)
+AUTO_GPU_POINTS = 800
+AUTO_CPU_POINTS = 650
+
+
+def _backend_kind(world):
+    """"cpu" or "gpu": this world's backend setting (world.env, else EnvConfig.backend), with "auto" decided from the
+    scene. Scenes GpuBackend.pbd_substep can't run (ropes, custom predict / solve_constraints, no edges) are "cpu"."""
+    kind = world.env.get("backend", EnvConfig.backend)
+    if kind != "auto":
+        return kind
+    if world.ropes or world.solo_bodies or not world.batched_predict or world.edges.shape[1] == 0:
+        return "cpu"
+    limit = AUTO_CPU_POINTS if world.backend is not None else AUTO_GPU_POINTS  # hysteresis: stay where it is
+    return "gpu" if np.count_nonzero(world.W) >= limit else "cpu"
+
+
 def _make_backend(world):
-    """Helper object for EnvConfig.backend: None runs everything in this file ("cpu"), "gpu" moves the broad
-    phases and the PBD solves to the Apple GPU (gpu_backend.py)."""
-    if EnvConfig.backend == "cpu":
+    """Helper object for the world's backend (_backend_kind): None runs everything in this file ("cpu"), "gpu" moves
+    the broad phases and the PBD solves to the Apple GPU (gpu_backend.py)."""
+    kind = _backend_kind(world)
+    if kind == "cpu":
         return None
-    if EnvConfig.backend == "gpu":
+    if kind == "gpu":
         from gpu_backend import GpuBackend
         return GpuBackend(world)
-    raise ValueError(f"unknown EnvConfig.backend {EnvConfig.backend!r}, expected 'cpu' or 'gpu'")
+    raise ValueError(f"unknown backend {kind!r}, expected 'auto', 'cpu' or 'gpu'")
 
 
 def _outline_gap(a, b):
@@ -58,7 +85,7 @@ class World:
         self.grab_target = np.zeros(2)
         self.zone_count = 0  # how many CCD passes needed the rigid impact zone fallback (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
-        self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend)
+        self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend); re-picked on every repack
         # Looping (looping.py): a body that fully leaves `bounds` through a looping side re-enters through the opposite
         # one, same other coordinate and velocities. Done between frames, never inside a substep's CCD-checked motion.
         # Change it with set_looping, which also removes / re-adds that side's wall.
@@ -99,15 +126,16 @@ class World:
 
     def add_rope(self, rope):
         self.ropes.append(rope)
+        self._recheck_backend()
 
     def add_hook(self, hook):
         self.hooks.append(hook)
 
     def add_chain(self, chain):
-        """An entities.Chain: its boxes (one repack) and then its ropes, in order along the chain."""
+        """An entities.Chain: its boxes and then its ropes, in order along the chain (one repack)."""
         self.bodies.extend(chain.bodies)
-        self._rebuild()
         self.ropes.extend(chain.ropes)
+        self._rebuild()
 
     # ---------------- Editing (the editor's select / delete / paste, while paused; separate from step)
     def add_many(self, bodies=(), ropes=(), hooks=()):
@@ -117,6 +145,8 @@ class World:
         self.hooks.extend(hooks)
         if bodies:
             self._rebuild()
+        elif ropes:
+            self._recheck_backend()
 
     def remove(self, bodies=(), ropes=(), hooks=()):
         """Remove bodies, ropes and hooks (by identity); ropes attached to a removed body or hook go too. One repack.
@@ -136,6 +166,8 @@ class World:
             self.bodies = [b for b in self.bodies if id(b) not in gone_b]
             self.grabbed = None
             self._rebuild()
+        else:
+            self._recheck_backend()
 
     def remove_body(self, body):
         self.remove(bodies=[body])
@@ -179,6 +211,11 @@ class World:
         self.bounce_bodies = [k for k, b in enumerate(bodies) if b.restitution > 0 and (b.inv_mass > 0).all()]
         self._pack_constraints()
         self.backend = _make_backend(self)
+
+    def _recheck_backend(self):
+        """After a change that doesn't repack (ropes added / removed): switch backends only if the kind changed."""
+        if self.bodies and (_backend_kind(self) == "gpu") != (self.backend is not None):
+            self.backend = _make_backend(self)
 
     def _pack_constraints(self):
         """Gather the bodies whose constraints World solves in one batch (stock SoftBody springs, RigidBody shape
