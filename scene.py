@@ -1,4 +1,4 @@
-"""Shared setup for the entry points (main_screen.py and main_opengl.py): palette, view settings and the test scene.
+"""Shared setup for main_opengl.py: palette, view settings and the test scene.
 
 Importing this module has no side effects beyond defining things (no display, no game loop).
 """

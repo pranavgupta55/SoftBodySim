@@ -1,12 +1,14 @@
 """Real-time compute card: FPS, frame time, CPU / GPU / idle split and a scrolling per-frame bar chart (last 3 s).
 
-Drawn in the top-right card column (ui_style), under the info card. Timings come from a profiler.Profiler; see that
-module for the timing and GPU-reporting API.
+Drawn in the top-right card column under the info card, at native resolution on the HUD layer (hud_layer.py) with
+ui_style.HUD metrics (every length below is in base px, times HUD_SCALE). Timings come from a profiler.Profiler; see
+that module for the timing and GPU-reporting API.
 
 Bar chart: one stacked bar per frame, newest on the right, scrolling left. A bar's height is that frame's time
 between frames, stacked bottom-up as CPU work (physics / draw / other), GPU time and idle wait, so it sums to the
-frame time. The x axis is time (3 s across the graph), so at 60 fps a frame gets ~0.8 px: when several frames share
-a pixel column the slowest one is drawn (spikes never disappear); at low fps a frame spans several columns. The y
+frame time. The x axis is time (3 s across the graph, one native px per column), so at 60 fps and HUD_SCALE 2 a
+frame gets ~1.6 px: when several frames share a pixel column the slowest one is drawn (spikes never disappear); at
+low fps a frame spans several columns. The y
 scale is the smallest of SCALES_MS that fits the slowest frame in the window, with a reference line at 16.7 ms.
 """
 from collections import deque
@@ -14,6 +16,8 @@ from collections import deque
 import pygame
 
 import ui_style as ui
+
+H = ui.HUD  # card style at native resolution
 
 # stacked segments, bottom to top: (key, legend label, color)
 SEGMENTS = (
@@ -27,8 +31,8 @@ SEG_COL = {key: col for key, _, col in SEGMENTS}
 DRAW_SECTIONS = ("draw", "ui", "present")  # top-level main-loop sections counted as "draw"
 SCALES_MS = (100 / 3, 50, 200 / 3, 100, 200, 500, 1000)
 REF_MS = 1000 / 60
-GRAPH_H = 44
-SMALL = 8  # font size for graph labels and legend
+GRAPH_H = 44  # base px
+SMALL = 8  # base font size for graph labels and legend
 
 
 class PerfHUD:
@@ -38,13 +42,13 @@ class PerfHUD:
         self._segs = deque()  # (frame end, segment seconds) for each frame in prof.frames, in the same order
 
     # ---------------- text (cached: most strings repeat frame to frame)
-    def _text(self, surface, string, pos, color=ui.TEXT, style="regular", size=ui.TEXT_SIZE, align="left"):
+    def _text(self, surface, string, pos, color=ui.TEXT, style="regular", size=H.TEXT_SIZE, align="left"):
         key = (string, color, style, size)
         img = self._text_cache.get(key)
         if img is None:
             if len(self._text_cache) > 512:
                 self._text_cache.clear()
-            img = self._text_cache[key] = ui.font(style, size).render(string, False, color)
+            img = self._text_cache[key] = H.font(style, size).render(string, False, color)
         r = img.get_rect()
         setattr(r, {"left": "topleft", "right": "topright"}[align], pos)
         surface.blit(img, r)
@@ -61,22 +65,25 @@ class PerfHUD:
 
     # ---------------- card
     def draw(self, surface, top):
-        """Draw the card in the top-right column starting at y = `top`; returns its rect (for the next card)."""
-        prof = self.prof
+        """Draw the card in the top-right column of `surface` starting at y = `top`; returns its rect (for the next
+        card). Sizes follow ui_style.HUD (native-resolution px)."""
+        prof, px = self.prof, H.px
         st = prof.stats()
-        line = ui.font().get_linesize()
-        small_line = ui.font(size=SMALL).get_linesize()
-        pad = ui.CARD_PAD
-        height = pad + line + 1 + line + 3 * line + 3 + small_line + GRAPH_H + 1 + small_line + pad - 2
-        rect = ui.card_rect(surface.get_width(), top, height)
-        ui.draw_frame(surface, rect)
+        small = px(SMALL)
+        line = H.font().get_linesize()
+        small_line = H.font(size=small).get_linesize()
+        pad = H.CARD_PAD
+        graph_h = px(GRAPH_H)
+        height = pad + line + px(1) + line + 3 * line + px(3) + small_line + graph_h + px(1) + small_line + pad - px(2)
+        rect = H.card_rect(surface.get_width(), top, height)
+        H.draw_frame(surface, rect)
         x0, x1 = rect.left + pad, rect.right - pad
-        y = rect.top + pad - 1
+        y = rect.top + pad - px(1)
 
         # title + fps
-        self._text(surface, "Compute", (x0, y), style="bold", size=ui.TITLE_SIZE)
-        self._text(surface, f"{st['fps']:.0f} fps", (x1, y), color=ui.ACCENT, style="bold", size=ui.TITLE_SIZE, align="right")
-        y += line + 1
+        self._text(surface, "Compute", (x0, y), style="bold", size=H.TITLE_SIZE)
+        self._text(surface, f"{st['fps']:.0f} fps", (x1, y), color=ui.ACCENT, style="bold", size=H.TITLE_SIZE, align="right")
+        y += line + px(1)
 
         # time between frames: newest frame, then the window's mean and worst
         last = prof.last.wall * 1e3 if prof.last else 0.0
@@ -87,30 +94,36 @@ class PerfHUD:
         # CPU / GPU / idle per frame (3 s means)
         frame = st["frame"] or 1.0
         for label, key, col in (("CPU", "cpu", SEG_COL["physics"]), ("GPU", "gpu", SEG_COL["gpu"]), ("idle", "idle", SEG_COL["idle"])):
-            pygame.draw.rect(surface, col, (x0, y + 4, 6, 6))
-            pygame.draw.rect(surface, ui.BLACK, (x0, y + 4, 6, 6), 1)
-            self._text(surface, label, (x0 + 9, y))
+            swatch = (x0, y + px(4), px(6), px(6))
+            pygame.draw.rect(surface, col, swatch)
+            pygame.draw.rect(surface, ui.BLACK, swatch, px(1))
+            self._text(surface, label, (x0 + px(9), y))
             if key == "gpu" and not prof.gpu_seen:
                 self._text(surface, "no GPU backend", (x1, y), color=ui.TEXT_DIM, align="right")
             else:
                 self._text(surface, f"{st[key] / frame * 100:.0f}%", (x1, y), color=ui.TEXT_DIM, align="right")
-                self._text(surface, f"{st[key] * 1e3:.1f} ms", (x1 - 26, y), align="right")
+                self._text(surface, f"{st[key] * 1e3:.1f} ms", (x1 - px(30), y), align="right")  # room for "100%"
             y += line
-        y += 3
+        y += px(3)
 
-        # legend
+        # legend, spread across the card (native-size fonts are a little wider than the upscaled small ones were)
+        font_small = H.font(size=small)
+        widths = [px(7) + font_small.size(label)[0] for _, label, _ in SEGMENTS]
+        spare = max(x1 - x0 - sum(widths), 0) / (len(SEGMENTS) - 1)
         lx = x0
-        for _, label, col in SEGMENTS:
-            surface.fill(ui.BLACK, (lx, y + 3, 5, 5))
-            surface.fill(col, (lx + 1, y + 4, 3, 3))
-            lx = self._text(surface, label, (lx + 7, y), color=ui.TEXT_DIM, size=SMALL).right + 4
+        for (_, label, col), w in zip(SEGMENTS, widths):
+            ix = round(lx)
+            surface.fill(ui.BLACK, (ix, y + px(3), px(5), px(5)))
+            surface.fill(col, (ix + px(1), y + px(4), px(3), px(3)))
+            self._text(surface, label, (ix + px(7), y), color=ui.TEXT_DIM, size=small)
+            lx += w + spare
         y += small_line
 
         # bar chart
-        graph = pygame.Rect(x0, y, x1 - x0, GRAPH_H)
+        graph = pygame.Rect(x0, y, x1 - x0, graph_h)
         self._bars(surface, graph, st)
-        y = graph.bottom + 1
-        self._text(surface, "past 3 s, newest right", (x0, y), color=ui.TEXT_DIM, size=SMALL)
+        y = graph.bottom + px(1)
+        self._text(surface, "past 3 s, newest right", (x0, y), color=ui.TEXT_DIM, size=small)
         return rect
 
     def _bars(self, surface, graph, st):
@@ -156,16 +169,13 @@ class PerfHUD:
                         fill(col, (left + c, y_new, 1, y_px - y_new))
                         y_px = y_new
                 if b[0] * 1e3 > top_ms:  # off the scale: mark the top pixel
-                    fill(ui.ACCENT, (left + c, graph.top, 1, 1))
+                    fill(ui.ACCENT, (left + c, graph.top, 1, H.px(1)))
 
         # 60 fps reference line (dashed) and scale labels
+        px, small = H.px, H.px(SMALL)
         ref_y = graph.bottom - round(REF_MS / 1e3 * px_per_s)
-        for x in range(graph.left, graph.right, 4):
-            surface.fill(ui.TEXT, (x, ref_y, 2, 1))
-        self._text(surface, f"{top_ms:.0f} ms", (graph.left + 2, graph.top), color=ui.TEXT_DIM, size=SMALL)
-        self._text(surface, "16.7", (graph.right - 2, ref_y - small_h(SMALL)), color=ui.TEXT, size=SMALL, align="right")
-        pygame.draw.rect(surface, ui.BLACK, graph.inflate(2, 2), 1)
-
-
-def small_h(size):
-    return ui.font(size=size).get_height()
+        for x in range(graph.left, graph.right, px(4)):
+            surface.fill(ui.TEXT, (x, ref_y, px(2), px(1)))
+        self._text(surface, f"{top_ms:.0f} ms", (graph.left + px(2), graph.top), color=ui.TEXT_DIM, size=small)
+        self._text(surface, "16.7", (graph.right - px(2), ref_y - H.font(size=small).get_height()), color=ui.TEXT, size=small, align="right")
+        pygame.draw.rect(surface, ui.BLACK, graph.inflate(2 * px(1), 2 * px(1)), px(1))
