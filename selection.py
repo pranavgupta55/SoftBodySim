@@ -166,13 +166,13 @@ class SelectionTools:
         if not units:
             return "none"
         if len(units) > 1:
-            return f"{len(units)} objects"
+            return f"{len(units)} items"
         u = units[0]
         if isinstance(u, tuple):
-            return "Chain"
+            return "chain"
         if isinstance(u, (Hook, Rope)):
-            return type(u).__name__
-        return {SoftBody: "Soft body", RigidBody: "Rigid body", FixedBody: "Fixed body"}.get(type(u), "Body")
+            return type(u).__name__.lower()
+        return {SoftBody: "soft", RigidBody: "rigid", FixedBody: "fixed"}.get(type(u), "body")
 
     # ---------------- Picking
     def _pick_unit(self, wp):
@@ -554,13 +554,13 @@ class SelectionTools:
         """The info card's rows while editing (replacing "drag  grab bodies"): what's selected, then the actions."""
         has = bool(self._live_picked())
         if has:
-            rows = [("click", "select", self._selection_summary(), True), ("drag", "move", None, True)]
+            rows = [("click", "selected", self._selection_summary(), True), ("drag", "move", None, True)]
         else:  # one row (the card is as tall as before until something is selected)
             rows = [("click", "select / drag box", None, True)]
         if has or self.clipboard is not None or self.paste is not None:
             n = self._clip_count()
             rows += [("shift", "add / remove", None, True),
-                     ("DEL", "delete", None, has),  # DEL and ^D share a row (editor.PAIRED_HOTKEYS)
+                     ("DEL", "delete", None, has),
                      ("^D", "duplicate", None, has),
                      ("^C", "copy", None, has),
                      ("^V", "paste", f"{n} copied" if n else None, n > 0),
@@ -583,7 +583,7 @@ class SelectionTools:
             return
         col = pal.yellow
         if self.edit_drag is not None and self.edit_drag["moved"] and not self.edit_drag["valid"]:
-            col = pal.debug_red
+            col = pal.neon_red  # not debug_red: that's also a body colour (the demo square)
         if self.edit_drag is not None:  # what's being moved (the live positions would change what counts as contents)
             pose = self.edit_drag["pose"]
             bodies, ropes, hooks = pose.bodies, pose.ropes, pose.hooks

@@ -91,7 +91,7 @@ CARD_BTN_H = 20
 KEY_COL_W = 46  # hotkey name column on the info card (room for ENTER / SPACE in bold)
 # hotkeys listed side by side in one row of the info card (short, related ones), so the card stays short enough for
 # the compute card to fit under it on small screens
-PAIRED_HOTKEYS = {"Z": "X", "S": "M", "[ ]": "N", "DEL": "^D"}
+PAIRED_HOTKEYS = {"Z": "X", "S": "M", "[ ]": "N"}
 PAIR_GAP = 4  # base px between a paired hotkey's key, label and state
 
 
