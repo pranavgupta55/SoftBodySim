@@ -35,6 +35,9 @@ class EnvConfig:
     # "cpu": all physics in numpy (fastest for small scenes). "gpu": broad phases + PBD solves on the Apple GPU via
     # MLX, exact CCD still float64 on the CPU (gpu_backend.py); faster from roughly 600 points (M4). Read in World.add.
     backend = "gpu"
+    # True: the CPU physics' hot paths run as numba kernels (solver_jit.py), bit-identical to the numpy code and
+    # several times faster; ignored (numpy) when numba can't be imported. Per world via World.env like the rest.
+    jit = True
 
 
 def rect_points(cx, cy, w, h):
