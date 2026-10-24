@@ -16,7 +16,8 @@ uploaded only when it changes.
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
-GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, P pause, ESC quit.
+GLSL 330 shaders. Hotkeys: SPACE HUD, F compute card, G grid, V filled/points view, T motion trails, P pause,
+ESC quit.
 
 Timing: the compute card's "present" section is split into upload / render / gpu wait / flip. "gpu wait" is a
 GPU-tagged section around ctx.finish(): the time the CPU blocks until the GPU has finished this frame's texture
@@ -39,6 +40,7 @@ from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
 from perf_hud import PerfHUD
 from hud_layer import HudLayer
+from trails import Trails
 import ui_style
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
@@ -288,6 +290,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     profiler = Profiler()
     world.profiler = profiler
     perf_hud = PerfHUD(profiler)
+    trails = Trails()  # T: fading paths behind moving bodies, drawn under them
 
     def draw_top(surface, origin=(0, 0)):
         """What goes over the HUD cards, at UI-surface px minus origin: the editor message and the cursor."""
@@ -342,15 +345,22 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     ViewConfig.show_grid = not ViewConfig.show_grid
                 if event.key == pygame.K_v:
                     ViewConfig.filled = not ViewConfig.filled
+                if event.key == pygame.K_t:
+                    ViewConfig.trails = not ViewConfig.trails
 
         # ---------------- Updating Screen
         profiler.switch("physics")
         world.drag_to((wx, wy))
-        if not editor.paused:
+        stepped = not editor.paused
+        if stepped:
             world.step(dt / fps)  # dt is in frames here, World wants seconds
         profiler.switch("draw")
         if ViewConfig.show_grid:
             world.draw_grid(screen2, zoom=ViewConfig.zoom)
+        with profiler.section("trails"):
+            trails.set_enabled(ViewConfig.trails)
+            trails.update(world, dt / fps, stepped)
+            trails.draw(screen2, zoom=ViewConfig.zoom)  # under the bodies
         world.draw(screen2, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
         editor.draw_world(screen2, screenT, (mx, my))
         editor.draw_ui(screenUI, (mx, my))  # panels, buttons and hints, under the HUD cards

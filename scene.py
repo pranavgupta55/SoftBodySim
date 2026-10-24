@@ -72,9 +72,10 @@ class FireCols:
 
 
 class ViewConfig:
-    """View settings: debug toggles (keys G and V) and the world -> render surface zoom."""
+    """View settings: debug toggles (keys G, V and T) and the world -> render surface zoom."""
     show_grid = True  # G: draw the collision spatial hash grid under the bodies
     filled = True  # V: filled polygons with a black border instead of points + springs
+    trails = False  # T: fading motion trails behind moving bodies (trails.py)
     zoom = 0.5  # render pixels per world unit: 0.5 shows twice as much world each way
 
 
