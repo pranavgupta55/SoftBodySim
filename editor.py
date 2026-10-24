@@ -104,6 +104,7 @@ class CardLayout(NamedTuple):
     compute: pygame.Rect
     action: pygame.Rect  # the action row: Undo / Finish / Redo, or Done while picking objects to go around
     rows: list  # [(kind, y, data)]: ("section", y, title) or ("key", y, (key, label, state, usable))
+    worlds: pygame.Rect = None  # its [w] button (world selector), right of [f]; None without a world selector
 
 
 def max_skip_sets(n):
@@ -246,6 +247,7 @@ class Editor(SelectionTools):
         self.message, self.message_until = None, 0.0
         self.show_compute = True  # F / the card's [f] button: the Compute card in full (else its short summary)
         # set by the main loop, for the Controls card's states: debug_overlay.DebugOverlays (keys 1-4) and
+        self.world_selector = None  # world_selector.WorldSession: adds the [w] button and W to the card when set
         # timectl.TimeControl ([ / ] speed, N frame step); None leaves those rows without a state
         self.overlays = None
         self.time = None
@@ -1056,12 +1058,23 @@ class Editor(SelectionTools):
             entries.append(("key", y, row))
             y += line
         rect = pygame.Rect(x, top, w, y + pad - px(1) - top)
-        bw = (w - 2 * pad - 2 * gap) // 3
-        pause = pygame.Rect(x + pad, buttons_y, bw, bh)
-        plus = pygame.Rect(pause.right + gap, buttons_y, bw, bh)
-        compute = pygame.Rect(plus.right + gap, buttons_y, rect.right - pad - plus.right - gap, bh)
+        if self.world_selector is None:
+            bw = (w - 2 * pad - 2 * gap) // 3
+            widths = [bw, bw]
+        else:  # a fourth button ([w], the world selector): each button its content's width plus an equal share
+            labels = ("[p]", "edit", "[f]", "[w]")  # the last one has no icon
+            content = [HUD.font("bold").size(t)[0] + (px(12) if t != "[w]" else 0) for t in labels]  # icon 8 + gap 4
+            spare = (w - 2 * pad - 3 * gap - sum(content)) // 4
+            widths = [c + spare for c in content[:3]]
+        pause = pygame.Rect(x + pad, buttons_y, widths[0], bh)
+        plus = pygame.Rect(pause.right + gap, buttons_y, widths[1], bh)
+        right = rect.right - pad if self.world_selector is None else plus.right + gap + widths[2]
+        compute = pygame.Rect(plus.right + gap, buttons_y, right - plus.right - gap, bh)
+        worlds = None
+        if self.world_selector is not None:
+            worlds = pygame.Rect(compute.right + gap, buttons_y, rect.right - pad - compute.right - gap, bh)
         action = pygame.Rect(x + pad, action_y, w - 2 * pad, bh)
-        return CardLayout(rect, pause, plus, compute, action, entries)
+        return CardLayout(rect, pause, plus, compute, action, entries, worlds)
 
     def _placing(self):
         return self.active and self.stage == "place"
@@ -1092,7 +1105,7 @@ class Editor(SelectionTools):
         return [("Sim", [("P", "pause", "paused" if self.paused else "running", True),
                          ("[ ]", "speed", None if self.time is None else self.time.label(), True),
                          ("N", "step", None, self.can_frame_step()),
-                         ("KP1-9", "gravity", direction_name(compass=True), True)]
+                         ("KP1-9", "gravity", direction_name(compass=True), True)] + self._world_hotkeys()
                         + ([] if self._editing() else [("drag", "grab bodies", None, not self.paused)])
                         + [("ESC", "back" if self.active or self._esc_cancels() else "quit", None, True)]),
                 ("View", [("G", "grid", grid, True),
@@ -1111,6 +1124,10 @@ class Editor(SelectionTools):
     def _hotkeys(self):
         """(key, what it does, current state or None, usable now) for every hotkey on the Controls card."""
         return [row for _, rows in self._hotkey_sections() for row in rows]
+
+    def _world_hotkeys(self):
+        """W, the world selector (in the Sim section; its card and the lit [w] button show the rest)."""
+        return [] if self.world_selector is None else [("W", "worlds", None, True)]
 
     def _menu_layout(self):
         n, cols = len(KIND_TITLES), MENU_COLS
@@ -1254,6 +1271,8 @@ class Editor(SelectionTools):
         ws = [(lay.pause, self.toggle_pause, ("pause",)), (lay.plus, self.open if can_edit else None, ("plus", not can_edit)),
               (lay.compute, self.toggle_compute, ("compute",))]
         ws += self._place_buttons()
+        if lay.worlds is not None:
+            ws.append((lay.worlds, self.world_selector.toggle, ("worlds",)))
         ws.append((self.sidebar, None, ("blocker",)))
         return ws
 
@@ -1735,6 +1754,8 @@ class Editor(SelectionTools):
             self._icon_button(surface, st, area, hovered, self._draw_plus_icon, "edit", disabled=spec[1])
         elif kind == "compute":  # selected (lit) while the compute card is shown
             self._icon_button(surface, st, area, hovered, self._draw_chart_icon, "[f]", selected=self.show_compute)
+        elif kind == "worlds":  # selected (lit) while the world selector panel is open
+            st.draw_button(surface, area, "[w]", hovered, self.world_selector.open)
         elif kind == "kind":
             ui.draw_button(surface, area, None, hovered)
             self._draw_kind_icon(surface, spec[1], area)

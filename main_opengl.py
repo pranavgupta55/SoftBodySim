@@ -12,15 +12,19 @@ it's uploaded only when it changes.
 
     python3 main_opengl.py                      fullscreen, GPU compositing
     python3 main_opengl.py --window 1280x800    windowed
-    python3 main_opengl.py --scene diamonds     a preset scene (scene.PRESETS; default "default"),
+    python3 main_opengl.py --scene diamonds     start in a preset world (scene.PRESETS; W switches worlds),
     python3 main_opengl.py --scene "newtons cradle"    e.g. this one (quote names with spaces)
     python3 main_opengl.py --basic              the Framework pipeline as-is: layers composited on the CPU into one
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
 GLSL 330 shaders. Hotkeys (all listed on the sidebar's Controls card): F compute card full / summary, G grid,
-V filled/points view, T motion trails, P pause, numpad 1-9 gravity (direction = numpad layout, 5 = off/on), ESC quit,
+V filled/points view, T motion trails, P pause, numpad 1-9 gravity (direction = numpad layout, 5 = off/on), W worlds, ESC quit,
 1-4 debug overlays (debug_overlay.py), [ / ] physics speed 0.25x-2x and N one physics frame while paused (timectl.py).
+
+Worlds: `session` (world_selector.WorldSession) holds the Custom world and the preset worlds; `world` and `editor`
+are always its active world and that world's editor (rebound whenever the selector switches or resets a world, and
+swapped in hud.cards). The session is also the sidebar's Worlds card.
 
 Timing: the compute card's "present" section is split into upload / render / gpu wait / flip. "gpu wait" is a
 GPU-tagged section around ctx.finish(): the time the CPU blocks until the GPU has finished this frame's texture
@@ -43,6 +47,7 @@ from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
 from perf_hud import PerfHUD
 from hud_layer import HudLayer
+from world_selector import WorldSession
 from trails import Trails
 from gravity_dial import GravityDial
 from debug_overlay import DebugOverlays
@@ -300,17 +305,24 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     # surfaces (UI px) / the zoom. Every scene builder takes world_width / world_height, so all get the smaller world.
     world_px = (hud.rect.x // scaleDownFactor, screen_height)  # the world area, render-surface px
     world_width, world_height = world_px[0] / ViewConfig.zoom, world_px[1] / ViewConfig.zoom
-    world = PRESETS[args.scene](world_width, world_height)
-    editor = Editor(world, Endesga, (screen_width, screen_height), (world_width, world_height), scaleDownFactor, INSET,
-                    ViewConfig.zoom, view=ViewConfig, screen_size=display.window_size, sidebar=hud.rect)
     world_view = screen2.subsurface((0, 0) + world_px)  # the grid, trails and bodies are drawn in the world area only
     profiler = Profiler()
-    world.profiler = profiler
+
+    def make_editor(w):
+        return Editor(w, Endesga, (screen_width, screen_height), (world_width, world_height), scaleDownFactor, INSET,
+                      ViewConfig.zoom, view=ViewConfig, screen_size=display.window_size, sidebar=hud.rect)
+
+    # Custom (the default scene at launch, kept for the session) + the presets; only the active world steps, and it
+    # alone has the profiler attached (the session moves it)
+    session = WorldSession(PRESETS, (world_width, world_height), make_editor, profiler, start=args.scene)
+    world, editor = session.world, session.editor
     perf_hud = PerfHUD(profiler)
     trails = Trails()  # T: fading paths behind moving bodies, drawn under them
     gravity_dial = GravityDial()  # the gravity selector card (numpad 1-9 too)
     # the sidebar's cards, top to bottom (hud_layer.py describes a card provider; append new cards here)
-    hud.cards = [editor, perf_hud, gravity_dial]
+    # (the Controls card is the active world's editor: the session swaps it in this list when it switches worlds)
+    hud.cards = [editor, session, perf_hud, gravity_dial]
+    session.bind_cards(hud.cards)
     hud.layout()
 
     overlays = DebugOverlays()  # keys 1-4
@@ -330,6 +342,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     frame_index = 0
     while running:
         profiler.frame()
+        world, editor = session.world, session.editor  # the active world (anything may have switched / replaced it)
         profiler.begin("draw")
 
         # ---------------- Reset Variables and Clear screens
@@ -350,6 +363,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            if session.handle_event(event):  # W, the Worlds card and the world selector panel (may switch worlds)
+                world, editor = session.world, session.editor
+                continue
             if gravity_dial.handle_event(event):  # numpad keys, and clicks on the gravity card
                 continue
             if editor.handle_event(event):  # the Controls card, the rest of the sidebar, editor panels and placement
@@ -407,6 +423,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         if overlays.any():  # the legend: top left of the world area
             overlays.draw_legend(screenUI, world, (OVERLAY_LEGEND_PX, OVERLAY_LEGEND_PX))
         editor.draw_ui(screenUI, (mx, my))  # panels, buttons and hints (in the world area)
+        session.draw(screenUI, (mx, my))  # the world selector panel (W), over the editor's panels
 
         profiler.switch("ui")
         pygame.mouse.set_visible(False)
