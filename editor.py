@@ -590,15 +590,19 @@ class Editor(SelectionTools):
         key = (tuple(map(id, world.bodies)), world.P.tobytes() if world.bodies else b"")
         if key != self._tree_key:
             polys = [c for c in world.bodies if closed(c)]
-            lo = {id(b): b.points.min(axis=1) for b in world.bodies}
-            hi = {id(b): b.points.max(axis=1) for b in world.bodies}
             area = {id(c): poly_area(c.points) for c in polys}
+            # every body's bounding box against every closed body's at once: (bodies, polys) "C's box holds B's"
+            lo = np.array([b.points.min(axis=1) for b in world.bodies]).reshape(-1, 2)
+            hi = np.array([b.points.max(axis=1) for b in world.bodies]).reshape(-1, 2)
+            k_poly = [k for k, b in enumerate(world.bodies) if closed(b)]
+            holds = ~((lo[:, None, :] < lo[None, k_poly, :]).any(axis=2) | (hi[:, None, :] > hi[None, k_poly, :]).any(axis=2))
             tree = {}
-            for b in world.bodies:
+            for b, row in zip(world.bodies, holds):
                 best = None
-                for c in polys:
-                    if c is b or (lo[id(b)] < lo[id(c)]).any() or (hi[id(b)] > hi[id(c)]).any():
-                        continue  # C's bounding box doesn't hold B's
+                for j in np.flatnonzero(row).tolist():  # (in polys order, as before: the first smallest wins)
+                    c = polys[j]
+                    if c is b:
+                        continue
                     if points_in_poly(b.points, c.points).all() and (best is None or area[id(c)] < area[id(best)]):
                         best = c
                 tree[b] = best
@@ -618,7 +622,15 @@ class Editor(SelectionTools):
     def _with_contents(self, bodies):
         """The bodies plus everything nested inside them (at any depth)."""
         chosen = set(bodies)
-        return {b for b in self.world.bodies if chosen.intersection(self._ancestors(b))}
+        parents, out = self._parents(), set()  # (_ancestors of each body, with the cache looked up once)
+        for b in self.world.bodies:
+            a = b
+            while a is not None:
+                if a in chosen:
+                    out.add(b)
+                    break
+                a = parents.get(a)
+        return out
 
     def _target(self):
         """(where the new object goes: its container or None for the top level, the bodies it must enclose)."""
@@ -658,6 +670,20 @@ class Editor(SelectionTools):
                 return False
         return True
 
+    def _near(self, wp, reach):
+        """The world's bodies (in order) whose bounding box, grown by `reach` (+ a margin far above float error),
+        holds world point wp: the only ones that can hold wp or have an outline within `reach` of it. Read from the
+        packed World.P while every body's points are its slice of it (always, after World._rebuild); else all."""
+        world = self.world
+        bodies, P, off = world.bodies, getattr(world, "P", None), getattr(world, "offsets", None)
+        if (not bodies or P is None or off is None or len(off) != len(bodies) + 1 or (np.diff(off) <= 0).any()
+                or any(b.points.base is not P for b in bodies)):
+            return bodies
+        lo, hi = np.minimum.reduceat(P, off[:-1], axis=1), np.maximum.reduceat(P, off[:-1], axis=1)
+        m, (x, y) = reach + 1e-6, wp
+        near = (lo[0] - m <= x) & (x <= hi[0] + m) & (lo[1] - m <= y) & (y <= hi[1] + m)
+        return [bodies[k] for k in np.flatnonzero(near)]
+
     def _pick(self, wp):
         """The object a click at wp picks for the current relation: the innermost one whose polygon holds wp, or one
         whose outline is within PICK_UI_PX (segments and chain boxes too). Walls, and for "inside" bodies without an
@@ -665,7 +691,7 @@ class Editor(SelectionTools):
         reach = PICK_UI_PX / self.zoom
         best, best_area = None, math.inf
         p = np.asarray(wp, dtype=float).reshape(2, 1)
-        for b in self.world.bodies:
+        for b in self._near(p[:, 0], reach):
             if self._is_wall(b) or (self.relation == "inside" and not closed(b)):
                 continue
             a, c = b.points[:, b.edges[0]], b.points[:, b.edges[1]]
