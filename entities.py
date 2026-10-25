@@ -35,6 +35,9 @@ class EnvConfig:
     # px; a CCD root counts as a touch when the point is within this of the (clamped) segment at that time. Covers
     # float64 rounding at segment ends (real root errors are <= ~1e-10 px), far below ccd_gap.
     ccd_tau = 1e-6
+    # Inelastic projection rounds (Harmon et al. 2008) tried when ccd_passes of impulses leave hits, before the
+    # rigid impact zones. 0: straight to the impact zones.
+    ccd_projection_rounds = 8
     grab_radius = 15.0  # px; how close the cursor must be to a point to pick it up
     # 1/s; the gap to the cursor shrinks as exp(-grab_stiffness * t) (85.6: 30% per 1/240 s substep)
     grab_stiffness = 85.6

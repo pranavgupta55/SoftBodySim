@@ -84,6 +84,7 @@ class World:
         self.grabbed = None  # global index of the point being dragged
         self.grab_target = np.zeros(2)
         self.zone_count = 0  # how many CCD passes needed the rigid impact zone fallback (for debugging)
+        self.projection_count = 0  # how many CCD passes the inelastic projection fallback fixed (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
         self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend); re-picked on every repack
         # Looping (looping.py): a body that fully leaves `bounds` through a looping side re-enters through the opposite
@@ -881,6 +882,7 @@ class World:
         if self.debug is not None:
             self.debug.ccd_hits(self, hits, D)
         fresh = True  # V hasn't changed since the broad phase
+        V_pre = None
         for _ in range(EnvConfig.ccd_passes):
             if hits[0].size == 0:
                 if fresh:
@@ -906,13 +908,112 @@ class World:
                     self.debug.ccd_hits(self, hits, D)
             with sec("narrow+impulses"):
                 V_before = V.copy()
+                if fresh:
+                    V_pre = V_before  # before any CCD response: the inelastic projection's reference
                 self._ccd_impulses(*hits, h)
                 hits = self._ccd_redetect(V * h, pairs, hits, (V != V_before).any(axis=0))
             fresh = False
 
-        self.zone_count += 1
         with sec("impact zones"):
+            if self._inelastic_zones(h, V_pre):
+                return
+            self.zone_count += 1
             self._impact_zones(h)
+
+    def _ccd_normal(self, i, ia, ib, t, side, h):
+        """_ccd_impulses' push direction for point i against edge (ia, ib): from the closest point on the edge to the
+        point at the start of the substep, or the edge normal at the hit time t (towards `side`) if they touch."""
+        V, X0 = self.V, self.PREV
+        e0 = X0[:, ib] - X0[:, ia]
+        u = min(max((X0[:, i] - X0[:, ia]) @ e0 / max(e0 @ e0, 1e-12), 0.0), 1.0)
+        sep = X0[:, i] - (X0[:, ia] + u * e0)
+        if np.hypot(*sep) > 1e-9:
+            return sep / np.hypot(*sep)
+        e = (X0[:, ib] + t * h * V[:, ib]) - (X0[:, ia] + t * h * V[:, ia])
+        return side * np.array([-e[1], e[0]]) / max(np.hypot(*e), 1e-12)
+
+    def _inelastic_zones(self, h, V_pre, pgs_iters=300):
+        """Fallback when the impulse passes leave hits: inelastic projection (Harmon et al. 2008, "Robust treatment
+        of simultaneous collisions", Algorithm 1), tried before the rigid impact zones. True if the motion ends up
+        collision-free (checked with a fresh broad phase); False leaves V as it found it.
+
+        Each hit (point i, edge (a, b), s, normal n) becomes a constraint G V >= b with G = +n on i, -(1 - s) n on
+        a and -s n on b, and b = (ccd_push - start gap along n) / h: the same end gap _ccd_impulses aims for.
+        Constraints accumulate over rounds; each connected group of them is reset to its velocities from before
+        any CCD response and projected onto them in the mass metric, min |V' - V_pre|_M subject to G V' >= b, by
+        projected Gauss-Seidel on the small dual (Delassus) system. Only velocities along the constraint normals
+        change, so sliding survives, where the impact zones stop all relative motion. Sequential impulses converge
+        only geometrically for a point wedged between two edges (Bridson et al. 2002 name the case); solving the
+        group's constraints together fixes that. Every round is re-verified by _ccd_detect, so the guarantee still
+        rests on the impact zones as the last resort (research/02 F4)."""
+        rounds = EnvConfig.ccd_projection_rounds
+        if not rounds:
+            return False
+        V, W, X0, E = self.V, self.W, self.PREV, self.edges
+        push = EnvConfig.ccd_push
+        V_entry = V.copy()
+        V_pre = V_entry if V_pre is None else V_pre
+        cons = {}  # (point, edge) -> (i, a, b, s, n, rhs), in first-seen order
+        projected = False
+        for _ in range(rounds):
+            pts, eids, ts, ss, sides = self._ccd_detect(V * h)
+            if pts.size == 0:
+                self.projection_count += projected
+                return True
+            for i, e, t, s, side in zip(pts.tolist(), eids.tolist(), ts.tolist(), ss.tolist(), sides.tolist()):
+                ia, ib = int(E[0, e]), int(E[1, e])
+                n = self._ccd_normal(i, ia, ib, t, side, h)
+                gap0 = (X0[:, i] - ((1 - s) * X0[:, ia] + s * X0[:, ib])) @ n
+                cons[(i, e)] = (i, ia, ib, s, n, (push - gap0) / h)
+            parent = {}
+
+            def find(x):
+                parent.setdefault(x, x)
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            for i, ia, ib, *_ in cons.values():
+                for j in (ia, ib):
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[rj] = ri
+            groups = {}
+            for c in cons.values():
+                groups.setdefault(find(c[0]), []).append(c)
+            for cs in groups.values():
+                members = sorted({p for c in cs for p in c[:3]})
+                loc = {p: k for k, p in enumerate(members)}
+                m, k = len(members), len(cs)
+                G = np.zeros((k, 2 * m))
+                rhs = np.empty(k)
+                for row, (i, ia, ib, s, n, b) in enumerate(cs):
+                    for p, wgt in ((i, 1.0), (ia, -(1 - s)), (ib, -s)):
+                        G[row, 2 * loc[p]:2 * loc[p] + 2] += wgt * n
+                    rhs[row] = b
+                Minv = np.repeat(W[members], 2)
+                diag = np.einsum("ij,ij->i", G * Minv, G)
+                lam = np.zeros(k)
+                v = V_pre[:, members].T.reshape(-1).copy()
+                for _ in range(pgs_iters):
+                    worst = 0.0
+                    for row in range(k):
+                        if diag[row] < 1e-12:
+                            continue
+                        viol = rhs[row] - G[row] @ v
+                        new = max(lam[row] + viol / diag[row], 0.0)
+                        if new != lam[row]:
+                            v += Minv * G[row] * (new - lam[row])
+                            lam[row] = new
+                        if lam[row] > 0 or viol > 0:
+                            worst = max(worst, abs(viol))
+                    if worst < 1e-9:
+                        break
+                V[:, members] = v.reshape(m, 2).T
+            projected = True
+        V[:] = V_entry
+        return False
 
     def _ccd_redetect(self, D, pairs, hits, changed):
         """_ccd_detect(D, pairs) after impulses that changed only the `changed` points' velocities. A pair's result
