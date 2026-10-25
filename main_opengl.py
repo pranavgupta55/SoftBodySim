@@ -42,7 +42,7 @@ from collections import namedtuple
 import moderngl
 import pygame
 
-from scene import Endesga, ViewConfig, INSET, PRESETS
+from scene import Endesga, ViewConfig, INSET, PRESETS, FULLSCREEN_BUILDERS
 from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
 from perf_hud import PerfHUD
@@ -343,7 +343,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
 
     def build_twin(name):
         def build(_w, h):
-            w = PRESETS[name](full_width, h)
+            w = FULLSCREEN_BUILDERS.get(name, PRESETS[name])(full_width, h)
             w.fullscreen = True
             return w
         return build
