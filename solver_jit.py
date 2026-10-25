@@ -128,10 +128,11 @@ def ccd_pairs(world, cells):
     return _pairs(world, *cells, False)
 
 
-def ccd_detect(world, D, pts, eids, gap):
+def ccd_detect(world, D, pts, eids, gap, tau):
     """World._ccd_detect for the given broad phase pairs."""
     _, ea, eb, *_ = _topology(world)
-    return ccd_narrow(world.PREV, D, ea, eb, pts.astype(np.int64, copy=False), eids.astype(np.int64, copy=False), gap)
+    return ccd_narrow(world.PREV, D, ea, eb, pts.astype(np.int64, copy=False), eids.astype(np.int64, copy=False), gap,
+                      tau)
 
 
 def ccd_impulses(world, pts, eids, ts, ss, sides, h, push):
@@ -530,18 +531,25 @@ def floor_cells(box, cell):
 
 # ================================================================ CCD narrow phase + impulses
 @njit(**NB)
-def ccd_narrow(X0, D, ea, eb, pts, eids, gap):
-    """World._ccd_detect after the broad phase: the swept-box pre-reject inline, then the quadratic per pair.
-    Returns (pts, edge_ids, t, s, side) of the hits, in pair order."""
-    m, E = pts.size, ea.size
-    collapses = np.zeros(E, np.bool_)  # edges that shrink to (nearly) zero length mid-substep keep every pair
-    if m > 0:
-        for e in range(E):
-            e0x, e0y = X0[0, eb[e]] - X0[0, ea[e]], X0[1, eb[e]] - X0[1, ea[e]]
-            dex, dey = D[0, eb[e]] - D[0, ea[e]], D[1, eb[e]] - D[1, ea[e]]
-            tm = min(max(-(e0x * dex + e0y * dey) / max(dex * dex + dey * dey, 1e-300), 0.0), 1.0)
-            sx, sy = e0x + tm * dex, e0y + tm * dey
-            collapses[e] = sx * sx + sy * sy < 1e-6
+def _tau_hit(rr, e0x, e0y, dex, dey, q0x, q0y, dqx, dqy, tau2):
+    """The robust acceptance test of World._ccd_detect for root rr: rr in [0, 1] and the point within ccd_tau of
+    the segment (s clamped) at rr. Returns (accepted, s)."""
+    if not (rr >= 0 and rr <= 1):
+        return False, 0.0
+    ex, ey = e0x + rr * dex, e0y + rr * dey
+    qx, qy = q0x + rr * dqx, q0y + rr * dqy
+    s = min(max((qx * ex + qy * ey) / max(ex * ex + ey * ey, 1e-300), 0.0), 1.0)
+    ox, oy = qx - s * ex, qy - s * ey
+    return ox * ox + oy * oy <= tau2, s
+
+
+@njit(**NB)
+def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau):
+    """World._ccd_detect after the broad phase: the swept-box pre-reject inline, then the quadratic per pair
+    (textbook roots, verified; the float64-robust solve where they find nothing). Returns (pts, edge_ids, t, s,
+    side) of the hits, in pair order."""
+    m = pts.size
+    tau2 = tau * tau
     hp, he = np.empty(m, np.int64), np.empty(m, np.int64)
     ht, hs, hside = np.empty(m), np.empty(m), np.empty(m)
     nh = 0
@@ -550,18 +558,17 @@ def ccd_narrow(X0, D, ea, eb, pts, eids, gap):
         e = eids[k]
         ia = ea[e]
         ib = eb[e]
-        if not collapses[e]:  # pre-reject: the point's and the edge's swept boxes must overlap
-            ok = True
-            for c in range(2):
-                p0 = X0[c, ip]
-                p1 = p0 + D[c, ip]
-                a0, b0 = X0[c, ia], X0[c, ib]
-                a1, b1 = a0 + D[c, ia], b0 + D[c, ib]
-                if not (min(p0, p1) <= max(max(a0, b0), max(a1, b1)) + 1.0
-                        and max(p0, p1) >= min(min(a0, b0), min(a1, b1)) - 1.0):
-                    ok = False
-            if not ok:
-                continue
+        ok = True  # pre-reject: the point's and the edge's swept boxes must overlap
+        for c in range(2):
+            p0 = X0[c, ip]
+            p1 = p0 + D[c, ip]
+            a0, b0 = X0[c, ia], X0[c, ib]
+            a1, b1 = a0 + D[c, ia], b0 + D[c, ib]
+            if not (min(p0, p1) <= max(max(a0, b0), max(a1, b1)) + 1.0
+                    and max(p0, p1) >= min(min(a0, b0), min(a1, b1)) - 1.0):
+                ok = False
+        if not ok:
+            continue
         e0x, e0y = X0[0, ib] - X0[0, ia], X0[1, ib] - X0[1, ia]
         dex, dey = D[0, ib] - D[0, ia], D[1, ib] - D[1, ia]
         q0x, q0y = X0[0, ip] - X0[0, ia], X0[1, ip] - X0[1, ia]
@@ -585,6 +592,26 @@ def ccd_narrow(X0, D, ea, eb, pts, eids, gap):
             s = (qx * ex + qy * ey) / max(ex * ex + ey * ey, 1e-12)
             if rr >= 0 and rr <= 1 and s >= 0 and s <= 1 and rr < th:
                 th, sh = rr, s
+        if th != np.inf:  # verify: the point must be on the segment (within tau) at the root
+            ex, ey = e0x + th * dex, e0y + th * dey
+            ox, oy = (q0x + th * dqx) - sh * ex, (q0y + th * dqy) - sh * ey
+            if ox * ox + oy * oy > tau2:
+                th, sh = np.inf, 0.0
+        if th == np.inf:  # float64-robust solve
+            qq = -0.5 * (c1 + (sq if c1 >= 0 else -sq))
+            if c2 != 0:
+                ra, rb = qq / c2, c0 / qq
+            elif c1 != 0:
+                ra, rb = -c0 / c1, np.nan
+            else:  # collinear all substep: the times the point passes either end of the segment
+                w = dqx * e0x + dqy * e0y
+                ra = -(q0x * e0x + q0y * e0y) / w
+                rb = -((q0x - e0x) * e0x + (q0y - e0y) * e0y) / (w - (dex * e0x + dey * e0y))
+            for rr in (ra, rb):
+                if rr < th:
+                    acc, s = _tau_hit(rr, e0x, e0y, dex, dey, q0x, q0y, dqx, dqy, tau2)
+                    if acc:
+                        th, sh = rr, s
         if th == np.inf:  # ending within gap of the edge counts as a hit at t = 1
             e1x, e1y, q1x, q1y = e0x + dex, e0y + dey, q0x + dqx, q0y + dqy
             len2 = max(e1x * e1x + e1y * e1y, 1e-12)
@@ -812,6 +839,6 @@ def warmup():
                np.ones(4, np.int64), i2, i1, True, 100)
     contact_cells(P, i2, i1, 24.0, 6.0)
     floor_cells(ccd_boxes(P, P, i2, i1)[0], 24.0)
-    ccd_narrow(P, P, i2, i1, e, e, 0.01)
+    ccd_narrow(P, P, i2, i1, e, e, 0.01, 1e-6)
     impulse_pass(P.copy(), W, P, i2, i1, e, e, f, f, f, e, 0.004, 0.25)
     bounce_pass(P, P.copy(), W, np.array([0, 2, 4], np.int64), np.array([0, 1, 2], np.int64), i2, i1, e, f, 3.0, 0.004)
