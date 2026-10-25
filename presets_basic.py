@@ -167,9 +167,10 @@ def build_fluid(world_width, world_height, count=FLUID_COUNT, seed=0):
     world = World()
     add_world_box(world, world_width, world_height, INSET, col=Endesga.greyD)
     _set_looping(world, ("left", "right"))
+    bodies = []  # added in one go at the end (one repack instead of one per body)
     for x in (-FLUID_SIDE_BAND, world_width + FLUID_SIDE_BAND):
-        world.add(FixedBody(np.array([[x, x], [-world_height, 2 * world_height]]), point_radius=1, stick_width=2,
-                            **_style(Endesga.greyD)))
+        bodies.append(FixedBody(np.array([[x, x], [-world_height, 2 * world_height]]), point_radius=1, stick_width=2,
+                                **_style(Endesga.greyD)))
     world.env["friction"] = FLUID_FRICTION
     rng = np.random.default_rng(seed)
     x0, x1 = INSET, world_width - INSET
@@ -189,9 +190,10 @@ def build_fluid(world_width, world_height, count=FLUID_COUNT, seed=0):
             cx = left + R + shift + k * 2 * R
             col = [int(c) for c in lo + rng.uniform() * (hi - lo)]
             size = r * rng.uniform(0.85, 1.0)  # not all the same size, so they don't lock into a crystal
-            world.add(SoftBody(polygon_points(cx, cy, size, 6, angle=rng.uniform(0, math.pi / 3)), stiffness=0.1,
-                               skip_sets=2, point_radius=2, **_style(col)))
+            bodies.append(SoftBody(polygon_points(cx, cy, size, 6, angle=rng.uniform(0, math.pi / 3)), stiffness=0.1,
+                                   skip_sets=2, point_radius=2, **_style(col)))
         row += 1
+    world.add_many(bodies)
     return world
 
 

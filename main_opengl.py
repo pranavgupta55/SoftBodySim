@@ -37,6 +37,7 @@ import array
 import math
 import os
 import sys
+import threading
 import time
 from collections import namedtuple
 
@@ -264,6 +265,23 @@ class GLPresenter:
         self.hud_vao.render(mode=moderngl.TRIANGLE_STRIP)
         ctx.disable(moderngl.BLEND)
         ctx.viewport = (0, 0, fb_w, fb_h)
+
+
+def preload_gpu_backend():
+    """Import gpu_backend (and with it MLX, tens of ms) on a background thread, so the first world that runs on the
+    GPU (backend "auto" picks it for big scenes such as diamonds and fluid) doesn't pay for it when it's opened.
+    Only the import: kernels are still built on first use, on the main thread. Without MLX this does nothing (World
+    then imports it, and fails, exactly as before). Skipped when every world is forced onto the CPU."""
+    if EnvConfig.backend == "cpu" or "gpu_backend" in sys.modules:
+        return
+
+    def load():
+        try:
+            import gpu_backend  # noqa: F401  (the import system's lock makes a concurrent import wait for this one)
+        except Exception:
+            pass
+
+    threading.Thread(target=load, name="gpu-backend-preload", daemon=True).start()
 
 
 # ---------------- The game loop, presented through GLPresenter
@@ -546,6 +564,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 ctx.finish()
         with profiler.section("flip"):
             display.flip()
+        if frame_index == 0:  # the first frame is up: load the GPU backend while the next ones idle in clock.tick
+            preload_gpu_backend()
         if on_frame is not None:
             on_frame(frame_index, locals())
         frame_index += 1
