@@ -90,19 +90,21 @@ def tile_key(corners):
 
 
 def load_layout(path):
-    """A saved diamond layout: [tile_key, ...] (see save_layout)."""
+    """A saved diamond layout: ([tile_key, ...], (world_w, world_h) it was made for, or None) (see save_layout)."""
     with open(path) as f:
-        return [tuple(k) for k in json.load(f)["tiles"]]
+        data = json.load(f)
+    return [tuple(k) for k in data["tiles"]], tuple(data["size"]) if "size" in data else None
 
 
-def save_layout(path, diamonds, note=""):
-    """Write the picked diamonds' tile keys ([(corners, rgb)] from pick_diamonds) to `path` as JSON."""
+def save_layout(path, diamonds, size, note=""):
+    """Write the picked diamonds' tile keys ([(corners, rgb)] from pick_diamonds) and the world size they were picked
+    for to `path` as JSON."""
     with open(path, "w") as f:
-        json.dump({"note": note, "tiles": [tile_key(c) for c, _ in diamonds]}, f, indent=0)
+        json.dump({"note": note, "size": list(size), "tiles": [tile_key(c) for c, _ in diamonds]}, f, indent=0)
 
 
 def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, margin=10.0, top=20.0, size=None,
-                  gap=0.0, max_width=None, layout=None, remove=0, add=0, add_seed=0):
+                  gap=0.0, max_width=None, layout=None, layout_size=None, remove=0, add=0, add_seed=0):
     """A seeded random `fraction` of the diamonds (corners, rgb, face) in the playfield: at least `margin` in from the
     side walls (at x = side and world_w - side), at least `top` below the top edge (keeps the band where looping
     bodies re-enter clear), and centered above the bottom edge (there's no floor, so one may hang off the bottom).
@@ -111,7 +113,9 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, m
     corners up to `gap` apart) wider than `max_width`: clusters may grow tall, never into long horizontal chains.
     `size`: the tiling's edge length (for the cup test; default: from the first diamond). `layout`: tile keys
     (tile_key) to pick instead of random ones (those outside the playfield are left out; the rest are trusted to
-    follow the rules: forms_cup isn't symmetric, so re-testing them in another order could drop some).
+    follow the rules: forms_cup isn't symmetric, so re-testing them in another order could drop some). In a world
+    bigger than `layout_size` (the world it was made for), the area past it is topped up with random diamonds by the
+    rules, to the same `fraction` of its tiles.
     Then a variant of that layout: `remove` of its diamonds dropped at random and `add` new ones picked by the same
     rules (never one just removed), both seeded by (seed, add_seed). Returns [(corners, rgb)] in tiling order."""
     inside = [d for d in diamonds
@@ -149,6 +153,13 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, m
         index = {tuple(tile_key(d[0])): k for k, d in enumerate(inside)}
         order = [index[tuple(key)] for key in layout if tuple(key) in index]
         fill(order, len(order), trusted=True)
+        if layout_size is not None:  # top up the area past the layout's world (right / bottom strips)
+            lw, lh = layout_size
+            extra = [k for k, d in enumerate(inside) if d[0][0].max() > lw - side - margin or d[0][1].mean() > lh]
+            if extra:
+                rng0 = np.random.default_rng([seed, 1])
+                fill([extra[i] for i in rng0.permutation(len(extra))],
+                     len(chosen) + max(0, int(round(fraction * len(extra)))))
     rng = np.random.default_rng([seed, add_seed])
     if remove:  # drop some, then re-pick the rest (a subset of a valid layout is valid)
         drop = set(rng.choice(chosen, size=min(remove, len(chosen)), replace=False).tolist())

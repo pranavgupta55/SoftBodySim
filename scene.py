@@ -165,7 +165,8 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, fraction
     and `hexagons` soft hexagons of random sizes (DIAMONDS_HEX_SIZES) that fall through them. Colors come from
     palettes.py (the Palette card switches them, background and all). Every side loops, with no walls: what falls off
     the bottom comes back in at the top and what leaves one side comes in the other (looping.py).
-    layout: a saved layout file (DIAMONDS_LAYOUT; its diamonds that fit this world are used), or None for a seeded
+    layout: a saved layout file (DIAMONDS_LAYOUT; its diamonds that fit this world are used, and a bigger world than
+    the one it was made for is topped up with random ones past it), or None for a seeded
     random `fraction` of the tiling; remove / add / add_seed: a variant of it with that many diamonds dropped and
     added (diamonds_map.pick_diamonds)."""
     from diamonds_map import lattice_diamonds, load_layout, pick_diamonds, place_hexagons
@@ -176,10 +177,10 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, fraction
     for side in ("top", "bottom", "left", "right"):
         world.set_looping(side, True)
     tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed)
+    keys, size = load_layout(layout) if layout is not None else (None, None)
     diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, fraction=fraction, side=0.0,
                              margin=DIAMOND_WRAP_MARGIN, size=DIAMOND_SIDE, gap=CUP_GAP, max_width=DIAMOND_CHAIN_WIDTH,
-                             layout=None if layout is None else load_layout(layout), remove=remove, add=add,
-                             add_seed=add_seed)
+                             layout=keys, layout_size=size, remove=remove, add=add, add_seed=add_seed)
     rng = np.random.default_rng(seed + 2)  # each body's palette_pick: which of its role's colors it gets
     for corners, _ in diamonds:
         body = FixedBody(corners, point_radius=2)

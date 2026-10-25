@@ -427,7 +427,14 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     sidebar_shown = panel_open
                     continue
             if not sidebar_shown and event.type != pygame.KEYDOWN and event.type != pygame.KEYUP:
-                pass  # no sidebar: its cards take no clicks (the editor still gets them, below)
+                if session.open and event.type == pygame.MOUSEBUTTONDOWN:  # the Worlds panel (W) still takes clicks
+                    if hud.rect.collidepoint(event.pos) and not session.on_panel(event.pos):
+                        session.toggle()  # on the hidden cards: a click outside the panel
+                        continue
+                    if session.handle_event(event):
+                        world, editor = session.world, session.editor
+                        continue
+                # no sidebar: its cards take no other clicks (the editor still gets them, below)
             elif editor.scenes.state is None and session.handle_event(event):  # W, the Worlds card and panel
                 world, editor = session.world, session.editor  # (may switch worlds)
                 continue

@@ -370,6 +370,10 @@ class WorldSession:
         self.toggle()
         return True
 
+    def on_panel(self, pos):
+        """Is real screen px `pos` on the open panel?"""
+        return self.open and self._layout()["panel"].collidepoint(self.editor.to_ui(pos))
+
     # ---------------- Drawing (UI surface)
     def draw(self, surface, mouse_ui):
         if not self.open:
