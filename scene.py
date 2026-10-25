@@ -154,7 +154,9 @@ DIAMOND_WRAP_MARGIN = CUP_GAP / 2 + 1
 # its layout (diamonds_map.save_layout): picked by running variants for a while at a 1512x982 window and keeping the
 # one that left the hexagons most evenly spread (horizontal spread weighted 0.7, vertical 0.3). History: seed 12 of
 # seeds 0-15 (random layouts); then + 10 diamonds, best of 32 such offshoots (add_seed 21); then swap 2 out / 2 in,
-# best of 100 such variants run 30 s, top 8 re-run 3 min (add_seed 12: 0.993 vs 0.985 for the layout before it)
+# best of 100 such variants run 30 s, top 8 re-run 3 min (add_seed 12: 0.993 vs 0.985 for the layout before it).
+# All of that was at 1512x982; the real screen is 1800x1169 (a scaled display), so: topped up to that size, then the
+# same 100-variant sweep there (add_seed 69: 0.989 vs 0.981 over 3 min)
 DIAMONDS_LAYOUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "diamonds_layout.json")
 
 
