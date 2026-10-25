@@ -6,8 +6,8 @@ modulo their count), so switching palettes recolors the world in place without t
 remembers its palette in `World.palette` (None: it has no palettes, and the card is hidden).
 
 The card is a sidebar card provider (card_height / place / draw_card, see hud_layer.py), shown by main_opengl.py only
-while the active world has a palette: a button per palette, its name and a strip of its colors, and a fullscreen
-button (H; main_opengl.py switches to the world's sidebar-less twin and back).
+while the active world has a palette: a button per palette, its name and a strip of its colors, and a button that
+hides the panel (H; main_opengl.py floats the sidebar over its fullscreen worlds).
 """
 import pygame
 
@@ -57,24 +57,24 @@ def palette_colors(name):
 
 
 class PaletteCard:
-    """The sidebar's Palette card for the active world (`get_world()`): a button per palette, then a fullscreen
-    button that calls `on_fullscreen()`."""
+    """The sidebar's Palette card for the active world (`get_world()`): a button per palette, then a hide-panel
+    button that calls `on_hide()`."""
 
-    def __init__(self, get_world, on_fullscreen=None):
-        self.get_world, self.on_fullscreen = get_world, on_fullscreen
+    def __init__(self, get_world, on_hide=None):
+        self.get_world, self.on_hide = get_world, on_hide
         self.rect = pygame.Rect(0, 0, 0, 0)
 
     @staticmethod
     def card_height(compact=False):
         px, pad = HUD.px, HUD.CARD_PAD
-        n = len(PALETTES) + 1  # + the fullscreen button
+        n = len(PALETTES) + 1  # + the hide-panel button
         return pad + px(CARD_TITLE_H) + n * px(CARD_BTN_H) + (n - 1) * px(BTN_GAP) + pad - px(1)
 
     def place(self, rect):
         self.rect = pygame.Rect(rect)
 
     def _buttons(self):
-        """[(palette name, rect)], then (None, the fullscreen button's rect), in native screen px."""
+        """[(palette name, rect)], then (None, the hide-panel button's rect), in native screen px."""
         px, pad = HUD.px, HUD.CARD_PAD
         y, bh, gap = self.rect.y + pad + px(CARD_TITLE_H), px(CARD_BTN_H), px(BTN_GAP)
         return [(name, pygame.Rect(self.rect.x + pad, y + k * (bh + gap), self.rect.w - 2 * pad, bh))
@@ -88,8 +88,8 @@ class PaletteCard:
             for name, rect in self._buttons():
                 if rect.collidepoint(event.pos):
                     if name is None:
-                        if self.on_fullscreen is not None:
-                            self.on_fullscreen()
+                        if self.on_hide is not None:
+                            self.on_hide()
                     else:
                         apply_palette(self.get_world(), name)
         return True
@@ -104,7 +104,7 @@ class PaletteCard:
         for name, rect in self._buttons():
             local, on = rect.move(-ox, -oy), name == current
             if name is None:
-                HUD.draw_button(surface, local, "fullscreen [h]", rect.collidepoint(mouse_px))
+                HUD.draw_button(surface, local, "hide panel [h]", rect.collidepoint(mouse_px))
                 continue
             HUD.draw_button(surface, local, None, rect.collidepoint(mouse_px), on)
             HUD.text(surface, name, (local.x + px(5), local.centery), ui.WHITE if on else ui.TEXT_DIM, "bold",

@@ -3,6 +3,7 @@
 Importing this module has no side effects beyond defining things (no display, no game loop).
 """
 import math
+import os
 
 import numpy as np
 
@@ -143,54 +144,42 @@ BRIGHT_ENDESGA_32 = [c for c in ENDESGA_32 if sum(c) > 230]
 
 DIAMONDS_HEXAGONS = 140  # falling hexagons in the "diamonds" preset
 DIAMONDS_HEX_SIZES = (8.0, 12.0)  # circumradius range of its hexagons (uniform)
-# its layout: of seeds 0-15 run for 60 s at a 1512x982 window, 12 left the hexagons most evenly spread (horizontal
-# spread weighted 0.7, vertical 0.3; seed 7, the old one, drifted them left)
-DIAMONDS_SEED = 12
+DIAMONDS_SEED = 12  # its tiling colors, hexagon placement and palette picks (and the random layout, without one)
 DIAMOND_SIDE = 32.0  # edge length of its diamonds (world units)
 DIAMOND_CHAIN_WIDTH = 120.0  # a cluster of touching diamonds is at most this wide (tall is fine): no long ledges
-DIAMOND_MARGIN = 30.0  # diamonds stay this far in from the side walls
 CUP_GAP = 40.0  # diamonds whose corners are closer than this (the widest hexagon) can't form a cup either
-# "diamonds full" wraps left / right: diamonds stay this far from the seam, so two across it are over CUP_GAP apart
-# (no cups or ledges through the seam)
+# the world wraps left / right: diamonds stay this far from the seam, so two across it are over CUP_GAP apart (no
+# cups or ledges through the seam)
 DIAMOND_WRAP_MARGIN = CUP_GAP / 2 + 1
-# (extra diamonds, add_seed) for "diamonds full": of the base layout and 32 offshoots (10 extra diamonds each, add_seed
-# 0-31) run for 60 s at a 1512x982 window, add_seed 21 spread the hexagons most evenly (score 0.989 vs base 0.976;
-# 0.985 vs 0.964 over 3 min)
-DIAMONDS_FULL_ADD = (10, 21)
+# its layout (diamonds_map.save_layout): picked by running variants for a while at a 1512x982 window and keeping the
+# one that left the hexagons most evenly spread (horizontal spread weighted 0.7, vertical 0.3). History: seed 12 of
+# seeds 0-15 (random layouts); then + 10 diamonds, best of 32 such offshoots (add_seed 21); then swap 2 out / 2 in,
+# best of 100 such variants run 30 s, top 8 re-run 3 min (add_seed 12: 0.993 vs 0.985 for the layout before it)
+DIAMONDS_LAYOUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "diamonds_layout.json")
 
 
-def build_diamonds_full(world_width, world_height):
-    """"diamonds full" (the fullscreen twin of "diamonds", main_opengl.FULLSCREEN_TWINS): the same layout across the
-    whole window, wrapping left / right with no side walls, plus DIAMONDS_FULL_ADD extra diamonds."""
-    add, add_seed = DIAMONDS_FULL_ADD
-    return build_diamonds_scene(world_width, world_height, wrap=True, add=add, add_seed=add_seed)
-
-
-
-def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, fraction=0.09, hexagons=DIAMONDS_HEXAGONS, inset=INSET,
-                         wrap=False, add=0, add_seed=0):
-    """"diamonds" preset: a seeded random `fraction` of the rhombi of a tumbling-blocks tiling (edge DIAMOND_SIDE,
-    covering the world; never two that form a cup, diamonds_map.forms_cup) as fixed diamonds, and `hexagons` soft
-    hexagons of random sizes (DIAMONDS_HEX_SIZES) that fall through them. Colors come from palettes.py (the sidebar's
-    Palette card switches them; walls, background and all). Looping is on: there is no floor or ceiling, so what falls
-    off the bottom comes back in at the top, same x and velocity (looping.py). The side walls run a world size past
-    the screen at both ends, so bodies passing through the off-screen bands above and below stay between them.
-    wrap: no side walls either, left / right loop too (diamonds keep DIAMOND_WRAP_MARGIN from the seam instead);
-    add / add_seed: that many extra diamonds on top of the seed's layout (diamonds_map.pick_diamonds)."""
-    from diamonds_map import lattice_diamonds, pick_diamonds, place_hexagons
+def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, fraction=0.09, hexagons=DIAMONDS_HEXAGONS,
+                         inset=INSET, layout=DIAMONDS_LAYOUT, remove=0, add=0, add_seed=0):
+    """"diamonds" preset (fullscreen in main_opengl: the panel floats over it): fixed diamonds from a
+    tumbling-blocks tiling (edge DIAMOND_SIDE, covering the world; never two that form a cup, diamonds_map.forms_cup),
+    and `hexagons` soft hexagons of random sizes (DIAMONDS_HEX_SIZES) that fall through them. Colors come from
+    palettes.py (the Palette card switches them, background and all). Every side loops, with no walls: what falls off
+    the bottom comes back in at the top and what leaves one side comes in the other (looping.py).
+    layout: a saved layout file (DIAMONDS_LAYOUT; its diamonds that fit this world are used), or None for a seeded
+    random `fraction` of the tiling; remove / add / add_seed: a variant of it with that many diamonds dropped and
+    added (diamonds_map.pick_diamonds)."""
+    from diamonds_map import lattice_diamonds, load_layout, pick_diamonds, place_hexagons
     from palettes import DEFAULT, apply_palette
 
     world = World()
     add_world_box(world, world_width, world_height, inset)
-    world.set_looping("top", True)  # no ceiling: what loops off the bottom comes in from above the screen
-    world.set_looping("bottom", True)  # no floor
-    if wrap:  # no side walls: what leaves one side comes in the other
-        world.set_looping("left", True)
-        world.set_looping("right", True)
+    for side in ("top", "bottom", "left", "right"):
+        world.set_looping(side, True)
     tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed)
-    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, fraction=fraction, side=0.0 if wrap else inset,
-                             margin=DIAMOND_WRAP_MARGIN if wrap else DIAMOND_MARGIN, size=DIAMOND_SIDE, gap=CUP_GAP,
-                             max_width=DIAMOND_CHAIN_WIDTH, add=add, add_seed=add_seed)
+    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, fraction=fraction, side=0.0,
+                             margin=DIAMOND_WRAP_MARGIN, size=DIAMOND_SIDE, gap=CUP_GAP, max_width=DIAMOND_CHAIN_WIDTH,
+                             layout=None if layout is None else load_layout(layout), remove=remove, add=add,
+                             add_seed=add_seed)
     rng = np.random.default_rng(seed + 2)  # each body's palette_pick: which of its role's colors it gets
     for corners, _ in diamonds:
         body = FixedBody(corners, point_radius=2)
@@ -219,5 +208,5 @@ PRESETS = {
     "newtons cradle": build_newtons_cradle,
 }
 PRESETS.update(BASIC_PRESETS)  # blank, random walls, looping (presets_basic.py)
-# builders for fullscreen twins that differ from their preset (main_opengl.FULLSCREEN_TWINS; others reuse the preset)
-FULLSCREEN_BUILDERS = {"diamonds": build_diamonds_full}
+# presets built across the whole window with no sidebar; H shows / hides it as a panel floating over the world
+FULLSCREEN_PRESETS = {"diamonds"}

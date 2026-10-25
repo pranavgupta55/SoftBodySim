@@ -19,7 +19,7 @@ it's uploaded only when it changes.
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
 GLSL 330 shaders. Hotkeys (all listed on the sidebar's Controls card): F compute card full / summary, G grid,
-V filled/points view, T motion trails, SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, ESC quit,
+V filled/points view, T motion trails, SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), ESC quit,
 1-4 debug overlays (debug_overlay.py), [ / ] or the Controls card's - / + physics speed 1%-10000% and N one physics frame while paused (timectl.py).
 
 Worlds: `session` (world_selector.WorldSession) holds the Custom world and the preset worlds; `world` and `editor`
@@ -42,7 +42,7 @@ from collections import namedtuple
 import moderngl
 import pygame
 
-from scene import Endesga, ViewConfig, INSET, PRESETS, FULLSCREEN_BUILDERS
+from scene import Endesga, ViewConfig, INSET, PRESETS, FULLSCREEN_PRESETS
 from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
 from perf_hud import PerfHUD
@@ -50,7 +50,7 @@ from hud_layer import HudLayer
 from world_selector import WorldSession
 from trails import Trails
 from gravity_dial import GravityDial
-from palettes import PaletteCard, apply_palette
+from palettes import PaletteCard
 from debug_overlay import DebugOverlays
 from timectl import TimeControl
 
@@ -274,11 +274,6 @@ def draw_sidebar(hud, editor, perf_hud, mouse_px, draw_top):
     hud.overlay(draw_top)
 
 
-# Worlds with a fullscreen twin: the same preset built across the whole window, shown without the sidebar (H switches
-# between them; in the twin, SPACE shows / hides the sidebar as a floating panel over the world instead of pausing)
-FULLSCREEN_TWINS = {"diamonds": "diamonds full"}
-
-
 def grid_colors(background):
     """draw_grid colors for a world's own background: its default ones (made for Endesga.my_blue) are lifted toward
     white by about as much as they are from my_blue. None (the default background) keeps the defaults."""
@@ -332,7 +327,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     world_view = screen2.subsurface((0, 0) + world_px)  # the grid, trails and bodies are drawn in the world area only
     profiler = Profiler()
 
-    full_width = screen_width / ViewConfig.zoom  # a fullscreen twin's world: the whole window
+    full_width = screen_width / ViewConfig.zoom  # a fullscreen world's width: the whole window
     no_sidebar = pygame.Rect(win_w, 0, 0, win_h)  # a fullscreen editor's sidebar while the panel is hidden
 
     def make_editor(w):
@@ -341,32 +336,24 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                       scaleDownFactor, INSET, ViewConfig.zoom, view=ViewConfig, screen_size=display.window_size,
                       sidebar=no_sidebar if full else hud.rect)
 
-    def build_twin(name):
+    def build_fullscreen(builder):
         def build(_w, h):
-            w = FULLSCREEN_BUILDERS.get(name, PRESETS[name])(full_width, h)
+            w = builder(full_width, h)
             w.fullscreen = True
             return w
         return build
 
-    presets = dict(PRESETS)
-    presets.update({twin: build_twin(name) for name, twin in FULLSCREEN_TWINS.items()})
-    twins = {**FULLSCREEN_TWINS, **{twin: name for name, twin in FULLSCREEN_TWINS.items()}}
-    panel_open = False  # the floating sidebar in a fullscreen world (SPACE)
+    presets = {name: build_fullscreen(b) if name in FULLSCREEN_PRESETS else b for name, b in PRESETS.items()}
+    panel_open = False  # the sidebar floating over a fullscreen world (H)
     shown_name = None  # the active world's name last frame (a fullscreen world is unpaused when it's switched to)
 
-    def toggle_fullscreen():
-        """H / the Palette card's button: switch to the active world's twin, keeping its palette; the fullscreen one
-        always runs (SPACE opens the panel there instead of pausing), the normal one keeps the run state."""
+    def toggle_panel():
+        """H / the Palette card's button, in a fullscreen world: show / hide the sidebar as a panel floating over
+        the right side of the world (the world keeps its size and shape)."""
         nonlocal panel_open
-        twin = twins.get(session.name)
-        if twin is None:
-            return
-        old, paused = session.world, session.editor.paused
-        session.switch(session.index(twin))
-        if old.palette is not None and session.world.palette is not None:
-            apply_palette(session.world, old.palette)
-        session.editor.paused = False if getattr(session.world, "fullscreen", False) else paused
-        panel_open = False
+        if getattr(session.world, "fullscreen", False):
+            panel_open = not panel_open
+            session.editor.sidebar = hud.rect if panel_open else no_sidebar
 
     # Custom (the default scene at launch, kept for the session) + the presets; only the active world steps, and it
     # alone has the profiler attached (the session moves it)
@@ -378,7 +365,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     # the sidebar's cards, top to bottom (hud_layer.py describes a card provider; append new cards here)
     # (the Controls card is the active world's editor: the session swaps it in this list when it switches worlds)
     hud.cards = [editor, session, perf_hud, gravity_dial]
-    palette_card = PaletteCard(lambda: session.world, toggle_fullscreen)  # last, while the active world has palettes
+    palette_card = PaletteCard(lambda: session.world, toggle_panel)  # last, while the active world has palettes
     session.bind_cards(hud.cards)
     hud.layout()
 
@@ -435,16 +422,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
             if event.type == pygame.QUIT:
                 running = False
             if event.type == pygame.KEYDOWN and editor.scenes.state is None and not editor.active:
-                if event.key == pygame.K_h and session.name in twins:  # H: fullscreen twin and back
-                    toggle_fullscreen()
-                    world, editor = session.world, session.editor
-                    full = getattr(world, "fullscreen", False)
-                    sidebar_shown = not full
-                    editor.sidebar = no_sidebar if full else editor.sidebar
-                    continue
-                if event.key == pygame.K_SPACE and full:  # fullscreen: SPACE shows / hides the floating panel
-                    panel_open = sidebar_shown = not panel_open
-                    editor.sidebar = hud.rect if panel_open else no_sidebar
+                if event.key == pygame.K_h and full:  # H: the floating panel over a fullscreen world
+                    toggle_panel()
+                    sidebar_shown = panel_open
                     continue
             if not sidebar_shown and event.type != pygame.KEYDOWN and event.type != pygame.KEYUP:
                 pass  # no sidebar: its cards take no clicks (the editor still gets them, below)
