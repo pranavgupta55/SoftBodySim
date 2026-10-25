@@ -346,6 +346,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     presets = {name: build_fullscreen(b) if name in FULLSCREEN_PRESETS else b for name, b in PRESETS.items()}
     panel_open = False  # the sidebar floating over a fullscreen world (H)
     shown_name = None  # the active world's name last frame (a fullscreen world is unpaused when it's switched to)
+    grid_world = None  # the world whose G grid state ViewConfig.show_grid holds
 
     def toggle_panel():
         """H / the Palette card's button, in a fullscreen world: show / hide the sidebar as a panel floating over
@@ -388,6 +389,11 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         profiler.frame()
         world, editor = session.world, session.editor  # the active world (anything may have switched / replaced it)
         full = getattr(world, "fullscreen", False)
+        if world is not grid_world:  # G is per world: keep the old one's grid state, take the new one's (default on)
+            if grid_world is not None:
+                grid_world.show_grid = ViewConfig.show_grid
+            ViewConfig.show_grid = getattr(world, "show_grid", True)
+            grid_world = world
         if full and session.name != shown_name:  # a fullscreen world runs however it was opened (H, W panel, ...)
             editor.paused, panel_open = False, False
         shown_name = session.name

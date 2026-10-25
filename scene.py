@@ -142,35 +142,32 @@ ENDESGA_32 = [Endesga.rust_red, Endesga.burnt_orange, Endesga.sand, Endesga.tan,
 # ...minus the darkest few, which vanish against the background (Endesga.my_blue)
 BRIGHT_ENDESGA_32 = [c for c in ENDESGA_32 if sum(c) > 230]
 
-DIAMONDS_HEXAGONS = 140  # falling hexagons in the "diamonds" preset
-DIAMONDS_HEX_SIZES = (8.0, 12.0)  # circumradius range of its hexagons (uniform)
-DIAMONDS_SEED = 12  # its tiling colors, hexagon placement and palette picks (and the random layout, without one)
-DIAMOND_SIDE = 32.0  # edge length of its diamonds (world units)
+DIAMONDS_SHAPES = 168  # falling soft shapes in the "diamonds" preset: hexagons and heptagons, alternating
+DIAMONDS_HEX_SIZES = (8.0, 12.0)  # circumradius range of those shapes (uniform)
+DIAMONDS_SEED = 12  # its tiling colors, shape placement and palette picks (and the random layout, without one)
+DIAMOND_SIDE = 28.8  # edge length of its diamonds (world units)
+DIAMOND_DENSITY = 210 / (1800 * 1169)  # diamonds per square world unit of a random layout (210 on a 1800x1169 screen)
 DIAMOND_CHAIN_WIDTH = 120.0  # a cluster of touching diamonds is at most this wide (tall is fine): no long ledges
-CUP_GAP = 40.0  # diamonds whose corners are closer than this (the widest hexagon) can't form a cup either
-# the world wraps left / right: diamonds stay this far from the seam, so two across it are over CUP_GAP apart (no
-# cups or ledges through the seam)
-DIAMOND_WRAP_MARGIN = CUP_GAP / 2 + 1
-# its layout (diamonds_map.save_layout): picked by running variants for a while at a 1512x982 window and keeping the
-# one that left the hexagons most evenly spread (horizontal spread weighted 0.7, vertical 0.3). History: seed 12 of
-# seeds 0-15 (random layouts); then + 10 diamonds, best of 32 such offshoots (add_seed 21); then swap 2 out / 2 in,
-# best of 100 such variants run 30 s, top 8 re-run 3 min (add_seed 12: 0.993 vs 0.985 for the layout before it).
-# All of that was at 1512x982; the real screen is 1800x1169 (a scaled display), so: topped up to that size, then the
-# same 100-variant sweep there (add_seed 69: 0.989 vs 0.981 over 3 min)
+CUP_GAP = 40.0  # diamonds whose corners are closer than this (the widest shape) can't form a cup either
+# its layout (diamonds_map.save_layout): picked by running variants and keeping the one that left the shapes most
+# evenly spread (see maps/diamonds_layout.json's note for how)
 DIAMONDS_LAYOUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "diamonds_layout.json")
 
 
-def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, fraction=0.09, hexagons=DIAMONDS_HEXAGONS,
-                         inset=INSET, layout=DIAMONDS_LAYOUT, remove=0, add=0, add_seed=0):
-    """"diamonds" preset (fullscreen in main_opengl: the panel floats over it): fixed diamonds from a
-    tumbling-blocks tiling (edge DIAMOND_SIDE, covering the world; never two that form a cup, diamonds_map.forms_cup),
-    and `hexagons` soft hexagons of random sizes (DIAMONDS_HEX_SIZES) that fall through them. Colors come from
-    palettes.py (the Palette card switches them, background and all). Every side loops, with no walls: what falls off
-    the bottom comes back in at the top and what leaves one side comes in the other (looping.py).
-    layout: a saved layout file (DIAMONDS_LAYOUT; its diamonds that fit this world are used, and a bigger world than
-    the one it was made for is topped up with random ones past it), or None for a seeded
-    random `fraction` of the tiling; remove / add / add_seed: a variant of it with that many diamonds dropped and
-    added (diamonds_map.pick_diamonds)."""
+def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, shapes=DIAMONDS_SHAPES, inset=INSET,
+                         layout=DIAMONDS_LAYOUT, remove=0, add=0, add_seed=0):
+    """"diamonds" preset (fullscreen in main_opengl: the panel floats over it; grid off): fixed diamonds from a
+    tumbling-blocks tiling (edge DIAMOND_SIDE, its top row at the top edge; never two that form a cup,
+    diamonds_map.forms_cup, even across the wraps), and `shapes` soft hexagons and heptagons (half each) of random
+    sizes (DIAMONDS_HEX_SIZES) that fall through them. Colors come from palettes.py (the Palette card switches them,
+    background and all). Every side loops, with no walls: what falls off the bottom comes back in at the top and what
+    leaves one side comes in the other (looping.py). Diamonds lie wholly on screen, anywhere; the tiling's top faces
+    touch the top edge and its last full row ends less than a row above the bottom edge, so rows meet across the
+    top / bottom wrap about a row apart.
+    layout: a saved layout file (DIAMONDS_LAYOUT) or (tile keys, world size it was made for); its diamonds that fit
+    this world are used, and a bigger world than the one it was made for is topped up with random ones past it.
+    None: a seeded random layout of DIAMOND_DENSITY. remove / add / add_seed: a variant of it with that many diamonds
+    dropped and added (diamonds_map.pick_diamonds)."""
     from diamonds_map import lattice_diamonds, load_layout, pick_diamonds, place_hexagons
     from palettes import DEFAULT, apply_palette
 
@@ -178,21 +175,24 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, fraction
     add_world_box(world, world_width, world_height, inset)
     for side in ("top", "bottom", "left", "right"):
         world.set_looping(side, True)
-    tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed)
-    keys, size = load_layout(layout) if layout is not None else (None, None)
-    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, fraction=fraction, side=0.0,
-                             margin=DIAMOND_WRAP_MARGIN, size=DIAMOND_SIDE, gap=CUP_GAP, max_width=DIAMOND_CHAIN_WIDTH,
-                             layout=keys, layout_size=size, remove=remove, add=add, add_seed=add_seed)
+    world.show_grid = False  # the G grid overlay starts off here (main_opengl keeps G per world)
+    tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed, y0=DIAMOND_SIDE)
+    keys, size = load_layout(layout) if isinstance(layout, str) else layout if layout is not None else (None, None)
+    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=DIAMOND_SIDE, gap=CUP_GAP,
+                             max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
+                             add_seed=add_seed, count=int(round(DIAMOND_DENSITY * world_width * world_height)))
     rng = np.random.default_rng(seed + 2)  # each body's palette_pick: which of its role's colors it gets
     for corners, _ in diamonds:
         body = FixedBody(corners, point_radius=2)
         body.palette_role, body.palette_pick = "diamond", int(rng.integers(1 << 30))
         world.add(body)
-    for cx, cy, r, angle in place_hexagons([c for c, _ in diamonds], world_width, world_height, hexagons, seed=seed,
-                                           r_min=DIAMONDS_HEX_SIZES[0], r_max=DIAMONDS_HEX_SIZES[1], side=inset):
-        body = SoftBody(polygon_points(cx, cy, r, 6, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
+    for k, (cx, cy, r, angle) in enumerate(place_hexagons([c for c, _ in diamonds], world_width, world_height, shapes,
+                                                          seed=seed, r_min=DIAMONDS_HEX_SIZES[0],
+                                                          r_max=DIAMONDS_HEX_SIZES[1], side=inset)):
+        n = 6 if k % 2 == 0 else 7  # hexagons and heptagons, alternating
+        body = SoftBody(polygon_points(cx, cy, r, n, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
                         point_radius=2)
-        body.palette_role, body.palette_pick = "hexagon", int(rng.integers(1 << 30))
+        body.palette_role, body.palette_pick = "hexagon", int(rng.integers(1 << 30))  # (role: the falling shapes)
         world.add(body)
     for wall in world.walls.values():
         wall.palette_role = "wall"

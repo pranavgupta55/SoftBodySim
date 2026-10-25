@@ -29,10 +29,11 @@ def cube_faces(c, side):
     return {face: np.array([[cx + dx for dx, _ in v], [cy + dy for _, dy in v]]) for face, v in pts.items()}
 
 
-def lattice_diamonds(world_w, world_h, side, seed=7, palette=None):
+def lattice_diamonds(world_w, world_h, side, seed=7, palette=None, y0=0.0):
     """Every diamond of a tumbling-blocks tiling with edge length `side` covering the world: [(corners (2, 4),
     rgb, face)], each a random palette color (default: the image's, maps/diamonds.json, minus its dark navy, which
-    vanishes against the background). Cubes sit in rows 1.5 side apart, alternate rows shifted half a cube."""
+    vanishes against the background). Cubes sit in rows 1.5 side apart, alternate rows shifted half a cube; the
+    whole tiling is shifted down by `y0` (y0 = side: the top faces of the first row touch the top edge)."""
     if palette is None:
         palette = [c for c in load_tiling()["palette"] if sum(c) > 230]
     rng = np.random.default_rng(seed)
@@ -40,7 +41,7 @@ def lattice_diamonds(world_w, world_h, side, seed=7, palette=None):
     out = []
     for j in range(-1, int(world_h / (1.5 * side)) + 3):
         for i in range(-1, int(world_w / w) + 3):
-            c = (i * w + (w / 2 if j % 2 else 0.0), j * 1.5 * side)
+            c = (i * w + (w / 2 if j % 2 else 0.0), y0 + j * 1.5 * side)
             for face, corners in cube_faces(c, side).items():
                 out.append((corners, list(palette[int(rng.integers(len(palette)))]), face))
     return out
@@ -103,28 +104,32 @@ def save_layout(path, diamonds, size, note=""):
         json.dump({"note": note, "size": list(size), "tiles": [tile_key(c) for c, _ in diamonds]}, f, indent=0)
 
 
-def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, margin=10.0, top=20.0, size=None,
-                  gap=0.0, max_width=None, layout=None, layout_size=None, remove=0, add=0, add_seed=0):
-    """A seeded random `fraction` of the diamonds (corners, rgb, face) in the playfield: at least `margin` in from the
-    side walls (at x = side and world_w - side), at least `top` below the top edge (keeps the band where looping
-    bodies re-enter clear), and centered above the bottom edge (there's no floor, so one may hang off the bottom).
-    A diamond that would form a cup with one already picked (forms_cup; corners up to `gap` apart count as touching)
-    is skipped and the next random one tried, as is one that would make a cluster (picked diamonds linked by
-    corners up to `gap` apart) wider than `max_width`: clusters may grow tall, never into long horizontal chains.
+def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, gap=0.0, max_width=None,
+                  layout=None, layout_size=None, remove=0, add=0, add_seed=0, count=None):
+    """A seeded random `fraction` (or `count`) of the diamonds (corners, rgb, face) lying wholly inside the world (0, 0, world_w,
+    world_h), which wraps on every side (looping, no walls). A diamond that would form a cup with one already picked
+    (forms_cup; corners up to `gap` apart count as touching) is skipped and the next random one tried, as is one that
+    would make a cluster (picked diamonds linked by corners up to `gap` apart) wider than `max_width`: clusters may
+    grow tall, never into long horizontal chains. Both rules also see across the wraps (each picked diamond's copies
+    a world width / height away); a cluster can't link across the left / right seam (its width would be ambiguous).
     `size`: the tiling's edge length (for the cup test; default: from the first diamond). `layout`: tile keys
-    (tile_key) to pick instead of random ones (those outside the playfield are left out; the rest are trusted to
-    follow the rules: forms_cup isn't symmetric, so re-testing them in another order could drop some). In a world
-    bigger than `layout_size` (the world it was made for), the area past it is topped up with random diamonds by the
-    rules, to the same `fraction` of its tiles.
+    (tile_key) to pick instead of random ones (those outside the world are left out; the rest are trusted to follow
+    the rules: forms_cup isn't symmetric, so re-testing them in another order could drop some). In a world bigger
+    than `layout_size` (the world it was made for), the area past it is topped up with random diamonds by the rules,
+    to the same `fraction` of its tiles.
     Then a variant of that layout: `remove` of its diamonds dropped at random and `add` new ones picked by the same
     rules (never one just removed), both seeded by (seed, add_seed). Returns [(corners, rgb)] in tiling order."""
-    inside = [d for d in diamonds
-              if d[0][0].min() >= side + margin and d[0][0].max() <= world_w - side - margin
-              and d[0][1].min() >= top and d[0][1].mean() <= world_h]
+    eps = 1e-6
+    inside = [d for d in diamonds if d[0][0].min() >= -eps and d[0][0].max() <= world_w + eps
+              and d[0][1].min() >= -eps and d[0][1].max() <= world_h + eps]
     if not inside:
         return []
     size = float(np.hypot(*(inside[0][0][:, 1] - inside[0][0][:, 0]))) if size is None else size
+    fraction = fraction if count is None else count / len(inside)
     link = max(gap, 1e-6 * size)
+    reach = 2 * size + gap  # centers farther apart than this can't touch, cup or link
+    centers = np.array([d[0].mean(axis=1) for d in inside])
+    shifts = [(dx, dy) for dx in (0.0, -world_w, world_w) for dy in (0.0, -world_h, world_h)]
     chosen, cluster, banned = [], {}, set()  # cluster: picked index -> its cluster (a shared list of picked indices)
 
     def fill(order, target, trusted=False):  # trusted: already checked (a saved layout), just rebuild the clusters
@@ -133,12 +138,26 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, m
                 break
             if k in cluster or k in banned:
                 continue
-            p = inside[k][0]
-            if not trusted and any(forms_cup(p, inside[m][0], size, gap) for m in chosen):
+            p, near, ok = inside[k][0], [], True
+            for m in chosen:
+                for dx, dy in shifts:
+                    if abs(centers[m][0] + dx - centers[k][0]) > reach or abs(centers[m][1] + dy - centers[k][1]) > reach:
+                        continue
+                    q = inside[m][0] + np.array([[dx], [dy]])
+                    if not trusted and forms_cup(p, q, size, gap):
+                        ok = False
+                    elif _corner_gap(p, q) <= link:
+                        if dx:
+                            ok = trusted  # no cluster through the left / right seam
+                        near.append(m)
+                    if not ok:
+                        break
+                if not ok:
+                    break
+            if not ok:
                 continue
-            near = [m for m in chosen if _corner_gap(p, inside[m][0]) <= link]
             merged = {id(c): c for c in (cluster[m] for m in near)}.values()
-            members = [int(k)] + [m for c in merged for m in c]
+            members = list(dict.fromkeys([int(k)] + [m for c in merged for m in c]))
             if max_width is not None and not trusted:
                 xs = np.concatenate([inside[m][0][0] for m in members])
                 if xs.max() - xs.min() > max_width:
@@ -155,7 +174,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, side=5.0, m
         fill(order, len(order), trusted=True)
         if layout_size is not None:  # top up the area past the layout's world (right / bottom strips)
             lw, lh = layout_size
-            extra = [k for k, d in enumerate(inside) if d[0][0].max() > lw - side - margin or d[0][1].mean() > lh]
+            extra = [k for k, d in enumerate(inside) if d[0][0].max() > lw + eps or d[0][1].max() > lh + eps]
             if extra:
                 rng0 = np.random.default_rng([seed, 1])
                 fill([extra[i] for i in rng0.permutation(len(extra))],
