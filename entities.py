@@ -46,6 +46,18 @@ class EnvConfig:
     jit = True
 
 
+# Small steps (research 01 and 10 F8): more substeps, fewer solver passes. Energy, free fall, chain stretch and
+# rigid shape error follow the substep length, not the iteration count: 8x1 halves the pendulum's energy loss and
+# 16x1 quarters it, and both take the pile-whip zone fallbacks to 0. Not the default (measured on numba CPU and the
+# GPU, 10-40% / 20-100% slower per frame than 4x4): with today's PBD springs, fewer passes leave soft bodies
+# wobbling at rest (8x1) and 16x1 topples research 10's soft box stack; 8x1 also needs more impact-zone fallbacks
+# when a body is dragged into a pile (one contact pass per substep). Revisit with XPBD springs.
+# Opt in per world with world.env.update(SMALL_STEPS) (saved with the scene), or app-wide: main_opengl.py --steps 8x1.
+# (8x2, --steps 8x2, was the best all-round schedule measured: 0 FAIL, fewer drag fallbacks than 4x4, ~1.1-1.25x.)
+SMALL_STEPS = {"substeps": 8, "iterations": 1}
+FINE_STEPS = {"substeps": 16, "iterations": 1}
+
+
 def rect_points(cx, cy, w, h):
     """(2, 4) corners: top-left, top-right, bottom-right, bottom-left."""
     return np.array([[cx - w / 2, cx + w / 2, cx + w / 2, cx - w / 2],

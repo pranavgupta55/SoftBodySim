@@ -16,6 +16,7 @@ it's uploaded only when it changes.
     python3 main_opengl.py --scene "newtons cradle"    e.g. this one (quote names with spaces)
     python3 main_opengl.py --basic              the Framework pipeline as-is: layers composited on the CPU into one
                                                 surface, uploaded as one texture, drawn by shaders/basic.frag
+    python3 main_opengl.py --steps 8x1          small steps: 8 substeps x 1 solver iteration per frame (default 4x4)
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
 GLSL 330 shaders. Hotkeys (all listed on the sidebar's Controls card): F compute card full / summary, G grid,
@@ -42,6 +43,7 @@ from collections import namedtuple
 import moderngl
 import pygame
 
+from entities import EnvConfig
 from scene import Endesga, ViewConfig, INSET, PRESETS, FULLSCREEN_PRESETS
 from editor import Editor, PEG_ALPHA, PEG_COL
 from profiler import Profiler
@@ -292,7 +294,15 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     folders = sorted({name.split("/", 1)[0] for name in PRESETS if "/" in name})
     parser.add_argument("--scene", default="default", choices=sorted(PRESETS) + folders,
                         help="preset scene to start with (a folder name: its first world)")
+    parser.add_argument("--steps", metavar="SxI",
+                        help="physics schedule for every world: substeps x solver iterations per frame, e.g. 8x1 "
+                             "(small steps, entities.SMALL_STEPS); default 4x4. A world's own env still wins")
     args = parser.parse_args(argv)
+    if args.steps:
+        try:
+            EnvConfig.substeps, EnvConfig.iterations = (max(1, int(v)) for v in args.steps.lower().split("x"))
+        except ValueError:
+            parser.error(f"--steps wants SxI, e.g. 8x1 (got {args.steps!r})")
 
     pygame.init()
     if display is None:
