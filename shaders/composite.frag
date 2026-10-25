@@ -7,7 +7,10 @@
 
 out vec4 f_color;
 
-uniform sampler2D u_game;   // screen2: the world (opaque background + bodies)
+uniform sampler2D u_world;  // the GPU world layer (gl_world.py: background, grid, trails, bodies), if u_world_on
+uniform bool u_world_on;
+uniform sampler2D u_game;   // screen2: the world (opaque background + bodies), or with u_world_on what pygame still
+                            // draws over it (debug overlays, the editor's previews) on a transparent surface
 uniform sampler2D u_ghost;  // screenT: translucent editor preview layer
 uniform sampler2D u_ui;     // screenUI: panels, cards, cursor (never shaken)
 
@@ -31,6 +34,10 @@ void main() {
     vec2 p = vec2(gl_FragCoord.x, u_fb_height - gl_FragCoord.y) - u_origin;
     vec3 col = u_background;
     // Same "over" blend pygame uses when blitting a per-pixel-alpha surface: dst = src * a + dst * (1 - a)
+    if (u_world_on) {
+        vec4 world = fetch(u_world, p - u_shake);
+        col = mix(col, world.rgb, world.a);
+    }
     vec4 game = fetch(u_game, p - u_shake);
     col = mix(col, game.rgb, game.a);
     vec4 ghost = fetch(u_ghost, p - u_shake);
