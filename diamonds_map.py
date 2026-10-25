@@ -97,11 +97,19 @@ def load_layout(path):
     return [tuple(k) for k in data["tiles"]], tuple(data["size"]) if "size" in data else None
 
 
-def save_layout(path, diamonds, size, note=""):
-    """Write the picked diamonds' tile keys ([(corners, rgb)] from pick_diamonds) and the world size they were picked
-    for to `path` as JSON."""
+def layout_spawn(path):
+    """A saved layout's own shape spawning settings ({} if it has none; see scene.DIAMONDS_SPAWN for the keys)."""
+    with open(path) as f:
+        return dict(json.load(f).get("spawn", {}))
+
+
+def save_layout(path, diamonds, size, note="", spawn=None, keys=None):
+    """Write the picked diamonds' tile keys ([(corners, rgb)] from pick_diamonds, or `keys` directly), the world size
+    they were picked for and (optional) the layout's own shape spawning settings to `path` as JSON."""
+    keys = [tile_key(c) for c, _ in diamonds] if keys is None else [list(k) for k in keys]
+    data = {"note": note, "size": list(size), **({"spawn": spawn} if spawn else {}), "tiles": keys}
     with open(path, "w") as f:
-        json.dump({"note": note, "size": list(size), "tiles": [tile_key(c) for c, _ in diamonds]}, f, indent=0)
+        json.dump(data, f, indent=0)
 
 
 def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, gap=0.0, max_width=None,

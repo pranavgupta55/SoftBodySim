@@ -142,34 +142,52 @@ ENDESGA_32 = [Endesga.rust_red, Endesga.burnt_orange, Endesga.sand, Endesga.tan,
 # ...minus the darkest few, which vanish against the background (Endesga.my_blue)
 BRIGHT_ENDESGA_32 = [c for c in ENDESGA_32 if sum(c) > 230]
 
-DIAMONDS_SHAPES = 168  # falling soft shapes in the "diamonds" preset: hexagons and heptagons, alternating
-DIAMONDS_HEX_SIZES = (8.0, 12.0)  # circumradius range of those shapes (uniform)
 DIAMONDS_SEED = 12  # its tiling colors, shape placement and palette picks (and the random layout, without one)
 DIAMOND_SIDE = 28.8  # edge length of its diamonds (world units)
-DIAMOND_DENSITY = 210 / (1800 * 1169)  # diamonds per square world unit of a random layout (210 on a 1800x1169 screen)
 DIAMOND_CHAIN_WIDTH = 120.0  # a cluster of touching diamonds is at most this wide (tall is fine): no long ledges
-CUP_GAP = 40.0  # diamonds whose corners are closer than this (the widest shape) can't form a cup either
-# its layout (diamonds_map.save_layout): picked by running variants and keeping the one that left the shapes most
-# evenly spread (see maps/diamonds_layout.json's note for how)
-DIAMONDS_LAYOUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "diamonds_layout.json")
+CUP_GAP = 40.0  # diamonds whose corners are closer than this can't form a cup either
+# shape spawning, for a new layout (each saved layout keeps its own: the file's "spawn", over these defaults)
+DIAMONDS_SPAWN = {
+    "shapes": 168,  # falling soft shapes
+    "sizes": [6.4, 14.4],  # their circumradius range (uniform)
+    "sides": [6, 7],  # their side counts, taken in turn: hexagons and heptagons, half each
+    "density": 1.2 * 210 / (1800 * 1169),  # diamonds per square world unit of a random layout (252 on 1800x1169)
+}
+# the diamonds folder: a world per saved layout (diamonds_map.save_layout), "diamonds/<file name>"; each was picked by
+# running variants and keeping the one that left the shapes most evenly spread (its note says how)
+DIAMONDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "diamonds")
+DIAMONDS_LAYOUT = os.path.join(DIAMONDS_DIR, "evolved 1.json")  # the default one
 
 
-def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, shapes=DIAMONDS_SHAPES, inset=INSET,
-                         layout=DIAMONDS_LAYOUT, remove=0, add=0, add_seed=0):
+def diamonds_spawn(layout=None, spawn=None):
+    """The shape spawning settings for a diamonds world: DIAMONDS_SPAWN, then the layout file's own, then `spawn`."""
+    from diamonds_map import layout_spawn
+    out = dict(DIAMONDS_SPAWN)
+    if isinstance(layout, str):
+        out.update(layout_spawn(layout))
+    out.update(spawn or {})
+    return out
+
+
+def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=INSET, layout=DIAMONDS_LAYOUT,
+                         remove=0, add=0, add_seed=0, spawn=None):
     """"diamonds" preset (fullscreen in main_opengl: the panel floats over it; grid off): fixed diamonds from a
     tumbling-blocks tiling (edge DIAMOND_SIDE, its top row at the top edge; never two that form a cup,
-    diamonds_map.forms_cup, even across the wraps), and `shapes` soft hexagons and heptagons (half each) of random
-    sizes (DIAMONDS_HEX_SIZES) that fall through them. Colors come from palettes.py (the Palette card switches them,
+    diamonds_map.forms_cup, even across the wraps), and soft shapes (hexagons and heptagons, half each) of random
+    sizes that fall through them: how many, what sizes and sides come from diamonds_spawn (the layout file's own
+    settings over DIAMONDS_SPAWN, then `spawn`). Colors come from palettes.py (the Palette card switches them,
     background and all). Every side loops, with no walls: what falls off the bottom comes back in at the top and what
     leaves one side comes in the other (looping.py). Diamonds lie wholly on screen, anywhere; the tiling's top faces
     touch the top edge and its last full row ends less than a row above the bottom edge, so rows meet across the
     top / bottom wrap about a row apart.
     layout: a saved layout file (DIAMONDS_LAYOUT) or (tile keys, world size it was made for); its diamonds that fit
     this world are used, and a bigger world than the one it was made for is topped up with random ones past it.
-    None: a seeded random layout of DIAMOND_DENSITY. remove / add / add_seed: a variant of it with that many diamonds
+    None: a seeded random layout of the spawn settings' diamond density. remove / add / add_seed: a variant of it with that many diamonds
     dropped and added (diamonds_map.pick_diamonds)."""
     from diamonds_map import lattice_diamonds, load_layout, pick_diamonds, place_hexagons
     from palettes import DEFAULT, apply_palette
+
+    spawn = diamonds_spawn(layout, spawn)
 
     world = World()
     add_world_box(world, world_width, world_height, inset)
@@ -180,16 +198,18 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, shapes=D
     keys, size = load_layout(layout) if isinstance(layout, str) else layout if layout is not None else (None, None)
     diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=DIAMOND_SIDE, gap=CUP_GAP,
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
-                             add_seed=add_seed, count=int(round(DIAMOND_DENSITY * world_width * world_height)))
+                             add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)))
     rng = np.random.default_rng(seed + 2)  # each body's palette_pick: which of its role's colors it gets
     for corners, _ in diamonds:
         body = FixedBody(corners, point_radius=2)
         body.palette_role, body.palette_pick = "diamond", int(rng.integers(1 << 30))
         world.add(body)
-    for k, (cx, cy, r, angle) in enumerate(place_hexagons([c for c, _ in diamonds], world_width, world_height, shapes,
-                                                          seed=seed, r_min=DIAMONDS_HEX_SIZES[0],
-                                                          r_max=DIAMONDS_HEX_SIZES[1], side=inset)):
-        n = 6 if k % 2 == 0 else 7  # hexagons and heptagons, alternating
+    r_min, r_max = spawn["sizes"]
+    sides = spawn["sides"]
+    for k, (cx, cy, r, angle) in enumerate(place_hexagons([c for c, _ in diamonds], world_width, world_height,
+                                                          spawn["shapes"], seed=seed, r_min=r_min, r_max=r_max,
+                                                          side=inset)):
+        n = int(sides[k % len(sides)])  # side counts taken in turn
         body = SoftBody(polygon_points(cx, cy, r, n, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
                         point_radius=2)
         body.palette_role, body.palette_pick = "hexagon", int(rng.integers(1 << 30))  # (role: the falling shapes)
@@ -207,9 +227,20 @@ from presets_basic import PRESETS as BASIC_PRESETS  # noqa: E402
 
 PRESETS = {
     "default": build_scene,
-    "diamonds": build_diamonds_scene,
     "newtons cradle": build_newtons_cradle,
 }
 PRESETS.update(BASIC_PRESETS)  # blank, random walls, looping (presets_basic.py)
+
+
+def diamonds_presets():
+    """{"diamonds/<name>": builder} for each saved layout in DIAMONDS_DIR (a folder on the Worlds panel)."""
+    from functools import partial
+    names = sorted(f[:-5] for f in os.listdir(DIAMONDS_DIR) if f.endswith(".json"))
+    return {f"diamonds/{n}": partial(build_diamonds_scene, layout=os.path.join(DIAMONDS_DIR, n + ".json"))
+            for n in names}
+
+
+# the diamonds folder goes right after the default scene (first in the Worlds panel's list)
+PRESETS = {"default": PRESETS["default"], **diamonds_presets(), **{k: v for k, v in PRESETS.items() if k != "default"}}
 # presets built across the whole window with no sidebar; H shows / hides it as a panel floating over the world
-FULLSCREEN_PRESETS = {"diamonds"}
+FULLSCREEN_PRESETS = {name for name in PRESETS if name.startswith("diamonds/")}

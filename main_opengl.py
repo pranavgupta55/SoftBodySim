@@ -289,7 +289,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--window", help="windowed mode at WxH screen px instead of fullscreen, e.g. 1280x800")
     parser.add_argument("--basic", action="store_true", help="the Framework pipeline: CPU composite, one texture")
-    parser.add_argument("--scene", default="default", choices=sorted(PRESETS), help="preset scene to start with")
+    folders = sorted({name.split("/", 1)[0] for name in PRESETS if "/" in name})
+    parser.add_argument("--scene", default="default", choices=sorted(PRESETS) + folders,
+                        help="preset scene to start with (a folder name: its first world)")
     args = parser.parse_args(argv)
 
     pygame.init()
@@ -358,7 +360,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
 
     # Custom (the default scene at launch, kept for the session) + the presets; only the active world steps, and it
     # alone has the profiler attached (the session moves it)
-    session = WorldSession(presets, (world_width, world_height), make_editor, profiler, start=args.scene)
+    start = args.scene if args.scene in presets else next(n for n in presets if n.startswith(args.scene + "/"))
+    session = WorldSession(presets, (world_width, world_height), make_editor, profiler, start=start)
     world, editor = session.world, session.editor
     perf_hud = PerfHUD(profiler)
     trails = Trails()  # T: fading paths behind moving bodies, drawn under them
@@ -377,6 +380,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     def draw_top(surface, origin=(0, 0)):
         """What goes over the sidebar, at UI-surface px minus origin: the editor message and the cursor."""
         editor.draw_message(surface, origin)
+        if full and not panel_open and not session.open:
+            return  # a fullscreen world with its panel hidden (H): no cursor, just the world (W's panel still has one)
         cx, cy = mx - origin[0], my - origin[1]
         pygame.draw.circle(surface, Endesga.black, (cx + 1, cy + 1), 2, 1)
         pygame.draw.circle(surface, Endesga.white, (cx, cy), 2, 1)

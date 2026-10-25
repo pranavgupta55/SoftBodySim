@@ -54,6 +54,8 @@ RESET_W = 46
 GRID_W = 22
 COL_GAP = 8
 LINE_H = 13
+INDENT = 12  # a world inside a folder: its name button starts this far right
+FOLDER_SEP = "/"  # a preset named "folder/name" is listed inside that folder (a collapsible row)
 # UI attributes the main loop / keys set on the active editor, carried to the next one on a switch
 CARRIED = ("show_compute", "overlays", "time", "_card_pos")
 
@@ -120,6 +122,7 @@ class WorldSession:
         self.slots += [Slot(name, builder) for name, builder in presets.items() if name != "default"]
         self.active = 0
         self.open = False  # the panel
+        self.collapsed = set()  # folders closed on the panel (their worlds hidden; folders start open)
         self.confirm_until = 0.0  # the Custom Reset's confirmation window
         self._shared = None  # UI preferences shared by every world's editor (see _share_ui)
         self._cards = None  # the sidebar's card list (bind_cards): the active editor is swapped into it
@@ -289,31 +292,63 @@ class WorldSession:
         self.open = not self.open
         self.confirm_until = 0.0
 
+    @staticmethod
+    def folder_of(name):
+        """The folder a world's name puts it in ("diamonds/evolved 1" -> "diamonds"), or None."""
+        return name.split(FOLDER_SEP, 1)[0] if FOLDER_SEP in name else None
+
+    def toggle_folder(self, folder):
+        """Open / close a folder's row on the panel."""
+        self.collapsed ^= {folder}
+
+    def folder_open(self, folder):
+        return folder not in self.collapsed
+
+    def _entries(self):
+        """The panel's rows top to bottom: ("folder", name) the first time a folder comes up, then ("world", slot
+        index) for each world that's shown (one in a closed folder isn't)."""
+        out, seen = [], set()
+        for i, slot in enumerate(self.slots):
+            folder = self.folder_of(slot.name)
+            if folder is not None and folder not in seen:
+                seen.add(folder)
+                out.append(("folder", folder))
+            if folder is None or self.folder_open(folder):
+                out.append(("world", i))
+        return out
+
     # ---------------- Layout (UI px)
     def _layout(self):
         """{"panel", "close", "rows": [(slot index, name rect, [(side, toggle rect)], reset rect, [(size, grid rect)])],
-        "head_y", "foot_y"}, centered in the editor's free area (left of the HUD cards)."""
+        "folders": [(folder, rect)], "head_y", "foot_y"}, centered in the editor's free area (left of the HUD cards).
+        Rows are the shown worlds only (see _entries); a world in a folder has its name button indented."""
         nk = len(GRID_SIZES)
         w = (PAD + NAME_W + COL_GAP + 4 * TOGGLE_W + 3 * ROW_GAP + COL_GAP + nk * GRID_W + (nk - 1) * ROW_GAP + COL_GAP
              + RESET_W + PAD)
-        n = len(self.slots)
+        entries = self._entries()
+        n = len(entries)
         h = HEADER_H + LINE_H + n * (ROW_H + ROW_GAP) - ROW_GAP + PAD + 2 * LINE_H + PAD // 2
         area = self.editor._area()
         panel = pygame.Rect(max(ui.CARD_MARGIN, area.centerx - w // 2), max(ui.CARD_MARGIN, area.centery - h // 2), w, h)
         head_y = panel.y + HEADER_H
         y0 = head_y + LINE_H
-        rows = []
-        for i in range(n):
-            y = y0 + i * (ROW_H + ROW_GAP)
-            name = pygame.Rect(panel.x + PAD, y, NAME_W, ROW_H)
-            x = name.right + COL_GAP
+        rows, folders = [], []
+        for row, (kind, what) in enumerate(entries):
+            y = y0 + row * (ROW_H + ROW_GAP)
+            if kind == "folder":
+                folders.append((what, pygame.Rect(panel.x + PAD, y, NAME_W, ROW_H)))
+                continue
+            i = what
+            indent = INDENT if self.folder_of(self.slots[i].name) is not None else 0
+            name = pygame.Rect(panel.x + PAD + indent, y, NAME_W - indent, ROW_H)
+            x = panel.x + PAD + NAME_W + COL_GAP
             toggles = [(side, pygame.Rect(x + k * (TOGGLE_W + ROW_GAP), y, TOGGLE_W, ROW_H)) for k, side in enumerate(SIDES)]
             gx = toggles[-1][1].right + COL_GAP
             grids = [(size, pygame.Rect(gx + k * (GRID_W + ROW_GAP), y, GRID_W, ROW_H)) for k, size in enumerate(GRID_SIZES)]
             reset = pygame.Rect(grids[-1][1].right + COL_GAP, y, RESET_W, ROW_H)
             rows.append((i, name, toggles, reset, grids))
         close = pygame.Rect(panel.right - 6 - ROW_H, panel.y + 6, ROW_H, ROW_H)
-        return {"panel": panel, "close": close, "rows": rows, "head_y": head_y,
+        return {"panel": panel, "close": close, "rows": rows, "folders": folders, "head_y": head_y,
                 "foot_y": y0 + n * (ROW_H + ROW_GAP) - ROW_GAP + PAD}
 
     def _widgets(self):
@@ -321,6 +356,8 @@ class WorldSession:
         lay = self._layout()
         ws = [(lay["close"], self.toggle, ("button", "x", False, False))]
         confirming = time.time() <= self.confirm_until
+        for folder, rect in lay["folders"]:
+            ws.append((rect, lambda f=folder: self.toggle_folder(f), ("folder", folder)))
         for i, name, toggles, reset, grids in lay["rows"]:
             slot = self.slots[i]
             ws.append((name, lambda i=i: self.switch(i), ("world", i)))
@@ -397,6 +434,8 @@ class WorldSession:
                 ui.draw_button(surface, rect, spec[1], hovered, spec[2], spec[3])
             elif kind == "world":
                 self._draw_world_button(surface, rect, spec[1], hovered)
+            elif kind == "folder":
+                self._draw_folder_button(surface, rect, spec[1], hovered)
             elif kind == "loop":
                 _, i, side, on = spec
                 slot = self.slots[i]
@@ -413,6 +452,17 @@ class WorldSession:
             ui.text(surface, line, (panel.centerx, fy + k * LINE_H + LINE_H // 2), ui.ACCENT if (k and pending) else ui.TEXT_DIM,
                     align="center", valign="middle")
 
+    def _draw_folder_button(self, surface, rect, folder, hovered):
+        """A folder's row: open / closed marker, its name, and how many worlds it holds."""
+        ui.draw_button(surface, rect, None, hovered, False, False)
+        is_open = self.folder_open(folder)
+        cx, cy = rect.x + 7, rect.centery
+        tri = [(cx - 3, cy - 2), (cx + 3, cy - 2), (cx, cy + 2)] if is_open else [(cx - 2, cy - 3), (cx - 2, cy + 3), (cx + 2, cy)]
+        pygame.draw.polygon(surface, ui.WHITE, tri)
+        ui.text(surface, folder, (rect.x + 14, rect.centery), ui.WHITE, "bold", valign="middle")
+        count = sum(self.folder_of(s.name) == folder for s in self.slots)
+        ui.text(surface, f"{count} worlds", (rect.right - 5, rect.centery), ui.TEXT_DIM, align="right", valign="middle")
+
     def _draw_world_button(self, surface, rect, i, hovered):
         """The world's name, and its state on the right: running / paused / new (not built yet)."""
         slot = self.slots[i]
@@ -420,7 +470,7 @@ class WorldSession:
         ui.draw_button(surface, rect, None, hovered, active, False)
         state = "new" if not slot.built else "paused" if slot.editor.paused else "running"
         room = rect.w - 15 - ui.font().size(state)[0]
-        name = slot.name
+        name = slot.name.split(FOLDER_SEP, 1)[-1]  # (the folder row above says which folder)
         while len(name) > 1 and ui.font("bold").size(name)[0] > room:  # cut long names to fit before the state
             name = name.rstrip(".")[:-1].rstrip() + ".."
         ui.text(surface, name, (rect.x + 5, rect.centery), ui.WHITE, "bold", valign="middle")

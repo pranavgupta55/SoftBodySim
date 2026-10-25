@@ -1,9 +1,21 @@
 {
-"note": "diamonds layout at 1800x1169 (edge 28.8): random base (seed 12, 210 diamonds), then 5 rounds of 100 remove-3/add-3 variants run 60 s (round 1 from the base, then 20 children of each of the last round's top 5), score 0.9 x shape spread + 0.1 x diamond evenness (4x4 cells, 1/(1+std/mean)); round 5's top 8 re-run 3 min: final.r5.r4.r3.r2.r1.base.21.17.12.2.6 0.9865 vs base 0.9577",
+"note": "evolved 1 (2026-10-25): diamonds layout at 1800x1169 (edge 28.8): random base (seed 12, 210 diamonds), then 5 rounds of 100 remove-3/add-3 variants run 60 s (round 1 from the base, then 20 children of each of the last round's top 5), score 0.9 x shape spread + 0.1 x diamond evenness (4x4 cells, 1/(1+std/mean)); round 5's top 8 re-run 3 min: final.r5.r4.r3.r2.r1.base.21.17.12.2.6 0.9865 vs base 0.9577",
 "size": [
 1800.0,
 1169.0
 ],
+"spawn": {
+"shapes": 168,
+"sizes": [
+8.0,
+12.0
+],
+"sides": [
+6,
+7
+],
+"density": 9.98003992015968e-05
+},
 "tiles": [
 [
 87.3,
