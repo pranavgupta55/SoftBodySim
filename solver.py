@@ -620,6 +620,13 @@ class World:
         _span_left), grown by contact_radius, plus the edge boxes around them grown by 2 contact_radius more:
         (point lo, point hi, edge lo, edge hi). While every point stays in its box, any point within 2
         contact_radius of an edge has overlapping boxes with it, so the pairs are a superset of _candidates'."""
+        r = EnvConfig.contact_radius
+        plo, phi = self._span_point_boxes()
+        ea, eb = self.edges
+        return (plo, phi, np.minimum(plo[:, ea], plo[:, eb]) - 2 * r, np.maximum(phi[:, ea], phi[:, eb]) + 2 * r)
+
+    def _span_point_boxes(self):
+        """The point boxes of _span_boxes: (point lo, point hi)."""
         r, t = EnvConfig.contact_radius, self._span_left
         end = self.P + self.V * t + 0.5 * EnvConfig.gravity[:, None] * t * t * (self.W > 0)
         if self.grabbed is not None:  # the hand pulls toward the cursor at up to grab_max_speed
@@ -628,9 +635,7 @@ class World:
             reach = EnvConfig.grab_max_speed * t
             dist = float(np.hypot(*pull))
             end[:, g] = self.P[:, g] + self.V[:, g] * t + (pull if dist <= reach else pull * (reach / dist))
-        plo, phi = np.minimum(self.P, end) - r, np.maximum(self.P, end) + r
-        ea, eb = self.edges
-        return (plo, phi, np.minimum(plo[:, ea], plo[:, eb]) - 2 * r, np.maximum(phi[:, ea], phi[:, eb]) + 2 * r)
+        return np.minimum(self.P, end) - r, np.maximum(self.P, end) + r
 
     def _span_candidates(self):
         """Contact candidates and reach for a substep inside a CCD span: the span's swept-box candidate list
@@ -639,9 +644,13 @@ class World:
         sc = self._span_contacts
         if sc is not None and not ((self.P < sc[1]).any() or (self.P > sc[2]).any()):
             return sc[0], self._span_reach
-        boxes = self._span_boxes()
-        cells = [np.floor(box / EnvConfig.cell_size).astype(np.int64) for box in boxes]
-        candidates = self._filter_pairs(*self._cell_pairs(*cells), contact=True)
+        if _jit():  # same pairs in the same order, the edge boxes never built as floats
+            boxes = self._span_point_boxes()
+            candidates = solver_jit.span_candidates(self, *boxes, EnvConfig.cell_size, EnvConfig.contact_radius)
+        else:
+            boxes = self._span_boxes()
+            cells = [np.floor(box / EnvConfig.cell_size).astype(np.int64) for box in boxes]
+            candidates = self._filter_pairs(*self._cell_pairs(*cells), contact=True)
         self.contact_builds += 1
         self._span_contacts = (candidates, boxes[0], boxes[1])
         return candidates, None

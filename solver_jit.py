@@ -65,6 +65,12 @@ def candidates(world, cell, radius):
     return _pairs(world, pc, pc, lo, hi, True)
 
 
+def span_candidates(world, plo, phi, cell, radius):
+    """The candidate list of World._span_candidates from its point boxes (World._span_point_boxes)."""
+    _, ea, eb, *_ = _topology(world)
+    return _pairs(world, *span_cells(plo, phi, ea, eb, 2 * radius, cell), True)
+
+
 def solve_contacts(world, candidates, reach, r, mu):
     """World._solve_contacts (same `reach` protocol)."""
     P = world.P
@@ -501,6 +507,36 @@ def contact_cells(P, ea, eb, cell, pad):
 
 
 @njit(**NB)
+def _fmin(a, b):
+    """np.minimum of two floats (nan if either is nan)."""
+    return a if (a <= b or a != a) else b
+
+
+@njit(**NB)
+def _fmax(a, b):
+    """np.maximum of two floats (nan if either is nan)."""
+    return a if (a >= b or a != a) else b
+
+
+@njit(**NB)
+def span_cells(plo, phi, ea, eb, pad, cell):
+    """The cell ranges World._span_candidates floors from World._span_boxes, given its point boxes (float (2, N)):
+    point lo / hi (2, N) and lo / hi (2, E) of the edge boxes around them grown by `pad` (2 contact_radius), as
+    np.floor(box / cell) in int64, with the same float operations as the numpy expressions."""
+    N, E = plo.shape[1], ea.size
+    pl, ph = np.empty((2, N), np.int64), np.empty((2, N), np.int64)
+    el, eh = np.empty((2, E), np.int64), np.empty((2, E), np.int64)
+    for k in range(2):
+        for i in range(N):
+            pl[k, i] = np.int64(math.floor(plo[k, i] / cell))
+            ph[k, i] = np.int64(math.floor(phi[k, i] / cell))
+        for e in range(E):
+            el[k, e] = np.int64(math.floor((_fmin(plo[k, ea[e]], plo[k, eb[e]]) - pad) / cell))
+            eh[k, e] = np.int64(math.floor((_fmax(phi[k, ea[e]], phi[k, eb[e]]) + pad) / cell))
+    return pl, ph, el, eh
+
+
+@njit(**NB)
 def ccd_boxes(X0, D, ea, eb):
     """World._ccd_boxes: point lo / hi (2, N), edge lo / hi (2, E, grown by 1.0 px)."""
     N, E = X0.shape[1], ea.size
@@ -811,6 +847,7 @@ def warmup():
     cell_pairs(pc, pc, ec, ec, i2, i1, np.zeros(4, np.int64), np.zeros(2, np.int64), b, b, np.zeros(4, np.int64),
                np.ones(4, np.int64), i2, i1, True, 100)
     contact_cells(P, i2, i1, 24.0, 6.0)
+    span_cells(P, P, i2, i1, 6.0, 24.0)
     floor_cells(ccd_boxes(P, P, i2, i1)[0], 24.0)
     ccd_narrow(P, P, i2, i1, e, e, 0.01)
     impulse_pass(P.copy(), W, P, i2, i1, e, e, f, f, f, e, 0.004, 0.25)
