@@ -138,28 +138,34 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     reach = 2 * size + gap  # centers farther apart than this can't touch, cup or link
     centers = np.array([d[0].mean(axis=1) for d in inside])
     shifts = [(dx, dy) for dx in (0.0, -world_w, world_w) for dy in (0.0, -world_h, world_h)]
+    shift_x, shift_y = np.array([s[0] for s in shifts]), np.array([s[1] for s in shifts])
     chosen, cluster, banned = [], {}, set()  # cluster: picked index -> its cluster (a shared list of picked indices)
 
     def fill(order, target, trusted=False):  # trusted: already checked (a saved layout), just rebuild the clusters
+        # the picked diamonds' centers, in pick order (rows), for the reach test of every (picked, shift) pair at once:
+        # the same float operations as testing each pair in turn, so the same pairs go on to the exact tests below,
+        # in the same order (picked diamonds in pick order, each one's shifts in order)
+        cx_picked, cy_picked = np.empty(len(inside)), np.empty(len(inside))
+        for i, m in enumerate(chosen):
+            cx_picked[i], cy_picked[i] = centers[m]
         for k in order:
             if len(chosen) == target:
                 break
             if k in cluster or k in banned:
                 continue
             p, near, ok = inside[k][0], [], True
-            for m in chosen:
-                for dx, dy in shifts:
-                    if abs(centers[m][0] + dx - centers[k][0]) > reach or abs(centers[m][1] + dy - centers[k][1]) > reach:
-                        continue
-                    q = inside[m][0] + np.array([[dx], [dy]])
-                    if not trusted and forms_cup(p, q, size, gap):
-                        ok = False
-                    elif _corner_gap(p, q) <= link:
-                        if dx:
-                            ok = trusted  # no cluster through the left / right seam
-                        near.append(m)
-                    if not ok:
-                        break
+            n = len(chosen)
+            far = ((np.abs(cx_picked[:n, None] + shift_x - centers[k][0]) > reach)
+                   | (np.abs(cy_picked[:n, None] + shift_y - centers[k][1]) > reach))
+            for i, s in zip(*np.nonzero(~far)):
+                m, (dx, dy) = chosen[i], shifts[s]
+                q = inside[m][0] + np.array([[dx], [dy]])
+                if not trusted and forms_cup(p, q, size, gap):
+                    ok = False
+                elif _corner_gap(p, q) <= link:
+                    if dx:
+                        ok = trusted  # no cluster through the left / right seam
+                    near.append(m)
                 if not ok:
                     break
             if not ok:
@@ -172,6 +178,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                     continue
             for m in members:
                 cluster[m] = members
+            cx_picked[n], cy_picked[n] = centers[k]
             chosen.append(int(k))
 
     if layout is None:
@@ -218,15 +225,31 @@ def place_hexagons(obstacles, world_w, world_h, count, seed=7, r_min=8.0, r_max=
     the others. A hexagon lies inside its circle, so circle clearance is hexagon clearance. Seeded."""
     rng = np.random.default_rng(seed + 1)
     placed = []
+    # Speed only, same results: each test is first narrowed to the circles / obstacles whose bounding box comes
+    # within the clearance (plus a margin far above float error), then decided by the exact test as before. Anything
+    # farther than that in x or y can't be closer than the clearance, so the ones skipped could never fail it.
+    eps = 1e-6
+    obstacles = list(obstacles)
+    boxes = (np.array([[np.min(p[0]), np.max(p[0]), np.min(p[1]), np.max(p[1])] for p in obstacles])
+             if obstacles else np.empty((0, 4)))
+    circles = np.empty((count, 3))  # the placed circles' x, y, r
     for _ in range(count):
         for _ in range(tries):
             r = float(rng.uniform(r_min, r_max))
             lo_x, hi_x = side + r + gap, world_w - side - r - gap
             c = np.array([rng.uniform(lo_x, hi_x), rng.uniform(r + gap, world_h - r - gap)])
-            if any(math.hypot(c[0] - x, c[1] - y) < r + q + gap for x, y, q, _ in placed):
+            cx, cy, n = float(c[0]), float(c[1]), len(placed)
+            if n:
+                reach = circles[:n, 2] + (r + gap + eps)
+                near = np.flatnonzero((np.abs(circles[:n, 0] - cx) < reach) & (np.abs(circles[:n, 1] - cy) < reach))
+                if any(math.hypot(c[0] - placed[i][0], c[1] - placed[i][1]) < r + placed[i][2] + gap for i in near):
+                    continue
+            m = r + gap + eps
+            near = np.flatnonzero((boxes[:, 0] - m <= cx) & (cx <= boxes[:, 1] + m)
+                                  & (boxes[:, 2] - m <= cy) & (cy <= boxes[:, 3] + m))
+            if any(_dist_to_polygon(c, obstacles[i]) < r + gap for i in near):
                 continue
-            if any(_dist_to_polygon(c, poly) < r + gap for poly in obstacles):
-                continue
-            placed.append((float(c[0]), float(c[1]), r, float(rng.uniform(0, math.pi / 3))))
+            circles[n] = cx, cy, r
+            placed.append((cx, cy, r, float(rng.uniform(0, math.pi / 3))))
             break
     return placed

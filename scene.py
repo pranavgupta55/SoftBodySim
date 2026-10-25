@@ -200,10 +200,11 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
                              add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)))
     rng = np.random.default_rng(seed + 2)  # each body's palette_pick: which of its role's colors it gets
+    bodies = []  # added in one go at the end (one repack instead of one per body)
     for corners, _ in diamonds:
         body = FixedBody(corners, point_radius=2)
         body.palette_role, body.palette_pick = "diamond", int(rng.integers(1 << 30))
-        world.add(body)
+        bodies.append(body)
     r_min, r_max = spawn["sizes"]
     sides = spawn["sides"]
     for k, (cx, cy, r, angle) in enumerate(place_hexagons([c for c, _ in diamonds], world_width, world_height,
@@ -213,7 +214,8 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
         body = SoftBody(polygon_points(cx, cy, r, n, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
                         point_radius=2)
         body.palette_role, body.palette_pick = "hexagon", int(rng.integers(1 << 30))  # (role: the falling shapes)
-        world.add(body)
+        bodies.append(body)
+    world.add_many(bodies)
     for wall in world.walls.values():
         wall.palette_role = "wall"
     apply_palette(world, DEFAULT)
