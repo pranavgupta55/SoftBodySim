@@ -38,13 +38,16 @@ def lattice_diamonds(world_w, world_h, side, seed=7, palette=None, y0=0.0):
         palette = [c for c in load_tiling()["palette"] if sum(c) > 230]
     rng = np.random.default_rng(seed)
     w = 2 * side * SQRT3_2  # one cube's width
-    out = []
-    for j in range(-1, int(world_h / (1.5 * side)) + 3):
-        for i in range(-1, int(world_w / w) + 3):
-            c = (i * w + (w / 2 if j % 2 else 0.0), y0 + j * 1.5 * side)
-            for face, corners in cube_faces(c, side).items():
-                out.append((corners, list(palette[int(rng.integers(len(palette)))]), face))
-    return out
+    # every cube's front corner, row by row, then all faces' corners at once (cube_faces' arithmetic, element-wise)
+    fronts = [(i * w + (w / 2 if j % 2 else 0.0), y0 + j * 1.5 * side)
+              for j in range(-1, int(world_h / (1.5 * side)) + 3) for i in range(-1, int(world_w / w) + 3)]
+    offsets = cube_faces((0.0, 0.0), side)  # {face: (2, 4) corners around a front corner at the origin}
+    faces = list(offsets)
+    c = np.array(fronts, dtype=float).reshape(-1, 1, 2, 1)
+    corners = (c + np.array([offsets[f] for f in faces])[None]).reshape(-1, 2, 4)  # (cubes * 3, 2, 4)
+    # one draw per face in order: the same stream as drawing them one at a time
+    picks = rng.integers(len(palette), size=len(corners)).tolist() if len(corners) else []
+    return [(corners[k], list(palette[p]), faces[k % 3]) for k, p in enumerate(picks)]
 
 
 def _corner_arc(poly, k):
@@ -83,6 +86,14 @@ def forms_cup(p, q, side, gap=0.0):
 def _corner_gap(p, q):
     """The smallest distance between a corner of p and a corner of q ((2, n) each)."""
     return float(np.hypot(*(p[:, :, None] - q[:, None, :])).min())
+
+
+def _stack(diamonds):
+    """The diamonds' corners as one (n, 2, k) float array, or None if their corner arrays differ in shape."""
+    shapes = {np.shape(d[0]) for d in diamonds}
+    if len(shapes) != 1:
+        return None
+    return np.array([d[0] for d in diamonds], dtype=float)
 
 
 def tile_key(corners):
@@ -128,15 +139,24 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     Then a variant of that layout: `remove` of its diamonds dropped at random and `add` new ones picked by the same
     rules (never one just removed), both seeded by (seed, add_seed). Returns [(corners, rgb)] in tiling order."""
     eps = 1e-6
-    inside = [d for d in diamonds if d[0][0].min() >= -eps and d[0][0].max() <= world_w + eps
-              and d[0][1].min() >= -eps and d[0][1].max() <= world_h + eps]
+    stack = _stack(diamonds)  # (n, 2, corners) when they all have the same corner count: whole-array tests
+    if stack is None:
+        inside = [d for d in diamonds if d[0][0].min() >= -eps and d[0][0].max() <= world_w + eps
+                  and d[0][1].min() >= -eps and d[0][1].max() <= world_h + eps]
+        corners = _stack(inside)
+    else:
+        lo, hi = stack.min(axis=2), stack.max(axis=2)
+        keep = np.flatnonzero((lo[:, 0] >= -eps) & (hi[:, 0] <= world_w + eps)
+                              & (lo[:, 1] >= -eps) & (hi[:, 1] <= world_h + eps))
+        inside, corners = [diamonds[k] for k in keep], stack[keep]
     if not inside:
         return []
     size = float(np.hypot(*(inside[0][0][:, 1] - inside[0][0][:, 0]))) if size is None else size
     fraction = fraction if count is None else count / len(inside)
     link = max(gap, 1e-6 * size)
     reach = 2 * size + gap  # centers farther apart than this can't touch, cup or link
-    centers = np.array([d[0].mean(axis=1) for d in inside])
+    # each diamond's center = its corners' mean, the same reduction as d[0].mean(axis=1), for all of them at once
+    centers = corners.mean(axis=2) if corners is not None else np.array([d[0].mean(axis=1) for d in inside])
     shifts = [(dx, dy) for dx in (0.0, -world_w, world_w) for dy in (0.0, -world_h, world_h)]
     shift_x, shift_y = np.array([s[0] for s in shifts]), np.array([s[1] for s in shifts])
     chosen, cluster, banned = [], {}, set()  # cluster: picked index -> its cluster (a shared list of picked indices)
@@ -184,7 +204,11 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     if layout is None:
         fill(np.random.default_rng(seed).permutation(len(inside)), max(1, int(round(fraction * len(inside)))))
     else:
-        index = {tuple(tile_key(d[0])): k for k, d in enumerate(inside)}
+        if corners is not None:  # tile_key of every diamond at once (the same means, rounded the same way)
+            mx, my = corners[:, 0].mean(axis=1).tolist(), corners[:, 1].mean(axis=1).tolist()
+            index = {(round(x, 1), round(y, 1)): k for k, (x, y) in enumerate(zip(mx, my))}
+        else:
+            index = {tuple(tile_key(d[0])): k for k, d in enumerate(inside)}
         order = [index[tuple(key)] for key in layout if tuple(key) in index]
         fill(order, len(order), trusted=True)
         if layout_size is not None:  # top up the area past the layout's world (right / bottom strips)
