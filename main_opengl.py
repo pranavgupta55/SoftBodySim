@@ -1,12 +1,16 @@
 """The game: scene, physics, editor and HUD, presented through moderngl.
 
-Ported from Framework/mainScreenOpenGL.py: the game still draws into low-res pygame surfaces, which are uploaded to
-GPU textures every frame and drawn with a fullscreen quad. On top of that port, the three layers (world, translucent
-editor ghost, UI) are composited and nearest-neighbour upscaled in one fragment shader (shaders/composite.frag)
-instead of three pygame.transform.scale calls and blits on the CPU. The world fills the area left of a fixed right-hand
+Ported from Framework/mainScreenOpenGL.py. The world itself (background, G grid, T trails, every body, rope and
+hook) is drawn on the GPU by gl_world.py into a low-res framebuffer the size of the render surface, with shaders that
+reproduce pygame's own rasterisation pixel for pixel. Everything else still draws into low-res pygame surfaces:
+screen2 (now transparent: debug overlays and the editor's world-space previews over the GPU world), screenT (the
+translucent editor ghost) and screenUI (panels, hints, cursor). Only their rows that hold anything (now or last
+frame) are uploaded. The GPU world and the three layers are composited and nearest-neighbour upscaled in one fragment
+shader (shaders/composite.frag) instead of pygame.transform.scale calls and blits on the CPU. The world fills the area left of a fixed right-hand
 sidebar (ViewConfig.sidebar_frac of the screen width; the world box, grid and editor all use that area). The sidebar
 holds every card (Controls, Compute, Gravity) at native resolution on its own layer (hud_layer.py), uploaded to its own
-texture and drawn as a blended quad over the composite (shaders/hud.frag), in both modes. While the editor places a
+texture and drawn as a blended quad over the composite (shaders/hud.frag), in both modes. The sidebar is redrawn
+and re-uploaded only when what it shows changes (sidebar_key; the Compute card's live numbers at 10 Hz). While the editor places a
 hook, its peg grid overlay (peg_layer.py, native resolution) is drawn the same way between the two (shaders/pegs.frag);
 it's uploaded only when it changes.
 
@@ -14,8 +18,9 @@ it's uploaded only when it changes.
     python3 main_opengl.py --window 1280x800    windowed
     python3 main_opengl.py --scene diamonds     start in a preset world (scene.PRESETS; W switches worlds),
     python3 main_opengl.py --scene "newtons cradle"    e.g. this one (quote names with spaces)
-    python3 main_opengl.py --basic              the Framework pipeline as-is: layers composited on the CPU into one
-                                                surface, uploaded as one texture, drawn by shaders/basic.frag
+    python3 main_opengl.py --basic              the Framework pipeline as-is: everything drawn by pygame, layers
+                                                composited on the CPU into one surface, uploaded as one texture,
+                                                drawn by shaders/basic.frag
     python3 main_opengl.py --steps 8x1          small steps: 8 substeps x 1 solver iteration per frame (default 4x4)
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
@@ -55,6 +60,7 @@ from gravity_dial import GravityDial
 from palettes import PaletteCard
 from debug_overlay import DebugOverlays
 from timectl import TimeControl
+from gl_world import GLWorld
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
 FPS = 60
@@ -62,6 +68,7 @@ SCALE_DOWN = 2  # real screen px per render surface px
 GHOST_ALPHA = 100  # opacity of the translucent ghost layer (screenT)
 OVERLAY_LEGEND_PX = 6  # the debug overlay legend's top-left corner, UI px in from the top-left of the screen
 MEASURE_GPU = True  # ctx.finish() before the flip so the compute card can show GPU time
+INPUT_EVENTS = {pygame.KEYDOWN, pygame.KEYUP, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL}
 
 # ---------------- moderngl plumbing
 Display = namedtuple("Display", "ctx window_size fb_size flip")
@@ -105,11 +112,13 @@ def open_display(window=None):
 class GLPresenter:
     """Uploads the low-res layers to textures and draws them to the bound framebuffer, upscaled by `scale`."""
 
-    def __init__(self, ctx, layers, scale, fb_size, background, basic=False, hud=None, hud_scale=1.0):
+    def __init__(self, ctx, layers, scale, fb_size, background, basic=False, hud=None, hud_scale=1.0, world_tex=None):
         """layers: the (game, ghost, ui) pygame surfaces; scale: framebuffer px per surface px; hud: the sidebar's
         HudLayer, drawn on top at native resolution; hud_scale: framebuffer px per HUD layer px (window px; > 1 on
-        high-DPI)."""
+        high-DPI); world_tex: the GPU world layer's texture (gl_world.GLWorld.tex, the layers' size), composited
+        under the game layer, or None (the game layer holds the whole world)."""
         self.ctx, self.layers, self.scale, self.fb_size, self.basic = ctx, layers, scale, fb_size, basic
+        self.world_tex = world_tex
         self.hud, self.hud_scale = hud, hud_scale
         self.background = tuple(c / 255 for c in background)
         w, h = layers[0].get_size()
@@ -134,8 +143,9 @@ class GLPresenter:
             self.prog = load_shader(ctx, "basic.vert", "composite.frag")
             # composite.frag places pixels from gl_FragCoord, so the UVs are unused (and optimised out): skip them
             self.vao = ctx.vertex_array(self.prog, [(self.quad, "2f 8x", "in_vert")])
-            for unit, name in enumerate(("u_game", "u_ghost", "u_ui")):
+            for unit, name in enumerate(("u_game", "u_ghost", "u_ui", "u_world")):
                 self.prog[name].value = unit
+            self.prog["u_world_on"].value = world_tex is not None
             self.prog["u_background"].value = self.background
             self.prog["u_ghost_alpha"].value = GHOST_ALPHA / 255
         if hud is not None:
@@ -151,6 +161,9 @@ class GLPresenter:
             self.hud_prog["u_fb_height"].value = fb_size[1]
             self.hud_prog["u_origin"].value = (hud.rect.x * hud_scale, hud.rect.y * hud_scale)
             self.hud_rows = 0  # rows uploaded this frame
+        # per layer: the rows (top, bottom) that held anything at the last upload (None: all transparent); the
+        # textures start out uploaded in full
+        self.layer_rows = [(0, h)] * len(self.textures)
         self.peg_tex, self.peg_version = None, None  # the peg overlay's texture (made on first use) and its version
         self.peg_prog = load_shader(ctx, "basic.vert", "pegs.frag")
         self.peg_vao = ctx.vertex_array(self.peg_prog, [(self.quad, "2f 8x", "in_vert")])
@@ -173,15 +186,34 @@ class GLPresenter:
         else:
             tex.write(pygame.image.tobytes(surface, "RGBA"))  # padded rows: rare; tobytes repacks them
 
+    @staticmethod
+    def _write_rows(tex, surface, top, bottom):
+        """Upload rows [top, bottom) of `surface` into the same rows of `tex`."""
+        w = surface.get_width()
+        if surface.get_pitch() == 4 * w:
+            buf = surface.get_buffer()
+            tex.write(memoryview(buf)[4 * w * top:4 * w * bottom], viewport=(0, top, w, bottom - top))
+            del buf  # unlocks the surface
+        else:
+            part = surface.subsurface((0, top, w, bottom - top))
+            tex.write(pygame.image.tobytes(part, "RGBA"), viewport=(0, top, w, bottom - top))
+
     def upload(self):
         if self.basic:
             game, ghost, ui = self.layers
             game.blit(ghost, (0, 0))  # the Framework pipeline composites on the CPU (ghost keeps its surface alpha)
             game.blit(ui, (0, 0))
             self._write(self.textures[0], game)
-        else:
-            for tex, surface in zip(self.textures, self.layers):
-                self._write(tex, surface)
+            return
+        # Only the rows that hold something now or held something last frame: with the world on the GPU these
+        # layers are mostly transparent (the cursor, a panel, an editor preview), so most frames upload a few rows
+        for k, (tex, surface) in enumerate(zip(self.textures, self.layers)):
+            box = surface.get_bounding_rect()
+            rows = (box.top, box.bottom) if box.h else None
+            last, self.layer_rows[k] = self.layer_rows[k], rows
+            span = [r for r in (rows, last) if r is not None]
+            if span:
+                self._write_rows(tex, surface, min(r[0] for r in span), max(r[1] for r in span))
 
     def set_background(self, rgb):
         """The color behind the game layer (the active world's background)."""
@@ -206,6 +238,8 @@ class GLPresenter:
         ctx.viewport = (0, 0, fb_w, fb_h)
         for unit, tex in enumerate(self.textures):
             tex.use(location=unit)
+        if self.world_tex is not None:
+            self.world_tex.use(location=3)
         prog = self.prog
         prog["u_fb_height"].value = fb_h
         prog["u_origin"].value = (0.0, 0.0)
@@ -239,16 +273,11 @@ class GLPresenter:
         """Upload the HUD layer's used rows (the top `hud.used` rows; texture row 0 is the surface's top row)."""
         hud = self.hud
         self.hud_rows = rows = hud.used if hud is not None else 0
-        if not rows:
+        if not rows or hud.dirty is None:  # (nothing redrawn: the texture still holds it)
             return
-        surface = hud.surface
-        w = surface.get_width()
-        if surface.get_pitch() == 4 * w:
-            buf = surface.get_buffer()
-            self.hud_tex.write(memoryview(buf)[:4 * w * rows], viewport=(0, 0, w, rows))
-            del buf  # unlocks the surface
-        else:
-            self.hud_tex.write(pygame.image.tobytes(surface.subsurface((0, 0, w, rows)), "RGBA"), viewport=(0, 0, w, rows))
+        top, bottom = max(hud.dirty[0], 0), min(hud.dirty[1], rows)
+        if bottom > top:
+            self._write_rows(self.hud_tex, hud.surface, top, bottom)
 
     def render_hud(self):
         """Blend the uploaded HUD rows over the frame: viewport = the layer's used rect, so no other pixel is shaded."""
@@ -267,13 +296,25 @@ class GLPresenter:
 
 
 # ---------------- The game loop, presented through GLPresenter
-def draw_sidebar(hud, editor, perf_hud, mouse_px, draw_top):
+def draw_sidebar(hud, editor, perf_hud, mouse_px, draw_top, key=None):
     """The sidebar for this frame: every card at native resolution (hud.cards, in order), then the cursor on top.
-    mouse_px: the mouse in window px; draw_top(surface, origin): the main loop's message + cursor drawer."""
+    mouse_px: the mouse in window px; draw_top(surface, origin): the main loop's message + cursor drawer; key: the
+    state the cards show (HudLayer.draw: redrawn only when it changes), None to redraw regardless."""
     perf_hud.collapsed = not editor.show_compute  # F / [f]: the Compute card as its short summary
     perf_hud.world = editor.world  # its backend label
-    hud.draw(mouse_px)
+    hud.draw(mouse_px, key)
     hud.overlay(draw_top)
+
+
+SIDEBAR_SAFETY_HZ = 2  # the sidebar is redrawn at least this often, whatever its key says (HudLayer.draw)
+
+
+def sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, now):
+    """HudLayer.draw's key for this frame: what the cards show that can change without an input event changing
+    `inputs` (keys / buttons / wheel seen so far), plus the mouse while it is over the sidebar (hover)."""
+    return (inputs, mouse_px if hud.rect.collidepoint(mouse_px) else None, session.name, session.open, id(editor),
+            editor.paused, editor.active, editor.stage, editor.show_compute, ViewConfig.show_grid, ViewConfig.filled,
+            ViewConfig.trails, panel_open, int(now * SIDEBAR_SAFETY_HZ))
 
 
 def grid_colors(background):
@@ -329,8 +370,12 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     dpi_scale = display.fb_size[0] / win_w
     fb_scale = scaleDownFactor * dpi_scale
     hud = HudLayer(display.window_size, scaleDownFactor, ViewConfig.sidebar_frac)  # the sidebar, native (window px) res
+    # The world (background, grid, trails, bodies) is drawn on the GPU into its own layer, under screen2, which then
+    # only holds what pygame still draws in world space (debug overlays, editor previews). --basic: all pygame
+    gpu_world = None if args.basic else GLWorld(ctx, (screen_width, screen_height))
     presenter = GLPresenter(ctx, (screen2, screenT, screenUI), fb_scale, display.fb_size, Endesga.my_blue,
-                            basic=args.basic, hud=hud, hud_scale=dpi_scale)
+                            basic=args.basic, hud=hud, hud_scale=dpi_scale,
+                            world_tex=gpu_world.tex if gpu_world is not None else None)
 
     # The world is measured in its own units and fills the area left of the sidebar: that area's size on the render
     # surfaces (UI px) / the zoom. Every scene builder takes world_width / world_height, so all get the smaller world.
@@ -398,6 +443,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
 
     # ---------------- Main Game Loop
     last_time = time.time()
+    inputs = 0  # key / button / wheel events so far (part of the sidebar's redraw key)
     running = True
     frame_index = 0
     while running:
@@ -427,7 +473,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         mx, my = mx / scaleDownFactor, my / scaleDownFactor  # render-surface pixels (cursor, UI)
         wx, wy = mx / ViewConfig.zoom, my / ViewConfig.zoom  # world units (physics)
         background = world.background or Endesga.my_blue  # presets may have their own (World.background)
-        screen2.fill(background)
+        screen2.fill(background if gpu_world is None else (0, 0, 0, 0))
         presenter.set_background(background)
         screenT.fill((0, 0, 0, 0))
         screenUI.fill((0, 0, 0, 0))
@@ -440,6 +486,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
 
         profiler.switch("events")
         for event in pygame.event.get():
+            if event.type in INPUT_EVENTS:
+                inputs += 1  # (the sidebar is redrawn after any of these)
             if event.type == pygame.QUIT:
                 running = False
             if event.type == pygame.KEYDOWN and editor.scenes.state is None and not editor.active:
@@ -506,13 +554,22 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         time_ctl.pending = 0  # a step requested just before resuming is dropped
         profiler.switch("draw")
         view = screen2 if full else world_view  # a fullscreen world fills the whole render surface
-        if ViewConfig.show_grid:
-            world.draw_grid(view, zoom=ViewConfig.zoom, **grid_colors(world.background))
-        with profiler.section("trails"):
-            trails.set_enabled(ViewConfig.trails)
-            trails.update(world, dt / fps, stepped)
-            trails.draw(view, zoom=ViewConfig.zoom)  # under the bodies
-        world.draw(view, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
+        if gpu_world is not None:
+            with profiler.section("trails"):
+                trails.set_enabled(ViewConfig.trails)
+                trails.update(world, dt / fps, stepped)
+            with profiler.section("world gl"):  # grid, trails and bodies into the GPU world layer
+                gpu_world.render(world, view.get_size(), ViewConfig.filled, ViewConfig.zoom, background,
+                                 grid=grid_colors(world.background) if ViewConfig.show_grid else None,
+                                 trails=trails if ViewConfig.trails else None)
+        else:
+            if ViewConfig.show_grid:
+                world.draw_grid(view, zoom=ViewConfig.zoom, **grid_colors(world.background))
+            with profiler.section("trails"):
+                trails.set_enabled(ViewConfig.trails)
+                trails.update(world, dt / fps, stepped)
+                trails.draw(view, zoom=ViewConfig.zoom)  # under the bodies
+            world.draw(view, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
         if overlays.any():
             with profiler.section("overlays"):
                 overlays.draw(view, world, ViewConfig.zoom)
@@ -526,7 +583,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         pygame.mouse.set_visible(False)
         draw_top(screenUI)  # message + cursor
         if sidebar_shown:
-            draw_sidebar(hud, editor, perf_hud, pygame.mouse.get_pos(), draw_top)  # native res, over the composite
+            mouse_px = pygame.mouse.get_pos()
+            draw_sidebar(hud, editor, perf_hud, mouse_px, draw_top,  # native res, over the composite
+                         sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, time.perf_counter()))
 
         # ---------------- Present: textures -> one shader pass (+ the HUD quad) -> swap
         profiler.switch("present")

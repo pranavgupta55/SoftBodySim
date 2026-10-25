@@ -25,10 +25,21 @@ cards down to HUD_FLOOR_SCALE. Card heights don't depend on the editor's state, 
 fit is redone only when the cards' natural heights change (e.g. a hotkey row added).
 
 A frame:
-    hud.draw(mouse_px)          # fit if needed, place the cards, draw the sidebar + cards
+    hud.draw(mouse_px, key)     # fit if needed, place the cards, draw the sidebar + cards (if anything changed)
     hud.overlay(draw_top)       # message + cursor over the sidebar (see overlay)
-then main_opengl.py uploads the layer to a texture and draws it as a quad on top of its composite.
+then main_opengl.py uploads the layer's changed rows (`dirty`) to a texture and draws it as a quad on top of its
+composite.
+
+Redrawing only on change: the cards cost several ms of pygame drawing and text per frame, but almost never change
+from one frame to the next. draw() takes a `key`, a hashable summary from the caller of everything the cards show
+(input events, the mouse when it is over the sidebar, the active world and editor state, plus a slow safety tick so
+nothing the key misses stays stale for long). The sidebar is redrawn whole only when the key or the layout changes;
+otherwise only cards with a `refresh_hz` (live content: the Compute card) are redrawn in place at that rate.
+`dirty` = the (top, bottom) rows changed this frame, or None, so the presenter re-uploads just those. key=None
+redraws every frame (the tests drive cards directly, without a key).
 """
+import time
+
 import pygame
 
 import ui_style as ui
@@ -46,6 +57,11 @@ class HudLayer:
         self.compact = False  # cards drawn in their compact form (set by fit)
         self.placed = []  # (card, rect in native screen px) from the last layout
         self._fit_key = None
+        self.dirty = None  # (top, bottom) layer rows changed by the last draw / overlay, or None
+        self._key = self._layout_key = None  # what the layer was last drawn for (draw's key, the card layout)
+        self._ticks = {}  # id(card) -> its refresh tick when last drawn (cards with refresh_hz)
+        self._mouse = (0, 0)
+        self._overlay_box = None
         s = ui_scale
         self._top = pygame.Surface((-(-self.rect.w // s), -(-self.rect.h // s)), pygame.SRCALPHA)  # UI-res overlay
 
@@ -110,14 +126,44 @@ class HudLayer:
         return self.placed
 
     # ---------------- Drawing
-    def draw(self, mouse_px):
-        """The sidebar background (a black rule on its left edge) and every card."""
+    def draw(self, mouse_px, key=None, now=None):
+        """The sidebar background (a black rule on its left edge) and every card, when anything changed (see the
+        module docstring): key: hashable state the cards show, or None to redraw regardless; now: seconds, for
+        refresh_hz cards (default time.perf_counter())."""
         self.layout()
+        self._mouse = mouse_px
+        layout_key = (tuple((id(c), tuple(r)) for c, r in self.placed), self.compact, ui.HUD.scale)
+        now = time.perf_counter() if now is None else now
+        if key is None or key != self._key or layout_key != self._layout_key:
+            self._key, self._layout_key = key, layout_key
+            self._redraw(now)
+            return
+        self.dirty = None
+        for card, r in self.placed:  # live cards only, in place
+            hz = getattr(card, "refresh_hz", None)
+            tick = int(now * hz) if hz else None
+            if tick is not None and tick != self._ticks.get(id(card)):
+                self._ticks[id(card)] = tick
+                local = r.move(-self.rect.x, -self.rect.y)
+                self.surface.fill(ui.SIDEBAR_BG, local)
+                card.draw_card(self.surface, self.rect.topleft, mouse_px, self.compact)
+                self._mark(local.top, local.bottom)
+
+    def _redraw(self, now):
         s = self.surface
         s.fill(ui.SIDEBAR_BG)
         s.fill(ui.BLACK, (0, 0, ui.HUD.BORDER, self.rect.h))
         for card, _ in self.placed:
-            card.draw_card(s, self.rect.topleft, mouse_px, self.compact)
+            card.draw_card(s, self.rect.topleft, self._mouse, self.compact)
+            hz = getattr(card, "refresh_hz", None)
+            if hz:
+                self._ticks[id(card)] = int(now * hz)
+        self.dirty = (0, self.rect.h)
+
+    def _mark(self, top, bottom):
+        top, bottom = max(top, 0), min(bottom, self.rect.h)
+        if bottom > top:
+            self.dirty = (top, bottom) if self.dirty is None else (min(self.dirty[0], top), max(self.dirty[1], bottom))
 
     def overlay(self, draw):
         """Things drawn on the UI surface after the cards (the cursor; the message stays left of the sidebar) must
@@ -128,6 +174,13 @@ class HudLayer:
         self._top.fill((0, 0, 0, 0))
         draw(self._top, self.ui_origin)
         box = self._top.get_bounding_rect()
+        key = tuple(box) if box.h else None
+        if key != self._overlay_box:  # it moved or went: the cards under the old one must be redrawn
+            if self._overlay_box is not None:
+                self._redraw(time.perf_counter())
+            self._overlay_box = key
+            if key is not None:
+                self._mark(box.y * s, box.bottom * s)
         if box.h:  # nothing over the sidebar (the mouse is over the world): skip the scale + blit
             part = self._top.subsurface(box)
             self.surface.blit(pygame.transform.scale(part, (box.w * s, box.h * s)), (box.x * s, box.y * s))

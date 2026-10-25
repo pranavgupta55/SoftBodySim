@@ -70,6 +70,7 @@ def card_height(summary=False):
 
 class PerfHUD:
     compactable = True  # sidebar card provider (hud_layer.py): has a shorter, summary form
+    refresh_hz = 10  # live numbers: the sidebar redraws this card at this rate even when nothing else changed
 
     def __init__(self, profiler):
         self.prof = profiler
