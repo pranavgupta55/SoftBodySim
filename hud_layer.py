@@ -40,6 +40,7 @@ redraws every frame (the tests drive cards directly, without a key).
 """
 import time
 
+import numpy as np
 import pygame
 
 import ui_style as ui
@@ -173,7 +174,7 @@ class HudLayer:
         s = self.ui_scale
         self._top.fill((0, 0, 0, 0))
         draw(self._top, self.ui_origin)
-        box = self._top.get_bounding_rect()
+        box = bounding_rect(self._top)
         key = tuple(box) if box.h else None
         if key != self._overlay_box:  # it moved or went: the cards under the old one must be redrawn
             if self._overlay_box is not None:
@@ -184,3 +185,19 @@ class HudLayer:
         if box.h:  # nothing over the sidebar (the mouse is over the world): skip the scale + blit
             part = self._top.subsurface(box)
             self.surface.blit(pygame.transform.scale(part, (box.w * s, box.h * s)), (box.x * s, box.y * s))
+
+
+def bounding_rect(surface):
+    """Surface.get_bounding_rect for a cleared (all-zero) 32-bit surface: the box of its non-zero pixels, by a numpy
+    scan of the raw buffer (several times faster)."""
+    w, h = surface.get_size()
+    if surface.get_pitch() != 4 * w:
+        return surface.get_bounding_rect()
+    buf = surface.get_buffer()
+    used = np.frombuffer(buf, np.uint32).reshape(h, w) != 0
+    del buf  # (the array keeps the buffer until it is freed below)
+    rows, cols = np.flatnonzero(used.any(axis=1)), np.flatnonzero(used.any(axis=0))
+    del used
+    if not rows.size:
+        return pygame.Rect(0, 0, 0, 0)
+    return pygame.Rect(int(cols[0]), int(rows[0]), int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 1))
