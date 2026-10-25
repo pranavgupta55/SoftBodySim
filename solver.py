@@ -579,8 +579,10 @@ class World:
         hits = np.searchsorted(edge_keys, pt_keys, "right") - start  # edges sharing each point cell
         first = np.repeat(start - (np.cumsum(hits) - hits), hits)
         i, e = np.repeat(pt_owner, hits), edge_owner[first + np.arange(first.size)]
-        if pt_owner.size == pt_lo.shape[1]:
-            return i, e  # one cell per point: already in (point, edge) order, and a pair can't repeat
+        if pt_owner.size == pt_lo.shape[1] or i.size == 0:
+            # one cell per point: already in (point, edge) order, and a pair can't repeat. No pairs at all: nothing to
+            # dedupe (the mask below would be one element longer than the empty array it indexes: IndexError)
+            return i, e
         # a pair sharing several cells shows up once per cell: sort and dedupe
         code = np.sort(i * n_edges + e)
         code = code[np.r_[True, code[1:] != code[:-1]]]
