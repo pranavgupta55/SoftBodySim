@@ -11,8 +11,9 @@ surface's 32-bit pixels. Its cost follows the trail pixels on screen: ~0.1 ms fo
 for 200 bodies all falling at once with full-length trails, and nothing for bodies at rest or with T off. A fading
 accumulation layer would cost a constant ~0.55 ms (fade + blit of the whole surface, measured), but can't drop one
 body's trail, rescale with zoom or keep the banded look; on the GPU it would need the bodies on their own layer to
-stay under them. Since both bodies and trails go into screen2, the GPU and --basic paths need no changes and
-show the same pixels. The fade is in wall-clock time and
+stay under them. The GPU world layer (gl_world.py) takes the same pixels from pixels() and blends them with the
+same integer formula in its base pass, so it and the --basic path (draw()) show the same bytes. The fade is in
+wall-clock time and
 banded into a few opacity steps (FADE_BANDS) so it stays crisp like the rest of the pixel art; the newer half of a
 trail is 2px wide, the older half 1px.
 
@@ -101,18 +102,35 @@ class Trails:
     # ---------------- Drawing
     def draw(self, surface, zoom=1.0):
         """Blend the trails into `surface` (call before the bodies are drawn, so they sit under them)."""
+        px = self._raster(surface.get_size(), zoom)
+        if px is not None:
+            self._blend(surface, *px)
+
+    def pixels(self, size, zoom=1.0):
+        """The trail pixels draw() would blend into a surface of `size`, for the GPU world layer (gl_world.py):
+        (xs, ys, (k, 3) colours, (k,) opacities in 256ths) in write order (a later pixel replaces an earlier one at
+        the same spot), or None when there is nothing to draw."""
+        px = self._raster(size, zoom)
+        if px is None:
+            return None
+        xs, ys, seg, alpha, body = px
+        return xs, ys, self.cols.astype(np.int32)[body[seg]], alpha[seg]
+
+    def _raster(self, size, zoom):
+        """Every trail pixel inside a `size` surface: (xs, ys, segment per pixel, opacity per segment, body per
+        segment), or None."""
         if not self.enabled or not self.bodies:
-            return
+            return None
         life = 1.0 - (self.now - self.stamp) / self.fade_seconds  # per sample row: 1 new .. 0 faded
         rows = np.flatnonzero(life[:-1] > 0) + 1  # segments (row - 1 -> row) whose start hasn't faded yet
         if rows.size == 0:
-            return
+            return None
         a, b = self.pos[rows - 1], self.pos[rows]  # (segments, bodies, 2) world units
         length = np.abs(b - a).max(axis=2) * zoom  # surface px
         ok = ~self.gap[rows] & self.moving[None, :] & (length >= MIN_SEGMENT_PX)
         sel = np.flatnonzero(ok)  # row-major: older segments first, so newer pixels are written last
         if sel.size == 0:
-            return
+            return None
         seg_k, seg_b = np.divmod(sel, ok.shape[1])
         # per segment: start, step, body, banded opacity (from the life at its middle) and stroke width
         f4 = np.float32  # per-pixel math in float32 / int32: half the memory traffic of float64
@@ -136,9 +154,9 @@ class Trails:
         xs = np.concatenate([xi, xi[extra] + side])
         ys = np.concatenate([yi, yi[extra] + 1 - side])
         seg = np.concatenate([owner, owner[extra]])
-        w, h = surface.get_size()
+        w, h = size
         inside = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-        self._blend(surface, xs[inside], ys[inside], seg[inside], alpha, seg_b)
+        return xs[inside], ys[inside], seg[inside], alpha, seg_b
 
     def _blend(self, surface, xs, ys, seg, alpha, body):
         """pixel = (pixel * (256 - a) + colour * a) / 256 on the RGB channels of pixels (xs, ys), where pixel k
