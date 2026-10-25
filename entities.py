@@ -32,6 +32,12 @@ class EnvConfig:
     ccd_passes = 8  # collision-impulse passes per CCD pass before falling back to rigid impact zones
     ccd_gap = 0.01  # px; minimum gap continuous collision detection keeps between a point and an edge
     ccd_push = 0.25  # px; gap a collision impulse aims for, larger than ccd_gap so chains of contacts settle quickly
+    # px; a CCD root counts as a touch when the point is within this of the (clamped) segment at that time. Covers
+    # float64 rounding at segment ends (real root errors are <= ~1e-10 px), far below ccd_gap.
+    ccd_tau = 1e-6
+    # Inelastic projection rounds (Harmon et al. 2008) tried when ccd_passes of impulses leave hits, before the
+    # rigid impact zones. 0: straight to the impact zones.
+    ccd_projection_rounds = 8
     grab_radius = 15.0  # px; how close the cursor must be to a point to pick it up
     # 1/s; the gap to the cursor shrinks as exp(-grab_stiffness * t) (85.6: 30% per 1/240 s substep)
     grab_stiffness = 85.6

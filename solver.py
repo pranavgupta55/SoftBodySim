@@ -84,6 +84,7 @@ class World:
         self.grabbed = None  # global index of the point being dragged
         self.grab_target = np.zeros(2)
         self.zone_count = 0  # how many CCD passes needed the rigid impact zone fallback (for debugging)
+        self.projection_count = 0  # how many CCD passes the inelastic projection fallback fixed (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
         self.backend = None  # EnvConfig.backend helper, None for "cpu" (see _make_backend); re-picked on every repack
         # Looping (looping.py): a body that fully leaves `bounds` through a looping side re-enters through the opposite
@@ -775,29 +776,30 @@ class World:
         """Points that touch an edge at some time in the substep, moving in straight lines from PREV by D.
 
         A point p(t) is on the line through a(t), b(t) when cross(b - a, p - a) = 0, a quadratic in t in [0, 1];
-        it's a hit if the point is also within the segment then. Ending closer than ccd_gap also counts, so states
+        it's a hit if the point is also on the segment then. Ending closer than ccd_gap also counts, so states
         never get so close that rounding decides which side a point is on. Returns (pts, edge_ids, t, s, side).
         `pairs` reuses an earlier broad phase; only a fresh one (the default) can prove there are no collisions.
+
+        Every root is verified geometrically: a hit needs the point within ccd_tau of the segment at time t, which
+        rejects the spurious roots of an edge that collapses to ~zero length (the cross product then vanishes for
+        far points too). The textbook roots with an exact 0 <= s <= 1 test are tried first; where they find no
+        verified touch, a float64-robust solve runs: cancellation-free roots q / c2 and c0 / q, and s clamped to
+        the segment with the ccd_tau distance test, so a path through (or within rounding of) an endpoint is not
+        missed when s rounds to just outside [0, 1] on both edges meeting there (research/02 F3). An exactly
+        collinear point and edge (c2 = c1 = 0) get the times the point passes either end as candidates. Hits the
+        textbook test does verify keep its values bit for bit, so results only change where it was wrong.
         """
         pts, eids = self._ccd_pairs(D) if pairs is None else pairs
         if _jit():
-            return solver_jit.ccd_detect(self, D, pts, eids, EnvConfig.ccd_gap)
+            return solver_jit.ccd_detect(self, D, pts, eids, EnvConfig.ccd_gap, EnvConfig.ccd_tau)
         empty = np.empty(0)
         X0 = self.PREV
         if pts.size:
-            # Cheap pre-reject: a hit puts the point on the edge at some time t, so the point's swept box and the
-            # edge's swept box (grown by 1.0 px, more than ccd_gap) overlap. Grid cells are much coarser than that,
-            # so this drops most broad phase pairs before the quadratic, without changing any result. Except: an edge
-            # that shrinks to (nearly) zero length mid-substep makes the cross product vanish for every point, which
-            # the math below reports as hits even for far points; keep those pairs so the results stay the same.
+            # Cheap pre-reject: a hit puts the point within ccd_tau of the edge at some time t, so the point's swept
+            # box and the edge's swept box (grown by 1.0 px, more than ccd_gap and ccd_tau) overlap. Grid cells are
+            # much coarser than that, so this drops most broad phase pairs before the quadratic.
             p_lo, p_hi, e_lo, e_hi = self._ccd_boxes(D)
-            ea, eb = self.edges
-            e0, de = X0[:, eb] - X0[:, ea], D[:, eb] - D[:, ea]
-            t_min = np.clip(-np.sum(e0 * de, axis=0) / np.maximum(np.sum(de * de, axis=0), 1e-300), 0.0, 1.0)
-            shortest = e0 + t_min * de  # each edge at its shortest during the substep
-            collapses = np.sum(shortest * shortest, axis=0) < 1e-6
-            overlap = np.all((p_lo[:, pts] <= e_hi[:, eids]) & (p_hi[:, pts] >= e_lo[:, eids]), axis=0)
-            keep = overlap | collapses[eids]
+            keep = np.all((p_lo[:, pts] <= e_hi[:, eids]) & (p_hi[:, pts] >= e_lo[:, eids]), axis=0)
             pts, eids = pts[keep], eids[keep]
         if pts.size == 0:
             return pts, eids, empty, empty, empty
@@ -830,6 +832,40 @@ class World:
                 ok = (r >= 0) & (r <= 1) & (s >= 0) & (s <= 1) & (r < t_hit)
             t_hit = np.where(ok, r, t_hit)
             s_hit = np.where(ok, s, s_hit)
+        tau2 = EnvConfig.ccd_tau * EnvConfig.ccd_tau
+        found = np.flatnonzero(np.isfinite(t_hit))
+        if found.size:  # verify: the point must be on the segment (within ccd_tau) at the root
+            r = t_hit[found]
+            e, q = e0[:, found] + r * de[:, found], q0[:, found] + r * dq[:, found]
+            off = q - s_hit[found] * e
+            far = found[off[0] * off[0] + off[1] * off[1] > tau2]
+            t_hit[far], s_hit[far] = np.inf, 0.0
+
+        # float64-robust solve where the textbook one found nothing
+        k = np.flatnonzero(np.isinf(t_hit))
+        if k.size:
+            e0k, dek, q0k, dqk = e0[:, k], de[:, k], q0[:, k], dq[:, k]
+            c0k, c1k, c2k, sqk = c0[k], c1[k], c2[k], sq[k]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                qq = -0.5 * (c1k + np.where(c1k >= 0, sqk, -sqk))  # no cancellation
+                quad, lin = c2k != 0, (c2k == 0) & (c1k != 0)
+                # collinear all substep (c2 = c1 = 0): the times the point passes either end of the segment
+                w = np.sum(dqk * e0k, axis=0)
+                ta = -np.sum(q0k * e0k, axis=0) / w
+                tb = -np.sum((q0k - e0k) * e0k, axis=0) / (w - np.sum(dek * e0k, axis=0))
+                ra = np.where(quad, qq / c2k, np.where(lin, -c0k / c1k, ta))
+                rb = np.where(quad, c0k / qq, np.where(lin, np.nan, tb))
+            t_rob = np.full(k.size, np.inf)
+            s_rob = np.zeros(k.size)
+            for r in (ra, rb):
+                with np.errstate(invalid="ignore", over="ignore"):
+                    e, q = e0k + r * dek, q0k + r * dqk
+                    s = np.clip(np.sum(q * e, axis=0) / np.maximum(np.sum(e * e, axis=0), 1e-300), 0.0, 1.0)
+                    off = q - s * e
+                    ok = (r >= 0) & (r <= 1) & (off[0] * off[0] + off[1] * off[1] <= tau2) & (r < t_rob)
+                t_rob = np.where(ok, r, t_rob)
+                s_rob = np.where(ok, s, s_rob)
+            t_hit[k], s_hit[k] = t_rob, s_rob
 
         # ending within ccd_gap of the edge counts as a hit at t = 1
         e1, q1 = e0 + de, q0 + dq
@@ -855,6 +891,7 @@ class World:
         if self.debug is not None:
             self.debug.ccd_hits(self, hits, D)
         fresh = True  # V hasn't changed since the broad phase
+        V_pre = None
         for _ in range(EnvConfig.ccd_passes):
             if hits[0].size == 0:
                 if fresh:
@@ -880,13 +917,112 @@ class World:
                     self.debug.ccd_hits(self, hits, D)
             with sec("narrow+impulses"):
                 V_before = V.copy()
+                if fresh:
+                    V_pre = V_before  # before any CCD response: the inelastic projection's reference
                 self._ccd_impulses(*hits, h)
                 hits = self._ccd_redetect(V * h, pairs, hits, (V != V_before).any(axis=0))
             fresh = False
 
-        self.zone_count += 1
         with sec("impact zones"):
+            if self._inelastic_zones(h, V_pre):
+                return
+            self.zone_count += 1
             self._impact_zones(h)
+
+    def _ccd_normal(self, i, ia, ib, t, side, h):
+        """_ccd_impulses' push direction for point i against edge (ia, ib): from the closest point on the edge to the
+        point at the start of the substep, or the edge normal at the hit time t (towards `side`) if they touch."""
+        V, X0 = self.V, self.PREV
+        e0 = X0[:, ib] - X0[:, ia]
+        u = min(max((X0[:, i] - X0[:, ia]) @ e0 / max(e0 @ e0, 1e-12), 0.0), 1.0)
+        sep = X0[:, i] - (X0[:, ia] + u * e0)
+        if np.hypot(*sep) > 1e-9:
+            return sep / np.hypot(*sep)
+        e = (X0[:, ib] + t * h * V[:, ib]) - (X0[:, ia] + t * h * V[:, ia])
+        return side * np.array([-e[1], e[0]]) / max(np.hypot(*e), 1e-12)
+
+    def _inelastic_zones(self, h, V_pre, pgs_iters=300):
+        """Fallback when the impulse passes leave hits: inelastic projection (Harmon et al. 2008, "Robust treatment
+        of simultaneous collisions", Algorithm 1), tried before the rigid impact zones. True if the motion ends up
+        collision-free (checked with a fresh broad phase); False leaves V as it found it.
+
+        Each hit (point i, edge (a, b), s, normal n) becomes a constraint G V >= b with G = +n on i, -(1 - s) n on
+        a and -s n on b, and b = (ccd_push - start gap along n) / h: the same end gap _ccd_impulses aims for.
+        Constraints accumulate over rounds; each connected group of them is reset to its velocities from before
+        any CCD response and projected onto them in the mass metric, min |V' - V_pre|_M subject to G V' >= b, by
+        projected Gauss-Seidel on the small dual (Delassus) system. Only velocities along the constraint normals
+        change, so sliding survives, where the impact zones stop all relative motion. Sequential impulses converge
+        only geometrically for a point wedged between two edges (Bridson et al. 2002 name the case); solving the
+        group's constraints together fixes that. Every round is re-verified by _ccd_detect, so the guarantee still
+        rests on the impact zones as the last resort (research/02 F4)."""
+        rounds = EnvConfig.ccd_projection_rounds
+        if not rounds:
+            return False
+        V, W, X0, E = self.V, self.W, self.PREV, self.edges
+        push = EnvConfig.ccd_push
+        V_entry = V.copy()
+        V_pre = V_entry if V_pre is None else V_pre
+        cons = {}  # (point, edge) -> (i, a, b, s, n, rhs), in first-seen order
+        projected = False
+        for _ in range(rounds):
+            pts, eids, ts, ss, sides = self._ccd_detect(V * h)
+            if pts.size == 0:
+                self.projection_count += projected
+                return True
+            for i, e, t, s, side in zip(pts.tolist(), eids.tolist(), ts.tolist(), ss.tolist(), sides.tolist()):
+                ia, ib = int(E[0, e]), int(E[1, e])
+                n = self._ccd_normal(i, ia, ib, t, side, h)
+                gap0 = (X0[:, i] - ((1 - s) * X0[:, ia] + s * X0[:, ib])) @ n
+                cons[(i, e)] = (i, ia, ib, s, n, (push - gap0) / h)
+            parent = {}
+
+            def find(x):
+                parent.setdefault(x, x)
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            for i, ia, ib, *_ in cons.values():
+                for j in (ia, ib):
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[rj] = ri
+            groups = {}
+            for c in cons.values():
+                groups.setdefault(find(c[0]), []).append(c)
+            for cs in groups.values():
+                members = sorted({p for c in cs for p in c[:3]})
+                loc = {p: k for k, p in enumerate(members)}
+                m, k = len(members), len(cs)
+                G = np.zeros((k, 2 * m))
+                rhs = np.empty(k)
+                for row, (i, ia, ib, s, n, b) in enumerate(cs):
+                    for p, wgt in ((i, 1.0), (ia, -(1 - s)), (ib, -s)):
+                        G[row, 2 * loc[p]:2 * loc[p] + 2] += wgt * n
+                    rhs[row] = b
+                Minv = np.repeat(W[members], 2)
+                diag = np.einsum("ij,ij->i", G * Minv, G)
+                lam = np.zeros(k)
+                v = V_pre[:, members].T.reshape(-1).copy()
+                for _ in range(pgs_iters):
+                    worst = 0.0
+                    for row in range(k):
+                        if diag[row] < 1e-12:
+                            continue
+                        viol = rhs[row] - G[row] @ v
+                        new = max(lam[row] + viol / diag[row], 0.0)
+                        if new != lam[row]:
+                            v += Minv * G[row] * (new - lam[row])
+                            lam[row] = new
+                        if lam[row] > 0 or viol > 0:
+                            worst = max(worst, abs(viol))
+                    if worst < 1e-9:
+                        break
+                V[:, members] = v.reshape(m, 2).T
+            projected = True
+        V[:] = V_entry
+        return False
 
     def _ccd_redetect(self, D, pairs, hits, changed):
         """_ccd_detect(D, pairs) after impulses that changed only the `changed` points' velocities. A pair's result
