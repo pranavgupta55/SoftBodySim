@@ -464,7 +464,10 @@ def _periodic_wraps(world):
             out |= movable & ((box_hi[a] > c - r) if high else (box_lo[a] < c + r))
     if not out.any():
         return []
-    groups, anchored = rope_groups(world)
+    if world.ropes:
+        groups, anchored = rope_groups(world)
+    else:  # no ropes: every body is its own group (only those to move matter)
+        groups, anchored = {int(k): [int(k)] for k in np.flatnonzero(out)}, set()
     grabbed_body = None if world.grabbed is None else int(world.point_body[world.grabbed])
     wraps = []
     for root, members in groups.items():
