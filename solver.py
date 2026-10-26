@@ -658,9 +658,13 @@ class World:
         by an image offset (looping.image_shifts) shares a grid cell with the edge's box elo..ehi (the same boxes
         the direct broad phase floors, pads included). Only points whose moved box reaches the edges' overall extent
         are tried, so this costs O(points near a seam). Same-body pairs are left out (a body meets its own image
-        only if it is bigger than the period). Shared numpy code for both CPU paths, so they stay identical."""
+        only if it is bigger than the period). solver_jit.image_pairs gives the same pairs per offset (the merge then
+        orders them the same), so the two CPU paths stay identical."""
         empty = np.empty(0, dtype=np.int64)
         point_ok, edge_ok = self._image_topology()
+        if _jit():
+            return solver_jit.image_pairs(self, plo, phi, elo, ehi, point_ok, edge_ok,
+                                          looping.image_shifts(self.period), EnvConfig.cell_size)
         out_i, out_e, out_o = [], [], []
         if edge_ok.any():
             cell = EnvConfig.cell_size
@@ -873,6 +877,12 @@ class World:
         return reach
 
     # ---------------- Continuous collision detection (the no-intersection guarantee)
+    def _ccd_float_boxes(self, D):
+        """_ccd_boxes, from the compiled kernel when it runs (the same values)."""
+        if _jit():
+            return solver_jit.ccd_boxes(self.PREV, D, *solver_jit._topology(self)[1:3])
+        return self._ccd_boxes(D)
+
     def _ccd_boxes(self, D):
         """Swept boxes of the straight-line paths PREV -> PREV + D: (point lo, point hi, edge lo, edge hi), each
         (2, m). Edge boxes are grown by 1.0 px, which also covers the ccd_gap end check."""
@@ -895,7 +905,7 @@ class World:
         if self.period is not None:  # direct pairs on the CPU, plus the pairs through images (_merge_images)
             direct = (solver_jit.ccd_pairs(self, cells) if _jit()
                       else self._filter_pairs(*self._cell_pairs(*cells), contact=False))
-            return self._merge_images(direct, self._image_pairs(*self._ccd_boxes(D)))
+            return self._merge_images(direct, self._image_pairs(*self._ccd_float_boxes(D)))
         pairs = None if self.backend is None else self.backend.ccd_pairs(cells)  # None: use the CPU code below
         if pairs is not None:
             return pairs
@@ -917,7 +927,7 @@ class World:
             return i, e
         # with a periodic axis: plus every pair through an image for D (few; this only needs to be a superset of the
         # new pairs, see _resolve_ccd)
-        i_m, e_m, o_m = self._image_pairs(*self._ccd_boxes(D))
+        i_m, e_m, o_m = self._image_pairs(*self._ccd_float_boxes(D))
         return (np.concatenate([i, i_m]), np.concatenate([e, e_m]),
                 np.concatenate([np.zeros((2, i.size)), o_m], axis=1))
 

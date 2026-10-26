@@ -137,6 +137,85 @@ def solve_ropes(world):
     return True
 
 
+def image_pairs(world, plo, phi, elo, ehi, point_ok, edge_ok, shifts, cell):
+    """World._image_pairs: the same (point, edge) pairs for each image offset, grouped by offset in the same order
+    (within an offset sorted by (point, edge), like World._cell_pairs)."""
+    empty = np.empty(0, np.int64)
+    if not shifts:
+        return empty, empty, np.empty((2, 0))
+    S = np.array(shifts, dtype=np.float64)
+    i, e, k = image_pair_kernel(np.ascontiguousarray(plo), np.ascontiguousarray(phi), np.ascontiguousarray(elo),
+                                np.ascontiguousarray(ehi), point_ok.astype(np.bool_), edge_ok.astype(np.bool_), S, cell,
+                                world.point_body, world.edge_body, _topology(world)[5])
+    return i, e, np.ascontiguousarray(S[k].T)
+
+
+@njit(**NB)
+def image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body, body_fixed):
+    """Pairs of image_pairs: per offset s, points whose box moved by s reaches the extent of the edges with
+    edge_ok, edges with edge_ok overlapping those points' union box, and the (point, edge) pairs among them whose
+    floored cell ranges overlap, other bodies only and not both fixed. Returns (points, edges, offset index)."""
+    N, E = plo.shape[1], elo.shape[1]
+    ext = np.array([np.inf, np.inf, -np.inf, -np.inf])  # lo x, lo y, hi x, hi y
+    anyedge = False
+    for e in range(E):
+        if edge_ok[e]:
+            anyedge = True
+            for c in range(2):
+                ext[c] = min(ext[c], elo[c, e])
+                ext[2 + c] = max(ext[2 + c], ehi[c, e])
+    empty = np.empty(0, np.int64)
+    if not anyedge:
+        return empty, empty, empty
+    pts = np.empty(N, np.int64)
+    eds = np.empty(E, np.int64)
+    cap = 1024
+    oi, oe, ok = np.empty(cap, np.int64), np.empty(cap, np.int64), np.empty(cap, np.int64)
+    m = 0
+    for k in range(S.shape[0]):
+        sx, sy = S[k, 0], S[k, 1]
+        npt = 0
+        ulx, uly, uhx, uhy = np.inf, np.inf, -np.inf, -np.inf
+        for i in range(N):
+            if not point_ok[i]:
+                continue
+            lx, ly, hx, hy = plo[0, i] + sx, plo[1, i] + sy, phi[0, i] + sx, phi[1, i] + sy
+            if lx <= ext[2] and hx >= ext[0] and ly <= ext[3] and hy >= ext[1]:
+                pts[npt] = i
+                npt += 1
+                ulx, uly, uhx, uhy = min(ulx, lx), min(uly, ly), max(uhx, hx), max(uhy, hy)
+        if npt == 0:
+            continue
+        ned = 0
+        for e in range(E):
+            if edge_ok[e] and elo[0, e] <= uhx and ehi[0, e] >= ulx and elo[1, e] <= uhy and ehi[1, e] >= uly:
+                eds[ned] = e
+                ned += 1
+        for q in range(npt):
+            i = pts[q]
+            cx0 = np.int64(math.floor((plo[0, i] + sx) / cell))
+            cy0 = np.int64(math.floor((plo[1, i] + sy) / cell))
+            cx1 = np.int64(math.floor((phi[0, i] + sx) / cell))
+            cy1 = np.int64(math.floor((phi[1, i] + sy) / cell))
+            pb = point_body[i]
+            for r in range(ned):
+                e = eds[r]
+                eb = edge_body[e]
+                if pb == eb or (body_fixed[pb] and body_fixed[eb]):
+                    continue
+                if (np.int64(math.floor(elo[0, e] / cell)) <= cx1 and np.int64(math.floor(ehi[0, e] / cell)) >= cx0
+                        and np.int64(math.floor(elo[1, e] / cell)) <= cy1
+                        and np.int64(math.floor(ehi[1, e] / cell)) >= cy0):
+                    if m == cap:
+                        cap *= 2
+                        ni, ne, nk = np.empty(cap, np.int64), np.empty(cap, np.int64), np.empty(cap, np.int64)
+                        ni[:m], ne[:m], nk[:m] = oi[:m], oe[:m], ok[:m]
+                        oi, oe, ok = ni, ne, nk
+                    oi[m], oe[m], ok[m] = i, e, k
+                    m += 1
+    return oi[:m].copy(), oe[:m].copy(), ok[:m].copy()
+
+
 def ccd_cells(world, D, cell):
     """World._ccd_cells."""
     _, ea, eb, *_ = _topology(world)
@@ -929,4 +1008,6 @@ def warmup():
     floor_cells(ccd_boxes(P, P, i2, i1)[0], 24.0)
     ccd_narrow(P, P, i2, i1, e, e, 0.01, 1e-6, f, f)
     impulse_pass(P.copy(), W, P, i2, i1, e, e, f, f, f, e, 0.004, 0.25, f, f)
+    image_pair_kernel(P, P, np.zeros((2, 2)), np.zeros((2, 2)), np.ones(4, np.bool_), np.ones(2, np.bool_), np.zeros((1, 2)), 24.0,
+                      np.array([0, 0, 1, 1], np.int64), np.zeros(2, np.int64), b)
     bounce_pass(P, P.copy(), W, np.array([0, 2, 4], np.int64), np.array([0, 1, 2], np.int64), i2, i1, e, f, 3.0, 0.004)
