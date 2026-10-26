@@ -76,17 +76,31 @@ def solve_contacts(world, candidates, reach, r, mu):
     P = world.P
     slack = r
     if reach is not None and moved_max(P, reach[2]) < 0.5 * slack - 1e-6:
-        pts, edge_ids = reach[0], reach[1]
+        pts, edge_ids, off = reach[0], reach[1], (reach[3] if len(reach) > 3 else None)
     else:
-        pts, edge_ids = candidates
+        pts, edge_ids, off = candidates[0], candidates[1], (candidates[2] if len(candidates) > 2 else None)
         reach = None
     if pts.size == 0:
         return reach
     _, ea, eb, _, _, _, _, esign, *_ = _topology(world)
     snap = P.copy() if reach is None else None  # P when the candidates were picked, before this pass moves it
     XS = world.PREV if world._span_start is None else world._span_start
-    keep = contact_pass(P, world.PREV, XS, world.W, ea, eb, esign, pts, edge_ids, r, mu, slack, reach is None)
-    return (pts[keep], edge_ids[keep], snap) if reach is None else reach
+    ox, oy = _offsets(off)
+    keep = contact_pass(P, world.PREV, XS, world.W, ea, eb, esign, pts, edge_ids, r, mu, slack, reach is None, ox, oy)
+    if reach is None:
+        return (pts[keep], edge_ids[keep], snap) + (() if off is None else (off[:, keep],))
+    return reach
+
+
+_NO_OFFSETS = np.empty(0)
+
+
+def _offsets(off):
+    """Contiguous x / y rows of (2, m) image offsets (World._merge_images), or two empty arrays for none (the kernels
+    then run their offset-free code)."""
+    if off is None:
+        return _NO_OFFSETS, _NO_OFFSETS
+    return np.ascontiguousarray(off[0], dtype=np.float64), np.ascontiguousarray(off[1], dtype=np.float64)
 
 
 def solve_body_constraints(world):
@@ -134,17 +148,22 @@ def ccd_pairs(world, cells):
     return _pairs(world, *cells, False)
 
 
-def ccd_detect(world, D, pts, eids, gap, tau):
-    """World._ccd_detect for the given broad phase pairs."""
+def ccd_detect(world, D, pts, eids, gap, tau, off=None):
+    """World._ccd_detect for the given broad phase pairs (off: their (2, m) image offsets, or None)."""
     _, ea, eb, *_ = _topology(world)
-    return ccd_narrow(world.PREV, D, ea, eb, pts.astype(np.int64, copy=False), eids.astype(np.int64, copy=False), gap,
-                      tau)
+    ox, oy = _offsets(off)
+    out = ccd_narrow(world.PREV, D, ea, eb, pts.astype(np.int64, copy=False), eids.astype(np.int64, copy=False), gap,
+                     tau, ox, oy)
+    if off is None:
+        return out[:5]
+    return out[:5] + (np.stack([out[5], out[6]]),)
 
 
-def ccd_impulses(world, pts, eids, ts, ss, sides, h, push):
+def ccd_impulses(world, pts, eids, ts, ss, sides, h, push, off=None):
     """World._ccd_impulses. The order comes from np.argsort itself (ties then break exactly as in numpy)."""
     _, ea, eb, *_ = _topology(world)
-    impulse_pass(world.V, world.W, world.PREV, ea, eb, pts, eids, ts, ss, sides, np.argsort(ts), h, push)
+    ox, oy = _offsets(off)
+    impulse_pass(world.V, world.W, world.PREV, ea, eb, pts, eids, ts, ss, sides, np.argsort(ts), h, push, ox, oy)
 
 
 def bounce(world, h, r):
@@ -168,11 +187,13 @@ def moved_max(P, P0):
 
 
 @njit(**NB)
-def contact_pass(P, PREV, XS, W, ea, eb, esign, pts, eids, r, mu, slack, want_reach):
+def contact_pass(P, PREV, XS, W, ea, eb, esign, pts, eids, r, mu, slack, want_reach, ox, oy):
     """One Jacobi contact pass, in place on P. Returns the mask dist < r + slack over the candidates if want_reach,
     else an empty array. One loop that skips non-touching pairs right after the distance (numpy computes everything
-    for every candidate, then filters)."""
+    for every candidate, then filters). ox / oy: per pair image offsets added to the point (periodic axis), or empty
+    for none."""
     m = pts.size
+    has_off = ox.size > 0
     keep = np.zeros(m if want_reach else 0, np.bool_)
     # per active contact: point, edge ends, the three shares and lam
     cp = np.empty(m, np.int64)
@@ -187,6 +208,9 @@ def contact_pass(P, PREV, XS, W, ea, eb, esign, pts, eids, r, mu, slack, want_re
         ia = ea[e]
         ib = eb[e]
         px, py, ax, ay = P[0, ip], P[1, ip], P[0, ia], P[1, ia]
+        if has_off:
+            px += ox[k]
+            py += oy[k]
         ex, ey = P[0, ib] - ax, P[1, ib] - ay
         len2 = max(ex * ex + ey * ey, 1e-12)
         t = min(max(((px - ax) * ex + (py - ay) * ey) / len2, 0.0), 1.0)
@@ -201,7 +225,10 @@ def contact_pass(P, PREV, XS, W, ea, eb, esign, pts, eids, r, mu, slack, want_re
         # start when CCD runs once per frame (World._span_start)
         pax, pay = XS[0, ia], XS[1, ia]
         e0x, e0y = XS[0, ib] - pax, XS[1, ib] - pay
-        q0x, q0y = XS[0, ip] - pax, XS[1, ip] - pay
+        if has_off:
+            q0x, q0y = (XS[0, ip] + ox[k]) - pax, (XS[1, ip] + oy[k]) - pay
+        else:
+            q0x, q0y = XS[0, ip] - pax, XS[1, ip] - pay
         cross0 = e0x * q0y - e0y * q0x
         if cross0 != 0:
             side = 1.0 if cross0 > 0 else -1.0
@@ -222,7 +249,10 @@ def contact_pass(P, PREV, XS, W, ea, eb, esign, pts, eids, r, mu, slack, want_re
         # friction
         cpx = PREV[0, ia] + t * (PREV[0, ib] - PREV[0, ia])
         cpy = PREV[1, ia] + t * (PREV[1, ib] - PREV[1, ia])
-        relx, rely = (px - PREV[0, ip]) - (cx - cpx), (py - PREV[1, ip]) - (cy - cpy)
+        if has_off:
+            relx, rely = (px - (PREV[0, ip] + ox[k])) - (cx - cpx), (py - (PREV[1, ip] + oy[k])) - (cy - cpy)
+        else:
+            relx, rely = (px - PREV[0, ip]) - (cx - cpx), (py - PREV[1, ip]) - (cy - cpy)
         rn = relx * nx + rely * ny
         tx, ty = relx - rn * nx, rely - rn * ny
         fric = min(1.0, mu * depth / max(math.hypot(tx, ty), 1e-9))
@@ -580,14 +610,17 @@ def _tau_hit(rr, e0x, e0y, dex, dey, q0x, q0y, dqx, dqy, tau2):
 
 
 @njit(**NB)
-def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau):
+def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau, offx, offy):
     """World._ccd_detect after the broad phase: the swept-box pre-reject inline, then the quadratic per pair
     (textbook roots, verified; the float64-robust solve where they find nothing). Returns (pts, edge_ids, t, s,
-    side) of the hits, in pair order."""
+    side, offset x, offset y) of the hits, in pair order. offx / offy: per pair image offsets added to the point
+    (periodic axis), or empty for none (the returned offsets are then empty too)."""
     m = pts.size
+    has_off = offx.size > 0
     tau2 = tau * tau
     hp, he = np.empty(m, np.int64), np.empty(m, np.int64)
     ht, hs, hside = np.empty(m), np.empty(m), np.empty(m)
+    hox, hoy = np.empty(m if has_off else 0), np.empty(m if has_off else 0)
     nh = 0
     for k in range(m):
         ip = pts[k]
@@ -597,6 +630,11 @@ def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau):
         ok = True  # pre-reject: the point's and the edge's swept boxes must overlap
         for c in range(2):
             p0 = X0[c, ip]
+            if has_off:
+                if c == 0:
+                    p0 += offx[k]
+                else:
+                    p0 += offy[k]
             p1 = p0 + D[c, ip]
             a0, b0 = X0[c, ia], X0[c, ib]
             a1, b1 = a0 + D[c, ia], b0 + D[c, ib]
@@ -607,7 +645,10 @@ def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau):
             continue
         e0x, e0y = X0[0, ib] - X0[0, ia], X0[1, ib] - X0[1, ia]
         dex, dey = D[0, ib] - D[0, ia], D[1, ib] - D[1, ia]
-        q0x, q0y = X0[0, ip] - X0[0, ia], X0[1, ip] - X0[1, ia]
+        if has_off:
+            q0x, q0y = (X0[0, ip] + offx[k]) - X0[0, ia], (X0[1, ip] + offy[k]) - X0[1, ia]
+        else:
+            q0x, q0y = X0[0, ip] - X0[0, ia], X0[1, ip] - X0[1, ia]
         dqx, dqy = D[0, ip] - D[0, ia], D[1, ip] - D[1, ia]
         c0 = e0x * q0y - e0y * q0x
         c1 = (e0x * dqy - e0y * dqx) + (dex * q0y - dey * q0x)
@@ -656,20 +697,30 @@ def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau):
                 th, sh = 1.0, s1
         if th != np.inf:
             hp[nh], he[nh], ht[nh], hs[nh], hside[nh] = ip, e, th, sh, side
+            if has_off:
+                hox[nh], hoy[nh] = offx[k], offy[k]
             nh += 1
-    return hp[:nh].copy(), he[:nh].copy(), ht[:nh].copy(), hs[:nh].copy(), hside[:nh].copy()
+    no = nh if has_off else 0
+    return (hp[:nh].copy(), he[:nh].copy(), ht[:nh].copy(), hs[:nh].copy(), hside[:nh].copy(), hox[:no].copy(),
+            hoy[:no].copy())
 
 
 @njit(**NB)
-def impulse_pass(V, W, X0, ea, eb, pts, eids, ts, ss, sides, order, h, push):
-    """World._ccd_impulses: one Gauss-Seidel pass over the hits in `order` (earliest first), editing V."""
+def impulse_pass(V, W, X0, ea, eb, pts, eids, ts, ss, sides, order, h, push, ox, oy):
+    """World._ccd_impulses: one Gauss-Seidel pass over the hits in `order` (earliest first), editing V. ox / oy: per
+    hit image offsets of the point (periodic axis), or empty for none."""
+    has_off = ox.size > 0
     for q in range(order.size):
         k = order[q]
         i, ia, ib, t, s = pts[k], ea[eids[k]], eb[eids[k]], ts[k], ss[k]
+        xix, xiy = X0[0, i], X0[1, i]
+        if has_off:
+            xix += ox[k]
+            xiy += oy[k]
         e0x, e0y = X0[0, ib] - X0[0, ia], X0[1, ib] - X0[1, ia]
-        u = min(max(((X0[0, i] - X0[0, ia]) * e0x + (X0[1, i] - X0[1, ia]) * e0y) / max(e0x * e0x + e0y * e0y, 1e-12),
+        u = min(max(((xix - X0[0, ia]) * e0x + (xiy - X0[1, ia]) * e0y) / max(e0x * e0x + e0y * e0y, 1e-12),
                     0.0), 1.0)
-        sepx, sepy = X0[0, i] - (X0[0, ia] + u * e0x), X0[1, i] - (X0[1, ia] + u * e0y)
+        sepx, sepy = xix - (X0[0, ia] + u * e0x), xiy - (X0[1, ia] + u * e0y)
         sl = math.hypot(sepx, sepy)
         if sl > 1e-9:
             nx, ny = sepx / sl, sepy / sl
@@ -680,7 +731,7 @@ def impulse_pass(V, W, X0, ea, eb, pts, eids, ts, ss, sides, order, h, push):
             nx, ny = sides[k] * -ey / el, sides[k] * ex / el
         vrx = V[0, i] - ((1 - s) * V[0, ia] + s * V[0, ib])
         vry = V[1, i] - ((1 - s) * V[1, ia] + s * V[1, ib])
-        epx, epy = X0[0, i] + h * V[0, i], X0[1, i] + h * V[1, i]
+        epx, epy = xix + h * V[0, i], xiy + h * V[1, i]
         ecx = (1 - s) * (X0[0, ia] + h * V[0, ia]) + s * (X0[0, ib] + h * V[0, ib])
         ecy = (1 - s) * (X0[1, ia] + h * V[1, ia]) + s * (X0[1, ib] + h * V[1, ib])
         dvn = max(max((push - ((epx - ecx) * nx + (epy - ecy) * ny)) / h, -(vrx * nx + vry * ny)), 0.0)
@@ -866,7 +917,7 @@ def warmup():
     i2, i1 = np.array([0, 1], np.int64), np.array([1, 2], np.int64)
     e, f = np.empty(0, np.int64), np.empty(0)
     moved_max(P, P)
-    contact_pass(P, P.copy(), P.copy(), W, i2, i1, np.ones(2), e, e, 3.0, 0.5, 3.0, True)
+    contact_pass(P, P.copy(), P.copy(), W, i2, i1, np.ones(2), e, e, 3.0, 0.5, 3.0, True, f, f)
     springs(P, W, i2, i1, np.ones(2), np.ones(2), np.ones(4))
     shape_match(P, np.zeros((1, 4), np.int64), np.zeros((1, 2, 4)), np.ones(1))
     rope_pass(P, W, e, e, np.zeros((0, 2, 2)), f, f)
@@ -876,6 +927,6 @@ def warmup():
     contact_cells(P, i2, i1, 24.0, 6.0)
     span_cells(P, P, i2, i1, 6.0, 24.0)
     floor_cells(ccd_boxes(P, P, i2, i1)[0], 24.0)
-    ccd_narrow(P, P, i2, i1, e, e, 0.01, 1e-6)
-    impulse_pass(P.copy(), W, P, i2, i1, e, e, f, f, f, e, 0.004, 0.25)
+    ccd_narrow(P, P, i2, i1, e, e, 0.01, 1e-6, f, f)
+    impulse_pass(P.copy(), W, P, i2, i1, e, e, f, f, f, e, 0.004, 0.25, f, f)
     bounce_pass(P, P.copy(), W, np.array([0, 2, 4], np.int64), np.array([0, 1, 2], np.int64), i2, i1, e, f, 3.0, 0.004)

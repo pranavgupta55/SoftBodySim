@@ -1,31 +1,51 @@
 """Looping (World.looping) and the world box walls it replaces.
 
-World.looping = {"left": bool, "right": bool, "top": bool, "bottom": bool}. A body that leaves the world rectangle
-World.bounds = (x0, y0, x1, y1) fully through a side whose looping is on, while moving outward through it, comes
-back in through the opposite side: same other coordinate (bottom -> top keeps x, right -> left keeps y) and the same
-velocities. It is placed just outside the opposite edge (fully off screen, so it slides in), or, if the opposite
-side still has its wall, just inside that wall so it isn't trapped outside the box. Works for any gravity direction:
-only position + direction of motion decide.
+World.looping = {"left": bool, "right": bool, "top": bool, "bottom": bool}; World.bounds = (x0, y0, x1, y1). A side
+is "active" when its looping is on or its wall is pending (see below). Each axis (left / right = x, top / bottom = y)
+is in one of two modes:
+
+Periodic (both sides of the axis active): the world repeats along that axis with period L = x1 - x0 (or y1 - y0).
+Contacts, CCD (time of impact, impulses, inelastic projection, impact zones) and the broad phases treat it as a
+torus: a point near one edge meets edges near the opposite edge through the minimum-image offset (+-L), see
+World._image_pairs. Wrapping is then a pure translation by exactly one period: a rope group (below) whose bounding
+box centre has left [x0, x1) (or [y0, y1)) moves by the whole periods that bring the centre back; the other
+coordinate and every velocity are kept, nothing is searched or lifted, and coordinates stay within half a group's
+size of the bounds. On a torus a translation by L changes no distance, so the no-intersection guarantee holds
+through it. An axis only becomes periodic once that is true of the state too (_images_clear: no movable body
+crosses or holds another body's image, e.g. bodies parked off screen by the walled mode); until then it stays
+walled-mode and the check is retried every RETRY_FRAMES frames. World.period is (Lx, Ly) (0 on an axis that isn't
+periodic), or None when neither is: then nothing in the solver changes at all.
+
+Walled mode (an axis with at most one side active, i.e. no looping, or mixed: one side looping, the other walled):
+exactly the behaviour from before periodic collisions. A body that leaves the world rectangle fully through an
+active side, while moving outward through it, comes back in through the opposite side: same other coordinate and
+the same velocities, placed just outside the opposite edge (fully off screen, so it slides in), or, if the opposite
+side still has its wall, just inside that wall so it isn't trapped outside the box; only into a spot with clearance
+from every other body (spot_free, which also looks across a periodic other axis), trying further spots (and for left
+/ right a few lifted ones) if it's taken, else waiting.
 
 World box walls: add_world_box gives a World four 2-point FixedBody walls, tagged `wall_side` and kept in
 World.walls[side] whether or not they are currently in World.bodies. Each wall runs `ext` past both ends of its
-side (a "#" frame, ends off screen), so bodies passing through an open side's off-screen band stay between the
-other walls. set_looping(world, side, True) removes that side's wall right away. set_looping(world, side, False)
-re-adds it only once no movable body lies beyond or straddles its line (every point at least contact_radius inside);
-until then the side is "pending": looping[side] already reads False, the wall is retried every frame, and wrapping
-through that side keeps working meanwhile so whatever is out there can come back. Returns True if applied now.
-
-No-intersection guarantee: World.step calls loop_step once per frame, before the substeps, so a wrap is never part
-of a substep's straight-line motion that CCD checks. A body is only moved into a spot with no edge crossings, no
-containment and every point at least clearance() from other bodies' edges (and theirs from its edges). If the spot
-is taken, further spots (half a body size + clearance apart, away from the screen, or further inside when placing
-inside a wall, up to half the band's length) are tried in order; if all are taken the body is left where it is and
-retried next frame.
+side (a "#" frame, ends off screen). The walls of a walled axis are parallel to the other axis: a periodic axis
+never pairs anything with them through an image (they run past its seams, so the direct contact is the same one),
+see World._image_topology. set_looping(world, side, True) removes that side's wall right away.
+set_looping(world, side, False) re-adds it only once no movable body lies beyond or straddles its line (every point
+at least contact_radius inside; the same rule in both modes); until then the side is "pending": looping[side]
+already reads False, the wall is retried every frame, and the side stays active meanwhile (wrapping through it, and
+a periodic axis stays periodic) so whatever is out there can come back. When the wall goes in, that axis drops to
+walled mode (mixed). Returns True if applied now.
 
 Ropes / chains: bodies tied together by ropes form a group that wraps together by one offset (rope lengths
-unchanged), once the whole group is past the edge. A group with any fixed end (rope to a Hook, (x, y) anchor or
-FixedBody) never wraps, nor does the group holding the dragged point. Fixed bodies never wrap.
+unchanged). A group with any fixed end (rope to a Hook, (x, y) anchor or FixedBody) never wraps: on a periodic axis
+it still collides across the seam, it just keeps its coordinates. Fixed bodies never wrap. The group holding the
+dragged point wraps like any other on a periodic axis, and World.grab_shift / grab_target move with it so the hand
+keeps pulling toward the cursor's image in the body's frame; in walled mode it never wraps (as before).
+
+World.step calls loop_step once per frame, before the substeps, so a wrap is never part of a substep's straight-line
+motion that CCD checks.
 """
+import math
+
 import numpy as np
 
 from entities import EnvConfig, FixedBody
@@ -36,12 +56,106 @@ REACH = 0.5  # destination spots are searched up to this fraction of the band's 
 MAX_SPOTS = 64
 LIFT_SPOTS = 16  # a left / right wrap with no free spot level with the body also tries this many spots stacked above
 RETURN_SPEED = 5.0  # px/s: a group fully past a left / right edge wraps unless it's heading back in faster than this
-RETRY_FRAMES = 8  # a group with no free spot at all waits this many frames before searching again
+RETRY_FRAMES = 8  # a group with no free spot at all waits this many frames before searching again (and an axis
+                  # that can't turn periodic yet waits this long before _images_clear checks again)
+AXIS_SIDES = (("left", "right"), ("top", "bottom"))
+AXIS_OF = {"left": 0, "right": 0, "top": 1, "bottom": 1}
 
 
 def clearance():
     """Minimum gap (world units) between a wrapped body and anything else at its destination."""
     return 2 * EnvConfig.contact_radius
+
+
+# ---------------- Periodic axes
+def _active(world, side):
+    """Looping on, or its wall pending (the side still wraps)."""
+    return bool(world.looping[side]) or side in world.pending_walls
+
+
+def wanted_axes(world):
+    """(x, y): whether each axis has both sides active, i.e. should be periodic (once _images_clear allows it)."""
+    if world.bounds is None:
+        return (False, False)
+    return tuple(all(_active(world, s) for s in sides) for sides in AXIS_SIDES)
+
+
+def periods(world):
+    """(Lx, Ly): the bounds' width and height."""
+    x0, y0, x1, y1 = world.bounds
+    return np.array([x1 - x0, y1 - y0], dtype=float)
+
+
+def image_shifts(period):
+    """The nonzero image offsets (2,) for a World.period (Lx, Ly; 0 = that axis isn't periodic), in a fixed order:
+    +Lx, -Lx, +Ly, -Ly, then the four diagonal ones (only when both axes are periodic). [] for None."""
+    if period is None:
+        return []
+    kx = (1, -1) if period[0] else ()
+    ky = (1, -1) if period[1] else ()
+    combos = [(a, 0) for a in kx] + [(0, b) for b in ky] + [(a, b) for a in kx for b in ky]
+    return [np.array([a * period[0], b * period[1]], dtype=float) for a, b in combos]
+
+
+def _set_periodic(world, axes):
+    world.periodic = tuple(bool(a) for a in axes)
+    world.period = np.where(world.periodic, periods(world), 0.0) if any(world.periodic) else None
+
+
+def clear_periodic(world):
+    """Leave periodic mode on both axes (looping off everywhere, or a new scene)."""
+    world.periodic, world.period = (False, False), None
+
+
+def is_world_wall(world, body):
+    """One of the world box walls (World.walls), whether or not it's in World.bodies right now."""
+    side = getattr(body, "wall_side", None)
+    return side is not None and world.walls.get(side) is body
+
+
+def _images_clear(world, period, axis):
+    """Is the state intersection-free on the torus `period` across `axis` (0 / 1)? No movable body, moved by an
+    image offset that wraps that axis, may cross or contain another body (gap 0: plain intersection). Bodies that
+    merely touch across the seam are fine (CCD separates them). World walls never pair through images."""
+    shifts = [s for s in image_shifts(period) if s[axis] != 0]
+    if not shifts or not world.bodies:
+        return True
+    lo, hi = body_boxes(world)
+    nonempty = world.body_counts > 0
+    movable = nonempty & ~world.body_fixed
+    other = nonempty & ~np.array([is_world_wall(world, b) for b in world.bodies])
+    mk, ok = np.flatnonzero(movable), np.flatnonzero(other)
+    if mk.size == 0 or ok.size == 0:
+        return True
+    for s in shifts:
+        slo, shi = lo[:, mk] + s[:, None], hi[:, mk] + s[:, None]
+        hit = np.all((slo[:, :, None] <= hi[:, None, ok]) & (shi[:, :, None] >= lo[:, None, ok]), axis=0)
+        for a, b in zip(*np.nonzero(hit)):
+            k, j = int(mk[a]), int(ok[b])
+            if k != j and not bodies_clear(world.bodies[k].points + s[:, None], world.bodies[j].points, 0.0):
+                return False
+    return True
+
+
+def _update_periodic(world):
+    """Set World.periodic / World.period for this frame: an axis whose two sides are no longer both active leaves
+    periodic mode at once; one that newly has both active enters it once _images_clear says the state allows it."""
+    want = wanted_axes(world)
+    have = getattr(world, "periodic", (False, False))
+    axes = [h and w for h, w in zip(have, want)]
+    new = [a for a in (0, 1) if want[a] and not have[a]]
+    if new:
+        if world.__dict__.get("_periodic_wait", 0) > 0:
+            world._periodic_wait -= 1
+        else:
+            for a in new:
+                trial = list(axes)
+                trial[a] = True
+                if _images_clear(world, np.where(trial, periods(world), 0.0), a):
+                    axes = trial
+            if any(not axes[a] for a in new):
+                world._periodic_wait = RETRY_FRAMES
+    _set_periodic(world, axes)
 
 
 # ---------------- World box walls
@@ -216,8 +330,9 @@ def body_boxes(world):
 
 
 def spot_free(world, members, shift, gap=None, boxes=None):
-    """Whether the bodies `members` (indices), translated by shift (dx, dy), are clear of every other body. boxes:
-    body_boxes(world), if the caller already has them (they must be current)."""
+    """Whether the bodies `members` (indices), translated by shift (dx, dy), are clear of every other body, and of
+    its images across a periodic axis (World.period). boxes: body_boxes(world), if the caller already has them (they
+    must be current)."""
     gap = clearance() if gap is None else gap
     member_set = set(members)
     d = np.reshape(np.asarray(shift, dtype=float), (2, 1))
@@ -225,16 +340,21 @@ def spot_free(world, members, shift, gap=None, boxes=None):
     lo = np.min([m.min(axis=1) for m in moved], axis=0) - gap
     hi = np.max([m.max(axis=1) for m in moved], axis=0) + gap
     o_lo, o_hi = body_boxes(world) if boxes is None else boxes
-    near = np.flatnonzero(np.all(o_lo <= hi[:, None], axis=0) & np.all(o_hi >= lo[:, None], axis=0)
-                          & (world.body_counts > 0))  # boxes within the gap of the moved group's box
-    for k in near:
-        if k in member_set:
-            continue
-        other = world.bodies[k]
-        if _parallel_wall_ok(other, members, world, d):
-            continue
-        if not all(bodies_clear(m, other.points, gap) for m in moved):
-            return False
+    for image in [None] + image_shifts(getattr(world, "period", None)):
+        s = np.zeros((2, 1)) if image is None else image[:, None]
+        near = np.flatnonzero(np.all(o_lo + s <= hi[:, None], axis=0) & np.all(o_hi + s >= lo[:, None], axis=0)
+                              & (world.body_counts > 0))  # boxes within the gap of the moved group's box
+        for k in near:
+            if k in member_set:
+                continue
+            other = world.bodies[k]
+            if image is None and _parallel_wall_ok(other, members, world, d):
+                continue
+            if image is not None and is_world_wall(world, other):
+                continue  # walls never pair through images
+            pts = other.points if image is None else other.points + s
+            if not all(bodies_clear(m, pts, gap) for m in moved):
+                return False
     return True
 
 
@@ -317,20 +437,69 @@ def _lifted(world, entry, spots, lo, hi, gap):
     return out
 
 
+def _group_index(world, members):
+    return np.concatenate([np.arange(world.offsets[k], world.offsets[k + 1]) for k in members])
+
+
+def _periodic_wraps(world):
+    """Translate every free group whose box centre has left the bounds along a periodic axis by the whole periods
+    that bring it back (module doc). Returns the wraps."""
+    L, on = world.period, world.period > 0
+    origin = np.array(world.bounds[:2], dtype=float)
+    span = np.where(on, L, 1.0)
+    box_lo, box_hi = body_boxes(world)
+    centre = 0.5 * (box_lo + box_hi)
+    out = (world.body_counts > 0) & ~world.body_fixed & np.any(
+        on[:, None] & (np.floor((centre - origin[:, None]) / span[:, None]) != 0), axis=0)
+    if not out.any():
+        return []
+    groups, anchored = rope_groups(world)
+    grabbed_body = None if world.grabbed is None else int(world.point_body[world.grabbed])
+    wraps = []
+    for root, members in groups.items():
+        if root in anchored or not any(out[k] for k in members):
+            continue
+        c = 0.5 * (box_lo[:, members].min(axis=1) + box_hi[:, members].max(axis=1))
+        d = np.where(on, -np.floor((c - origin) / span) * span, 0.0)
+        if not d.any():
+            continue
+        idx = _group_index(world, members)
+        world.P[:, idx] += d[:, None]
+        world.PREV[:, idx] += d[:, None]
+        if grabbed_body in members:  # the hand's target moves into the body's new frame with it
+            world.grab_target = np.asarray(world.grab_target, dtype=float) + d
+            world.grab_shift = world.grab_shift - d
+        wraps.extend((world.bodies[k], (float(d[0]), float(d[1]))) for k in members)
+    return wraps
+
+
 def loop_step(world):
-    """One looping pass (World.step calls it before each frame's substeps): add pending walls that are clear, then
-    wrap every group that fully left through a looping side. Moves P and PREV only; velocities untouched.
-    Returns [(body, (dx, dy)), ...] for the bodies moved, e.g. so motion trails don't draw the jump."""
+    """One looping pass (World.step calls it before each frame's substeps): add pending walls that are clear, update
+    the periodic axes, translate groups across periodic seams, then the walled-mode wraps through the other active
+    sides. Moves P and PREV only; velocities untouched. Returns [(body, (dx, dy)), ...] for the bodies moved, e.g.
+    so motion trails don't draw the jump."""
     if world.pending_walls:
         _try_pending_walls(world)
-    active = {s for s in SIDES if world.looping[s] or s in world.pending_walls}
-    if not active or not world.bodies or world.bounds is None:
+    if world.bounds is None or not world.bodies:
+        clear_periodic(world)
         return []
-    # cheap vectorized pre-check: is any movable body fully outside the bounds at all?
+    _update_periodic(world)
+    wraps = _periodic_wraps(world) if world.period is not None else []
+    active = {s for s in SIDES if _active(world, s) and not world.periodic[AXIS_OF[s]]}
+    if active:
+        wraps += _walled_wraps(world, active)
+    return wraps
+
+
+def _walled_wraps(world, active):
+    """Walled-mode wrapping (module doc) through the `active` sides, all on axes that aren't periodic."""
+    # cheap vectorized pre-check: is any movable body fully outside the bounds across one of those axes at all?
     nonempty = world.body_counts > 0
     box_lo, box_hi = body_boxes(world)  # (2, bodies); kept current below as groups move
     x0, y0, x1, y1 = world.bounds
-    outside = nonempty & ~world.body_fixed & ((box_lo[0] > x1) | (box_hi[0] < x0) | (box_lo[1] > y1) | (box_hi[1] < y0))
+    across_x, across_y = not world.periodic[0], not world.periodic[1]  # (both, as before periodic mode existed)
+    outside = nonempty & ~world.body_fixed & ((((box_lo[0] > x1) | (box_hi[0] < x0)) & across_x)
+                                              | (((box_lo[1] > y1) | (box_hi[1] < y0)) & across_y))
     if not outside.any():
         return []
     groups, anchored = rope_groups(world)
@@ -349,7 +518,7 @@ def loop_step(world):
         key = id(world.bodies[members[0]])
         if key in waiting:
             continue
-        idx = np.concatenate([np.arange(world.offsets[k], world.offsets[k + 1]) for k in members])
+        idx = _group_index(world, members)
         pts = world.P[:, idx]
         lo, hi = pts.min(axis=1), pts.max(axis=1)
         side = _exit_side(lo, hi, world.V[:, idx].mean(axis=1), world.bounds, active)
@@ -370,3 +539,24 @@ def loop_step(world):
                 break
         # every spot taken: leave the group where it is and try again next frame
     return wraps
+
+
+def image_copies(world):
+    """[(body index, (2,) shift)] of the extra copies to draw: every body (world walls aside) whose box sticks out
+    past an edge of a periodic axis shows again one period over on the other side, and in the opposite corner when
+    it sticks out across both axes. [] when nothing is periodic."""
+    period = getattr(world, "period", None)
+    if period is None or not world.bodies:
+        return []
+    x0, y0, x1, y1 = world.bounds
+    lo, hi = body_boxes(world)
+    out = []
+    for s in image_shifts(period):
+        need = world.body_counts > 0  # a copy at +Lx shows the part of a body left of x0, at -Lx right of x1, etc.
+        for a, (e0, e1) in enumerate(((x0, x1), (y0, y1))):
+            if s[a] > 0:
+                need = need & (lo[a] < e0)
+            elif s[a] < 0:
+                need = need & (hi[a] > e1)
+        out += [(int(k), s) for k in np.flatnonzero(need) if not is_world_wall(world, world.bodies[k])]
+    return out

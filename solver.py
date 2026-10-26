@@ -1,5 +1,6 @@
 from collections import defaultdict
 from contextlib import nullcontext
+import copy
 import math
 
 import numpy as np
@@ -95,6 +96,13 @@ class World:
         self.walls = {}  # side -> its world box wall (a FixedBody), whether or not it's in bodies right now
         self.pending_walls = set()  # sides whose looping was turned off, waiting for room to re-add the wall
         self.last_wraps = []  # [(body, (dx, dy))] moved by looping in the last step(), e.g. to break motion trails
+        # Periodic axes (looping.py): an axis whose two sides both loop is a torus for contacts and CCD. period is
+        # (Lx, Ly), 0 on an axis that isn't periodic, or None when neither is (then nothing below changes at all).
+        # Pairs found through an image carry the offset added to their point (_image_pairs). Set by loop_step.
+        self.periodic = (False, False)
+        self.period = None
+        self.grab_shift = np.zeros(2)  # the held point's frame minus the cursor's (an image offset; see grab)
+        self._image_topo = None  # (edges array, points, edges) that take part in image pairs (_image_topology)
         self.env = {}  # per-world EnvConfig overrides (attribute name -> value), in effect only during step()
         self.background = None  # per-world background color (rgb), None for the default (main_opengl.py)
         self.palette = None  # the palettes.py palette this world's colors come from (None: it has none)
@@ -294,19 +302,31 @@ class World:
 
     # ---------------- Mouse dragging
     def grab(self, pos):
-        """Pick up the nearest movable point within grab_radius of pos (if any)."""
+        """Pick up the nearest movable point within grab_radius of pos (if any). Across a periodic axis a point's
+        images count too (a body straddling the seam can be grabbed on either visible copy): grab_shift then holds
+        the image offset, and grab_target is the cursor moved into the point's frame."""
         dist = np.hypot(*(self.P - np.reshape(pos, (2, 1))))
         dist[self.W <= 0] = np.inf  # fixed points can't be dragged
         i = int(np.argmin(dist))
+        shift = np.zeros(2)
+        for s in looping.image_shifts(self.period):  # the point's copy at P + s under the cursor
+            d = np.hypot(*(self.P + s[:, None] - np.reshape(pos, (2, 1))))
+            d[self.W <= 0] = np.inf
+            k = int(np.argmin(d))
+            if d[k] < dist[i]:
+                i, dist, shift = k, d, s
         if dist[i] <= EnvConfig.grab_radius:
             self.grabbed = i
-            self.grab_target = np.array(pos, dtype=float)
+            self.grab_shift = shift
+            self.grab_target = np.array(pos, dtype=float) - shift if shift.any() else np.array(pos, dtype=float)
 
     def drag_to(self, pos):
-        self.grab_target = np.array(pos, dtype=float)
+        shift = self.grab_shift
+        self.grab_target = np.array(pos, dtype=float) - shift if shift.any() else np.array(pos, dtype=float)
 
     def release(self):
         self.grabbed = None
+        self.grab_shift = np.zeros(2)
 
     def _apply_grab(self, h):
         """Nudge the held point toward the cursor once per substep of length h, so contacts (solved after) can
@@ -345,7 +365,12 @@ class World:
 
     def _step(self, dt, scale=1.0, frames=1.0):
         # before the substeps, where the state is settled and intersection-free
-        self.last_wraps = looping.loop_step(self) if self.pending_walls or any(self.looping.values()) else []
+        if self.pending_walls or any(self.looping.values()):
+            self.last_wraps = looping.loop_step(self)
+        else:
+            self.last_wraps = []
+            if self.period is not None:
+                looping.clear_periodic(self)
         if scale == 1.0 and frames == 1.0:
             dt, n = min(dt, EnvConfig.max_dt), EnvConfig.substeps
         else:
@@ -504,12 +529,20 @@ class World:
 
     def draw(self, surface, filled=False, zoom=1.0):
         """Bodies in the order they were added (later ones on top). filled: solid polygons instead of points + springs.
-        zoom maps world units to surface pixels."""
-        for b in self.bodies:
-            if filled:
-                b.draw_filled(surface, zoom=zoom)
-            else:
-                b.draw(surface, zoom)
+        zoom maps world units to surface pixels. A body sticking out past a periodic edge also draws its copy one
+        period over (looping.image_copies), right after itself."""
+        copies = defaultdict(list)
+        for k, s in looping.image_copies(self):
+            copies[k].append(s)
+        for k, b in enumerate(self.bodies):
+            for s in [None] + copies.get(k, []):
+                if s is not None:  # a shallow copy with moved points draws the image (the body's arrays untouched)
+                    b = copy.copy(self.bodies[k])
+                    b.points = self.bodies[k].points + s[:, None]
+                if filled:
+                    b.draw_filled(surface, zoom=zoom)
+                else:
+                    b.draw(surface, zoom)
         for r in self.ropes:
             r.draw(surface, zoom)
         for hk in self.hooks:  # over the ropes, so a rope ends inside its hook
@@ -608,8 +641,97 @@ class World:
             keep[s] = (si != self.edges[0, se]) & (si != self.edges[1, se])
         return i[keep], e[keep]
 
+    # ---------------- Periodic axes: pairs through images (looping.py; only while World.period is set)
+    def _image_topology(self):
+        """(point mask, edge ids) that take part in image pairs: everything but the world box walls (World.walls).
+        Those of a walled axis run along the periodic one and past its seams, so their direct contacts already are
+        the image ones. Cached until the next repack."""
+        t = self._image_topo
+        if t is None or t[0] is not self.edges:
+            wall = np.array([looping.is_world_wall(self, b) for b in self.bodies], dtype=bool)
+            t = (self.edges, ~wall[self.point_body], ~wall[self.edge_body])
+            self._image_topo = t
+        return t[1], t[2]
+
+    def _image_pairs(self, plo, phi, elo, ehi):
+        """(point, edge, offset (2, m)) pairs that meet only through an image: the point's float box plo..phi moved
+        by an image offset (looping.image_shifts) shares a grid cell with the edge's box elo..ehi (the same boxes
+        the direct broad phase floors, pads included). Only points whose moved box reaches the edges' overall extent
+        are tried, so this costs O(points near a seam). Same-body pairs are left out (a body meets its own image
+        only if it is bigger than the period). Shared numpy code for both CPU paths, so they stay identical."""
+        empty = np.empty(0, dtype=np.int64)
+        point_ok, edge_ok = self._image_topology()
+        out_i, out_e, out_o = [], [], []
+        if edge_ok.any():
+            cell = EnvConfig.cell_size
+            ext_lo = np.min(elo, axis=1, where=edge_ok[None], initial=np.inf)[:, None]
+            ext_hi = np.max(ehi, axis=1, where=edge_ok[None], initial=-np.inf)[:, None]
+            for s in looping.image_shifts(self.period):
+                # points whose moved box reaches the edges' extent: those near the seam opposite the offset
+                idx = np.flatnonzero(point_ok & (plo[0] + s[0] <= ext_hi[0]) & (phi[0] + s[0] >= ext_lo[0])
+                                     & (plo[1] + s[1] <= ext_hi[1]) & (phi[1] + s[1] >= ext_lo[1]))
+                if idx.size == 0:
+                    continue
+                lo, hi = plo[:, idx] + s[:, None], phi[:, idx] + s[:, None]
+                u_lo, u_hi = lo.min(axis=1), hi.max(axis=1)
+                eids = np.flatnonzero(edge_ok & (elo[0] <= u_hi[0]) & (ehi[0] >= u_lo[0]) & (elo[1] <= u_hi[1])
+                                      & (ehi[1] >= u_lo[1]))
+                if eids.size == 0:
+                    continue
+                i, e = self._cell_pairs(np.floor(lo / cell).astype(np.int64), np.floor(hi / cell).astype(np.int64),
+                                        np.floor(elo[:, eids] / cell).astype(np.int64),
+                                        np.floor(ehi[:, eids] / cell).astype(np.int64))
+                i, e = idx[i], eids[e]
+                pb, eb = self.point_body[i], self.edge_body[e]
+                keep = (pb != eb) & ~(self.body_fixed[pb] & self.body_fixed[eb])
+                out_i.append(i[keep])
+                out_e.append(e[keep])
+                out_o.append(np.repeat(s[:, None], np.count_nonzero(keep), axis=1))
+        if not out_i:
+            return empty, empty, np.empty((2, 0))
+        return np.concatenate(out_i), np.concatenate(out_e), np.concatenate(out_o, axis=1)
+
+    def _merge_images(self, direct, image):
+        """Direct pairs (sorted by (point, edge), unique) plus image pairs -> (pts, eids, off), sorted by (point,
+        edge) with off = 0 for the direct ones. Minimum image: a (point, edge) pair met directly keeps only that, and
+        of several images of one pair the first (image_shifts order) is kept, so (point, edge) stays unique."""
+        i_d, e_d = direct
+        i_d, e_d = i_d.astype(np.int64, copy=False), e_d.astype(np.int64, copy=False)
+        i_m, e_m, o_m = image
+        if i_m.size == 0:
+            return i_d, e_d, np.zeros((2, i_d.size))
+        n_edges = max(self.edges.shape[1], 1)
+        keys_d = i_d * n_edges + e_d
+        keys_m = i_m.astype(np.int64) * n_edges + e_m
+        if keys_d.size:  # drop the pairs met directly
+            at = np.searchsorted(keys_d, keys_m)
+            fresh = (at >= keys_d.size) | (keys_d[np.minimum(at, keys_d.size - 1)] != keys_m)
+        else:
+            fresh = np.ones(keys_m.size, dtype=bool)
+        keys_m, first = np.unique(keys_m[fresh], return_index=True)  # sorted; the first image of a pair is kept
+        o_m = o_m[:, fresh][:, first]
+        at = np.searchsorted(keys_d, keys_m)  # insertion points: no sort of the (long) direct list
+        i_m, e_m = np.divmod(keys_m, n_edges)
+        pts, eids = np.insert(i_d, at, i_m), np.insert(e_d, at, e_m)
+        off = np.zeros((2, pts.size))
+        off[:, at + np.arange(at.size)] = o_m
+        return pts, eids, off
+
+    def _contact_boxes(self):
+        """Float boxes behind _candidates' cells: points, and edges grown by 2 contact_radius."""
+        pad = 2 * EnvConfig.contact_radius
+        a, b = self.P[:, self.edges[0]], self.P[:, self.edges[1]]
+        return self.P, self.P, np.minimum(a, b) - pad, np.maximum(a, b) + pad
+
     def _candidates(self):
-        """(point, edge) pairs that share a grid cell. Edges are registered in every cell their padded AABB touches."""
+        """(point, edge) pairs that share a grid cell. Edges are registered in every cell their padded AABB touches.
+        With a periodic axis: (point, edge, offset) including the pairs met through images (_merge_images)."""
+        direct = self._direct_candidates()
+        if self.period is None:
+            return direct
+        return self._merge_images(direct, self._image_pairs(*self._contact_boxes()))
+
+    def _direct_candidates(self):
         if _jit():
             return solver_jit.candidates(self, EnvConfig.cell_size, EnvConfig.contact_radius)
         cell, pad = EnvConfig.cell_size, 2 * EnvConfig.contact_radius
@@ -656,6 +778,11 @@ class World:
             boxes = self._span_boxes()
             cells = [np.floor(box / EnvConfig.cell_size).astype(np.int64) for box in boxes]
             candidates = self._filter_pairs(*self._cell_pairs(*cells), contact=True)
+        if self.period is not None:  # plus the pairs through images, from the same float boxes (_span_boxes)
+            plo, phi = boxes[0], boxes[1]
+            r, (ea, eb) = EnvConfig.contact_radius, self.edges
+            elo, ehi = np.minimum(plo[:, ea], plo[:, eb]) - 2 * r, np.maximum(phi[:, ea], phi[:, eb]) + 2 * r
+            candidates = self._merge_images(candidates, self._image_pairs(plo, phi, elo, ehi))
         self.contact_builds += 1
         self._span_contacts = (candidates, boxes[0], boxes[1])
         return candidates, None
@@ -671,16 +798,20 @@ class World:
             return solver_jit.solve_contacts(self, candidates, reach, r, mu)
         P, PREV, W = self.P, self.PREV, self.W
         slack = r
+        # reach: (pts, edge ids, P snapshot[, offsets]); candidates: (pts, edge ids[, offsets]). Offsets (2, m) come
+        # with a periodic axis (_merge_images): the image offset added to each pair's point
         if reach is not None and np.hypot(*(P - reach[2])).max() < 0.5 * slack - 1e-6:
-            pts, edge_ids = reach[0], reach[1]
+            pts, edge_ids, off = reach[0], reach[1], (reach[3] if len(reach) > 3 else None)
         else:
-            pts, edge_ids = candidates
+            pts, edge_ids, off = candidates[0], candidates[1], (candidates[2] if len(candidates) > 2 else None)
             reach = None
         if pts.size == 0:
             return reach
         ia, ib = self.edges[0, edge_ids], self.edges[1, edge_ids]
 
         p, a, b = P[:, pts], P[:, ia], P[:, ib]
+        if off is not None:
+            p = p + off
         e = b - a
         len2 = np.maximum(np.sum(e * e, axis=0), 1e-12)
         t = np.clip(np.sum((p - a) * e, axis=0) / len2, 0.0, 1.0)
@@ -689,7 +820,7 @@ class World:
         dist = np.hypot(d[0], d[1])
         if reach is None:
             keep = dist < r + slack
-            reach = (pts[keep], edge_ids[keep], P.copy())
+            reach = (pts[keep], edge_ids[keep], P.copy()) + (() if off is None else (off[:, keep],))
 
         # most candidates are out of range: keep only the touching ones (everything below is per pair)
         near = np.flatnonzero(dist < r)
@@ -697,6 +828,8 @@ class World:
             return reach
         pts, edge_ids, ia, ib, t, len2, dist = (x[near] for x in (pts, edge_ids, ia, ib, t, len2, dist))
         p, c, d, e = (x[:, near] for x in (p, c, d, e))
+        if off is not None:
+            off = off[:, near]
 
         # Edge normal facing the side the point started this substep on. CCD guarantees no point ever crosses an
         # edge, so that's always the free side: outside for neighboring bodies, inside for a body's contents.
@@ -705,7 +838,7 @@ class World:
         X_side = PREV if self._span_start is None else self._span_start
         pa0 = X_side[:, ia]
         e0 = X_side[:, ib] - pa0
-        q0 = X_side[:, pts] - pa0
+        q0 = (X_side[:, pts] if off is None else X_side[:, pts] + off) - pa0
         cross0 = e0[0] * q0[1] - e0[1] * q0[0]
         side = np.where(cross0 != 0, np.sign(cross0), -self.edge_sign[edge_ids])
         n_edge = -side * np.array([e[1], -e[0]]) / np.sqrt(len2)
@@ -722,7 +855,7 @@ class World:
 
         # friction: cancel part of the point's sliding relative to the contact point on the edge
         c_prev = PREV[:, ia] + t * (PREV[:, ib] - PREV[:, ia])
-        rel = (p - PREV[:, pts]) - (c - c_prev)
+        rel = (p - (PREV[:, pts] if off is None else PREV[:, pts] + off)) - (c - c_prev)
         tang = rel - np.sum(rel * n, axis=0) * n
         tang_len = np.hypot(tang[0], tang[1])
         fric = np.minimum(1.0, mu * depth / np.maximum(tang_len, 1e-9))
@@ -759,6 +892,10 @@ class World:
     def _ccd_pairs(self, D, cells=None):
         """(point, edge) pairs whose swept boxes (start -> start + D) share a grid cell. `cells`: _ccd_cells(D)."""
         cells = self._ccd_cells(D) if cells is None else cells
+        if self.period is not None:  # direct pairs on the CPU, plus the pairs through images (_merge_images)
+            direct = (solver_jit.ccd_pairs(self, cells) if _jit()
+                      else self._filter_pairs(*self._cell_pairs(*cells), contact=False))
+            return self._merge_images(direct, self._image_pairs(*self._ccd_boxes(D)))
         pairs = None if self.backend is None else self.backend.ccd_pairs(cells)  # None: use the CPU code below
         if pairs is not None:
             return pairs
@@ -766,15 +903,23 @@ class World:
             return solver_jit.ccd_pairs(self, cells)
         return self._filter_pairs(*self._cell_pairs(*cells), contact=False)
 
-    def _ccd_new_pairs(self, old_cells, cells):
+    def _ccd_new_pairs(self, old_cells, cells, D=None):
         """The pairs among _ccd_pairs for `cells` that may be missing from the pairs for `old_cells`: a pair can
-        only be new if its point's or its edge's cell range grew, so pair just those against everything."""
+        only be new if its point's or its edge's cell range grew, so pair just those against everything. D (the
+        motion `cells` came from) is needed only with a periodic axis."""
         p_lo, p_hi, e_lo, e_hi = cells
         grew_p = np.flatnonzero(((p_lo < old_cells[0]) | (p_hi > old_cells[1])).any(axis=0))
         grew_e = np.flatnonzero(((e_lo < old_cells[2]) | (e_hi > old_cells[3])).any(axis=0))
         i1, e1 = self._cell_pairs(p_lo[:, grew_p], p_hi[:, grew_p], e_lo, e_hi)
         i2, e2 = self._cell_pairs(p_lo, p_hi, e_lo[:, grew_e], e_hi[:, grew_e])
-        return self._filter_pairs(np.concatenate([grew_p[i1], i2]), np.concatenate([e1, grew_e[e2]]), contact=False)
+        i, e = self._filter_pairs(np.concatenate([grew_p[i1], i2]), np.concatenate([e1, grew_e[e2]]), contact=False)
+        if self.period is None:
+            return i, e
+        # with a periodic axis: plus every pair through an image for D (few; this only needs to be a superset of the
+        # new pairs, see _resolve_ccd)
+        i_m, e_m, o_m = self._image_pairs(*self._ccd_boxes(D))
+        return (np.concatenate([i, i_m]), np.concatenate([e, e_m]),
+                np.concatenate([np.zeros((2, i.size)), o_m], axis=1))
 
     def _ccd_detect(self, D, pairs=None):
         """Points that touch an edge at some time in the substep, moving in straight lines from PREV by D.
@@ -793,9 +938,11 @@ class World:
         collinear point and edge (c2 = c1 = 0) get the times the point passes either end as candidates. Hits the
         textbook test does verify keep its values bit for bit, so results only change where it was wrong.
         """
-        pts, eids = self._ccd_pairs(D) if pairs is None else pairs
+        pairs = self._ccd_pairs(D) if pairs is None else pairs
+        # with a periodic axis pairs carry (2, m) image offsets added to their points, and so do the hits returned
+        pts, eids, img = pairs[0], pairs[1], (pairs[2] if len(pairs) > 2 else None)
         if _jit():
-            return solver_jit.ccd_detect(self, D, pts, eids, EnvConfig.ccd_gap, EnvConfig.ccd_tau)
+            return solver_jit.ccd_detect(self, D, pts, eids, EnvConfig.ccd_gap, EnvConfig.ccd_tau, img)
         empty = np.empty(0)
         X0 = self.PREV
         if pts.size:
@@ -803,13 +950,19 @@ class World:
             # box and the edge's swept box (grown by 1.0 px, more than ccd_gap and ccd_tau) overlap. Grid cells are
             # much coarser than that, so this drops most broad phase pairs before the quadratic.
             p_lo, p_hi, e_lo, e_hi = self._ccd_boxes(D)
-            keep = np.all((p_lo[:, pts] <= e_hi[:, eids]) & (p_hi[:, pts] >= e_lo[:, eids]), axis=0)
+            if img is None:
+                keep = np.all((p_lo[:, pts] <= e_hi[:, eids]) & (p_hi[:, pts] >= e_lo[:, eids]), axis=0)
+            else:  # the point's image path p0 -> p0 + D (as solver_jit.ccd_narrow forms it)
+                p0 = X0[:, pts] + img
+                p1 = p0 + D[:, pts]
+                keep = np.all((np.minimum(p0, p1) <= e_hi[:, eids]) & (np.maximum(p0, p1) >= e_lo[:, eids]), axis=0)
+                img = img[:, keep]
             pts, eids = pts[keep], eids[keep]
         if pts.size == 0:
-            return pts, eids, empty, empty, empty
+            return (pts, eids, empty, empty, empty) + (() if img is None else (np.empty((2, 0)),))
         ia, ib = self.edges[0, eids], self.edges[1, eids]
         e0, de = X0[:, ib] - X0[:, ia], D[:, ib] - D[:, ia]
-        q0, dq = X0[:, pts] - X0[:, ia], D[:, pts] - D[:, ia]
+        q0, dq = (X0[:, pts] if img is None else X0[:, pts] + img) - X0[:, ia], D[:, pts] - D[:, ia]
 
         def cross(u, v):
             return u[0] * v[1] - u[1] * v[0]
@@ -881,7 +1034,7 @@ class World:
         s_hit = np.where(near, s1, s_hit)
 
         hit = np.isfinite(t_hit)
-        return pts[hit], eids[hit], t_hit[hit], s_hit[hit], side[hit]
+        return (pts[hit], eids[hit], t_hit[hit], s_hit[hit], side[hit]) + (() if img is None else (img[:, hit],))
 
     def _resolve_ccd(self, h):
         """Make the straight-line motion PREV -> PREV + V h collision-free by editing V."""
@@ -906,7 +1059,7 @@ class World:
                 D = V * h
                 with sec("broad"):
                     new_cells = self._ccd_cells(D)
-                    extra = self._ccd_new_pairs(cells, new_cells)
+                    extra = self._ccd_new_pairs(cells, new_cells, D)
                 with sec("narrow+impulses"):
                     if self._ccd_detect(D, extra)[0].size == 0:
                         return
@@ -923,7 +1076,7 @@ class World:
                 V_before = V.copy()
                 if fresh:
                     V_pre = V_before  # before any CCD response: the inelastic projection's reference
-                self._ccd_impulses(*hits, h)
+                self._ccd_impulses(*hits[:5], h, *hits[5:])
                 hits = self._ccd_redetect(V * h, pairs, hits, (V != V_before).any(axis=0))
             fresh = False
 
@@ -933,13 +1086,15 @@ class World:
             self.zone_count += 1
             self._impact_zones(h)
 
-    def _ccd_normal(self, i, ia, ib, t, side, h):
+    def _ccd_normal(self, i, ia, ib, t, side, h, off=None):
         """_ccd_impulses' push direction for point i against edge (ia, ib): from the closest point on the edge to the
-        point at the start of the substep, or the edge normal at the hit time t (towards `side`) if they touch."""
+        point at the start of the substep, or the edge normal at the hit time t (towards `side`) if they touch.
+        off: the point's image offset (periodic axis), or None."""
         V, X0 = self.V, self.PREV
+        xi = X0[:, i] if off is None else X0[:, i] + off
         e0 = X0[:, ib] - X0[:, ia]
-        u = min(max((X0[:, i] - X0[:, ia]) @ e0 / max(e0 @ e0, 1e-12), 0.0), 1.0)
-        sep = X0[:, i] - (X0[:, ia] + u * e0)
+        u = min(max((xi - X0[:, ia]) @ e0 / max(e0 @ e0, 1e-12), 0.0), 1.0)
+        sep = xi - (X0[:, ia] + u * e0)
         if np.hypot(*sep) > 1e-9:
             return sep / np.hypot(*sep)
         e = (X0[:, ib] + t * h * V[:, ib]) - (X0[:, ia] + t * h * V[:, ia])
@@ -969,14 +1124,17 @@ class World:
         cons = {}  # (point, edge) -> (i, a, b, s, n, rhs), in first-seen order
         projected = False
         for _ in range(rounds):
-            pts, eids, ts, ss, sides = self._ccd_detect(V * h)
+            hits = self._ccd_detect(V * h)
+            pts, eids, ts, ss, sides = hits[:5]
             if pts.size == 0:
                 self.projection_count += projected
                 return True
-            for i, e, t, s, side in zip(pts.tolist(), eids.tolist(), ts.tolist(), ss.tolist(), sides.tolist()):
+            offs = hits[5].T if len(hits) > 5 else [None] * pts.size  # image offsets (periodic axis)
+            for i, e, t, s, side, o in zip(pts.tolist(), eids.tolist(), ts.tolist(), ss.tolist(), sides.tolist(), offs):
                 ia, ib = int(E[0, e]), int(E[1, e])
-                n = self._ccd_normal(i, ia, ib, t, side, h)
-                gap0 = (X0[:, i] - ((1 - s) * X0[:, ia] + s * X0[:, ib])) @ n
+                n = self._ccd_normal(i, ia, ib, t, side, h, o)
+                xi = X0[:, i] if o is None else X0[:, i] + o
+                gap0 = (xi - ((1 - s) * X0[:, ia] + s * X0[:, ib])) @ n
                 cons[(i, e)] = (i, ia, ib, s, n, (push - gap0) / h)
             parent = {}
 
@@ -1036,29 +1194,31 @@ class World:
         def touches(pts, eids):
             return changed[pts] | changed[E[0, eids]] | changed[E[1, eids]]
 
-        pts, eids = pairs
+        pts, eids = pairs[0], pairs[1]
         moved = touches(pts, eids)
-        new = self._ccd_detect(D, (pts[moved], eids[moved]))
+        new = self._ccd_detect(D, tuple(a[..., moved] for a in pairs))  # (offsets (2, m) too, if periodic)
         kept = ~touches(hits[0], hits[1])
-        merged = [np.concatenate([old[kept], fresh]) for old, fresh in zip(hits, new)]
+        merged = [np.concatenate([old[..., kept], fresh], axis=-1) for old, fresh in zip(hits, new)]
         order = np.argsort(merged[0] * E.shape[1] + merged[1], kind="stable")  # back to (point, edge) order
-        return tuple(a[order] for a in merged)
+        return tuple(a[..., order] for a in merged)
 
-    def _ccd_impulses(self, pts, eids, ts, ss, sides, h):
-        """One pass of sequential (Gauss-Seidel) impulses over detected collisions, earliest first, editing V."""
+    def _ccd_impulses(self, pts, eids, ts, ss, sides, h, off=None):
+        """One pass of sequential (Gauss-Seidel) impulses over detected collisions, earliest first, editing V.
+        off: (2, m) image offsets of the hits' points (periodic axis), or None."""
         if _jit():
-            solver_jit.ccd_impulses(self, pts, eids, ts, ss, sides, h, EnvConfig.ccd_push)
+            solver_jit.ccd_impulses(self, pts, eids, ts, ss, sides, h, EnvConfig.ccd_push, off)
             return
         V, W, X0, E = self.V, self.W, self.PREV, self.edges
         push = EnvConfig.ccd_push
         for k in np.argsort(ts):
             i, ia, ib, t, s = pts[k], E[0, eids[k]], E[1, eids[k]], ts[k], ss[k]
+            xi = X0[:, i] if off is None else X0[:, i] + off[:, k]  # the point (its image, through a seam)
             # push direction: from the closest point on the edge to the point, at the start of the substep.
             # Mid-edge that's the edge normal; near a corner it's corner -> point, which both edges meeting
             # there agree on (per-edge normals would ping-pong the point between them).
             e0 = X0[:, ib] - X0[:, ia]
-            u = min(max((X0[:, i] - X0[:, ia]) @ e0 / max(e0 @ e0, 1e-12), 0.0), 1.0)
-            sep = X0[:, i] - (X0[:, ia] + u * e0)
+            u = min(max((xi - X0[:, ia]) @ e0 / max(e0 @ e0, 1e-12), 0.0), 1.0)
+            sep = xi - (X0[:, ia] + u * e0)
             if np.hypot(*sep) > 1e-9:
                 n = sep / np.hypot(*sep)
             else:
@@ -1066,7 +1226,7 @@ class World:
                 n = sides[k] * np.array([-e[1], e[0]]) / max(np.hypot(*e), 1e-12)  # points to the start side
             v_rel = V[:, i] - ((1 - s) * V[:, ia] + s * V[:, ib])
             # signed gap at the end of the substep, measured at the contact point
-            end_p = X0[:, i] + h * V[:, i]
+            end_p = xi + h * V[:, i]
             end_c = (1 - s) * (X0[:, ia] + h * V[:, ia]) + s * (X0[:, ib] + h * V[:, ib])
             dvn = max((push - (end_p - end_c) @ n) / h, -(v_rel @ n), 0.0)
             denom = W[i] + W[ia] * (1 - s) ** 2 + W[ib] * s ** 2
@@ -1083,6 +1243,9 @@ class World:
         A rigid 2D motion of a zone (here a similarity transform over the substep) can't make its own members
         collide, so each round either finishes or merges zones; at worst everything stops, which is the valid start.
         """
+        if self.period is not None:
+            self._impact_zones_periodic(h)
+            return
         V, W, X0, E = self.V, self.W, self.PREV, self.edges
         n_pts = X0.shape[1]
         parent = np.arange(n_pts)
@@ -1122,5 +1285,66 @@ class World:
             if not merged:
                 break  # collisions inside a rigid zone can only be rounding; stop everything below
         V[:, W > 0] = 0.0  # last resort: no motion this substep, i.e. the (valid) start positions
+        if self.debug is not None:
+            self.debug.zone_points(self, np.flatnonzero(W > 0))
+
+    def _impact_zones_periodic(self, h):
+        """_impact_zones with a periodic axis. A zone can reach across a seam, so its rigid motion is computed on
+        unwrapped positions: the union-find also tracks each point's offset to its root's frame (a hit of point i
+        through image offset o against an edge means i + o sits next to the edge's points). A zone whose offsets
+        disagree (it closes a loop around the torus) has no common frame and holds still for the substep."""
+        V, W, X0, E = self.V, self.W, self.PREV, self.edges
+        n_pts = X0.shape[1]
+        parent = np.arange(n_pts)
+        shift = np.zeros((2, n_pts))  # offset from a point's frame to its parent's
+        wrapped = set()  # roots of zones with inconsistent offsets
+
+        def find(x):
+            path = []
+            while parent[x] != x:
+                path.append(x)
+                x = parent[x]
+            for node in reversed(path):  # compress; the node next to the root first, so its parent's shift is final
+                p = parent[node]
+                if p != x:
+                    shift[:, node] += shift[:, p]
+                    parent[node] = x
+            return x
+
+        for _ in range(n_pts):
+            pts, eids, _, _, _, offs = self._ccd_detect(V * h)
+            if pts.size == 0:
+                return
+            merged = False
+            for i, e, o in zip(pts, eids, offs.T):
+                for j in (E[0, e], E[1, e]):
+                    ri, rj = find(i), find(j)
+                    if ri != rj:  # put j's zone in i's frame: S(i) - S'(j) = o
+                        parent[rj] = ri
+                        shift[:, rj] = shift[:, i] - o - shift[:, j]
+                        if rj in wrapped:
+                            wrapped.discard(rj)
+                            wrapped.add(ri)
+                        merged = True
+                    elif np.abs(shift[:, i] - shift[:, j] - o).max() > 1.0:  # (sums of whole periods: exact)
+                        wrapped.add(ri)
+            roots = np.array([find(x) for x in range(n_pts)])
+            for root in np.unique(roots[pts]):
+                members = np.flatnonzero(roots == root)
+                if self.debug is not None:
+                    self.debug.zone_points(self, members)
+                if (W[members] == 0).any() or root in wrapped:  # touching something fixed, or no common frame
+                    V[:, members] = 0.0
+                    continue
+                m = 1.0 / W[members]
+                x, v = X0[:, members] + shift[:, members], V[:, members]
+                com, v_com = (x * m).sum(axis=1) / m.sum(), (v * m).sum(axis=1) / m.sum()
+                r, u = x - com[:, None], v - v_com[:, None]
+                inertia = (m * (r * r).sum(axis=0)).sum()
+                omega = (m * (r[0] * u[1] - r[1] * u[0])).sum() / inertia if inertia > 1e-12 else 0.0
+                V[:, members] = v_com[:, None] + omega * np.array([-r[1], r[0]])
+            if not merged:
+                break
+        V[:, W > 0] = 0.0
         if self.debug is not None:
             self.debug.zone_points(self, np.flatnonzero(W > 0))
