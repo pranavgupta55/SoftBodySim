@@ -65,7 +65,7 @@ from timectl import TimeControl
 from gl_world import GLWorld
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
-FPS = 60
+FPS = 120  # frame cap; physics keeps its 1/240 s substeps at any rate (World.step's frames)
 SCALE_DOWN = 2  # real screen px per render surface px
 GHOST_ALPHA = 100  # opacity of the translucent ghost layer (screenT)
 OVERLAY_LEGEND_PX = 6  # the debug overlay legend's top-left corner, UI px in from the top-left of the screen
@@ -576,10 +576,10 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         # dt is in frames here, World wants seconds; the time scale applies to the physics only (timectl.py)
         stepped = not editor.paused
         if stepped:
-            world.step(*time_ctl.step_args(dt / fps))
+            world.step(*time_ctl.step_args(dt / fps), frames=60 / fps)
             overlays.after_step(world)
         for _ in range(time_ctl.take_steps() if editor.paused else 0):  # N: one nominal frame per press
-            world.step(*time_ctl.step_args(1 / fps))
+            world.step(*time_ctl.step_args(1 / fps), frames=60 / fps)
             overlays.after_step(world)
             stepped = True
         time_ctl.pending = 0  # a step requested just before resuming is dropped

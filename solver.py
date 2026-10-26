@@ -325,29 +325,31 @@ class World:
         """A profiler timing section, or a shared no-op context when no profiler is attached."""
         return _NO_SECTION if self.profiler is None else self.profiler.section(name)
 
-    def step(self, dt, scale=1.0):
+    def step(self, dt, scale=1.0, frames=1.0):
         """Advance dt * scale seconds. scale is the time scale (slow motion, timectl.py): the step then runs
         round(substeps * scale) substeps (at least 1) and clamps at max_dt * scale, so the substep length stays what
-        it is at scale 1 (substeps / max_dt from EnvConfig, or this world's env overrides)."""
+        it is at scale 1 (substeps / max_dt from EnvConfig, or this world's env overrides). frames: how many 1/60 s
+        frames this step stands for (EnvConfig.substeps are per 1/60 s frame), e.g. 0.5 at 120 fps: half the
+        substeps, so the substep length doesn't depend on the frame rate."""
         if not self.env:
-            self._step(dt, scale)
+            self._step(dt, scale, frames)
             return
         saved = {name: getattr(EnvConfig, name) for name in self.env}
         try:  # this world's overrides apply for the whole step (backend included), then the globals come back
             for name, value in self.env.items():
                 setattr(EnvConfig, name, value)
-            self._step(dt, scale)
+            self._step(dt, scale, frames)
         finally:
             for name, value in saved.items():
                 setattr(EnvConfig, name, value)
 
-    def _step(self, dt, scale=1.0):
+    def _step(self, dt, scale=1.0, frames=1.0):
         # before the substeps, where the state is settled and intersection-free
         self.last_wraps = looping.loop_step(self) if self.pending_walls or any(self.looping.values()) else []
-        if scale == 1.0:
+        if scale == 1.0 and frames == 1.0:
             dt, n = min(dt, EnvConfig.max_dt), EnvConfig.substeps
         else:
-            dt, n = min(dt, EnvConfig.max_dt) * scale, max(1, round(EnvConfig.substeps * scale))
+            dt, n = min(dt, EnvConfig.max_dt) * scale, max(1, round(EnvConfig.substeps * scale * frames))
         h = dt / n
         sec = self._section
         if self.debug is not None:
