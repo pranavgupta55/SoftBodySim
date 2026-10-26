@@ -236,26 +236,58 @@ def image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body
     empty = np.empty(0, np.int64)
     if not anyedge:
         return empty, empty, empty
-    pts = np.empty(N, np.int64)
+    K = S.shape[0]
+    # Points near a seam first: an offset's test below passes only if the test of its nonzero x or y part does, so
+    # points failing those for every offset (most of them) are skipped; the rest get the same float tests as before
+    xs, ys = np.empty(K), np.empty(K)  # the distinct nonzero x and y parts of the offsets
+    nx = ny = 0
+    for k in range(K):
+        if S[k, 0] != 0.0 and not (S[k, 0] == xs[:nx]).any():
+            xs[nx] = S[k, 0]
+            nx += 1
+        if S[k, 1] != 0.0 and not (S[k, 1] == ys[:ny]).any():
+            ys[ny] = S[k, 1]
+            ny += 1
+    near = np.empty(N, np.int64)
+    nn = 0
+    for i in range(N):
+        if not point_ok[i]:
+            continue
+        hit = False
+        for j in range(nx):
+            if plo[0, i] + xs[j] <= ext[2] and phi[0, i] + xs[j] >= ext[0]:
+                hit = True
+        for j in range(ny):
+            if plo[1, i] + ys[j] <= ext[3] and phi[1, i] + ys[j] >= ext[1]:
+                hit = True
+        if hit:
+            near[nn] = i
+            nn += 1
+    pts = np.empty((K, nn), np.int64)  # per offset: its points, ascending
+    npts = np.zeros(K, np.int64)
+    ub = np.empty((K, 4))  # per offset: union box of its moved points (lo x, lo y, hi x, hi y)
+    for k in range(K):
+        sx, sy = S[k, 0], S[k, 1]
+        ulx, uly, uhx, uhy = np.inf, np.inf, -np.inf, -np.inf
+        for q in range(nn):
+            i = near[q]
+            lx, ly, hx, hy = plo[0, i] + sx, plo[1, i] + sy, phi[0, i] + sx, phi[1, i] + sy
+            if lx <= ext[2] and hx >= ext[0] and ly <= ext[3] and hy >= ext[1]:
+                pts[k, npts[k]] = i
+                npts[k] += 1
+                ulx, uly, uhx, uhy = min(ulx, lx), min(uly, ly), max(uhx, hx), max(uhy, hy)
+        ub[k, 0], ub[k, 1], ub[k, 2], ub[k, 3] = ulx, uly, uhx, uhy
     eds = np.empty(E, np.int64)
     ec = np.empty((4, E), np.int64)  # cell ranges of the selected edges: x lo, x hi, y lo, y hi
     cap = 1024
     oi, oe, ok = np.empty(cap, np.int64), np.empty(cap, np.int64), np.empty(cap, np.int64)
     m = 0
-    for k in range(S.shape[0]):
+    for k in range(K):
         sx, sy = S[k, 0], S[k, 1]
-        npt = 0
-        ulx, uly, uhx, uhy = np.inf, np.inf, -np.inf, -np.inf
-        for i in range(N):
-            if not point_ok[i]:
-                continue
-            lx, ly, hx, hy = plo[0, i] + sx, plo[1, i] + sy, phi[0, i] + sx, phi[1, i] + sy
-            if lx <= ext[2] and hx >= ext[0] and ly <= ext[3] and hy >= ext[1]:
-                pts[npt] = i
-                npt += 1
-                ulx, uly, uhx, uhy = min(ulx, lx), min(uly, ly), max(uhx, hx), max(uhy, hy)
+        npt = npts[k]
         if npt == 0:
             continue
+        ulx, uly, uhx, uhy = ub[k, 0], ub[k, 1], ub[k, 2], ub[k, 3]
         ned = 0
         for e in range(E):
             if edge_ok[e] and elo[0, e] <= uhx and ehi[0, e] >= ulx and elo[1, e] <= uhy and ehi[1, e] >= uly:
@@ -267,7 +299,7 @@ def image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body
                 ec[3, ned] = np.int64(math.floor(ehi[1, e] / cell))
                 ned += 1
         for q in range(npt):
-            i = pts[q]
+            i = pts[k, q]
             cx0 = np.int64(math.floor((plo[0, i] + sx) / cell))
             cy0 = np.int64(math.floor((plo[1, i] + sy) / cell))
             cx1 = np.int64(math.floor((phi[0, i] + sx) / cell))
@@ -353,7 +385,7 @@ def ccd_detect(world, D, pts, eids, gap, tau, off=None):
                      tau, ox, oy)
     if off is None:
         return out[:5]
-    return out[:5] + (np.stack([out[5], out[6]]),)
+    return out[:5] + (out[5],)
 
 
 def ccd_impulses(world, pts, eids, ts, ss, sides, h, push, off=None):
@@ -849,14 +881,14 @@ def _tau_hit(rr, e0x, e0y, dex, dey, q0x, q0y, dqx, dqy, tau2):
 def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau, offx, offy):
     """World._ccd_detect after the broad phase: the swept-box pre-reject inline, then the quadratic per pair
     (textbook roots, verified; the float64-robust solve where they find nothing). Returns (pts, edge_ids, t, s,
-    side, offset x, offset y) of the hits, in pair order. offx / offy: per pair image offsets added to the point
+    side, offsets (2, m)) of the hits, in pair order. offx / offy: per pair image offsets added to the point
     (periodic axis), or empty for none (the returned offsets are then empty too)."""
     m = pts.size
     has_off = offx.size > 0
     tau2 = tau * tau
     hp, he = np.empty(m, np.int64), np.empty(m, np.int64)
     ht, hs, hside = np.empty(m), np.empty(m), np.empty(m)
-    hox, hoy = np.empty(m if has_off else 0), np.empty(m if has_off else 0)
+    ho = np.empty((2, m if has_off else 0))
     nh = 0
     for k in range(m):
         ip = pts[k]
@@ -934,11 +966,10 @@ def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau, offx, offy):
         if th != np.inf:
             hp[nh], he[nh], ht[nh], hs[nh], hside[nh] = ip, e, th, sh, side
             if has_off:
-                hox[nh], hoy[nh] = offx[k], offy[k]
+                ho[0, nh], ho[1, nh] = offx[k], offy[k]
             nh += 1
     no = nh if has_off else 0
-    return (hp[:nh].copy(), he[:nh].copy(), ht[:nh].copy(), hs[:nh].copy(), hside[:nh].copy(), hox[:no].copy(),
-            hoy[:no].copy())
+    return (hp[:nh].copy(), he[:nh].copy(), ht[:nh].copy(), hs[:nh].copy(), hside[:nh].copy(), ho[:, :no].copy())
 
 
 @njit(**NB)

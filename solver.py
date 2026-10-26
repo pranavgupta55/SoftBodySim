@@ -127,6 +127,7 @@ class World:
         self.period = None
         self.grab_shift = np.zeros(2)  # the held point's frame minus the cursor's (an image offset; see grab)
         self._image_topo = None  # (edges array, points, edges) that take part in image pairs (_image_topology)
+        self._ccd_box_cache = None  # (D, _ccd_float_boxes(D)) with a periodic axis
         self.env = {}  # per-world EnvConfig overrides (attribute name -> value), in effect only during step()
         self.background = None  # per-world background color (rgb), None for the default (main_opengl.py)
         self.palette = None  # the palettes.py palette this world's colors come from (None: it has none)
@@ -1001,10 +1002,19 @@ class World:
 
     # ---------------- Continuous collision detection (the no-intersection guarantee)
     def _ccd_float_boxes(self, D):
-        """_ccd_boxes, from the compiled kernel when it runs (the same values)."""
+        """_ccd_boxes, from the compiled kernel when it runs (the same values). With a periodic axis the boxes of
+        the latest D are kept: _ccd_cells, _ccd_pairs and _ccd_new_pairs all need them for the same D (PREV doesn't
+        change while a D is in use, and every D is a fresh array)."""
+        c = getattr(self, "_ccd_box_cache", None)
+        if c is not None and c[0] is D:
+            return c[1]
         if _jit():
-            return solver_jit.ccd_boxes(self.PREV, D, *solver_jit._topology(self)[1:3])
-        return self._ccd_boxes(D)
+            boxes = solver_jit.ccd_boxes(self.PREV, D, *solver_jit._topology(self)[1:3])
+        else:
+            boxes = self._ccd_boxes(D)
+        if self.period is not None:
+            self._ccd_box_cache = (D, boxes)
+        return boxes
 
     def _ccd_boxes(self, D):
         """Swept boxes of the straight-line paths PREV -> PREV + D: (point lo, point hi, edge lo, edge hi), each
@@ -1018,6 +1028,11 @@ class World:
 
     def _ccd_cells(self, D):
         """Grid cell ranges of the swept boxes: (point lo, point hi, edge lo, edge hi) cell indices."""
+        if self.period is not None:  # (the float boxes are kept for the image pairs)
+            boxes = self._ccd_float_boxes(D)
+            if _jit():
+                return [solver_jit.floor_cells(box, EnvConfig.cell_size) for box in boxes]
+            return [np.floor(box / EnvConfig.cell_size).astype(int) for box in boxes]
         if _jit():
             return solver_jit.ccd_cells(self, D, EnvConfig.cell_size)
         return [np.floor(box / EnvConfig.cell_size).astype(int) for box in self._ccd_boxes(D)]
