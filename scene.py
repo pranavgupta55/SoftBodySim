@@ -184,7 +184,8 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     this world are used, and a bigger world than the one it was made for is topped up with random ones past it.
     None: a seeded random layout of the spawn settings' diamond density. remove / add / add_seed: a variant of it with that many diamonds
     dropped and added (diamonds_map.pick_diamonds)."""
-    from diamonds_map import lattice_diamonds, load_layout, pick_diamonds, place_hexagons
+    from diamonds_map import (lattice_diamonds, layout_shift, load_layout, pick_diamonds, place_hexagons,
+                              shift_diamonds)
     from palettes import DEFAULT, apply_palette
 
     spawn = diamonds_spawn(layout, spawn)
@@ -199,6 +200,8 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=DIAMOND_SIDE, gap=CUP_GAP,
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
                              add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)))
+    if isinstance(layout, str):  # the layout file's own offset (diamonds_map.layout_shift), if any
+        diamonds = shift_diamonds(diamonds, layout_shift(layout), world_width, world_height)
     rng = np.random.default_rng(seed + 2)  # each body's palette_pick: which of its role's colors it gets
     bodies = []  # added in one go at the end (one repack instead of one per body)
     for corners, _ in diamonds:

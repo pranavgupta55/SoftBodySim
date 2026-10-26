@@ -114,6 +114,29 @@ def layout_spawn(path):
         return dict(json.load(f).get("spawn", {}))
 
 
+def layout_shift(path):
+    """A saved layout's own offset (dx, dy) for its picked diamonds, in world units ((0, 0) if it has none): the
+    whole layout slid over after picking, e.g. half a row down off the lattice."""
+    with open(path) as f:
+        return tuple(float(v) for v in json.load(f).get("shift", (0.0, 0.0)))
+
+
+def shift_diamonds(diamonds, shift, world_w, world_h):
+    """[(corners, rgb)] translated by shift (dx, dy); one that ends up wholly past the right / bottom edge comes back
+    one world width / height over (the world loops on every side). Ones straddling an edge stay put: the seams are
+    periodic, so they collide and draw across it."""
+    dx, dy = shift
+    if not dx and not dy:
+        return diamonds
+    out = []
+    for corners, rgb in diamonds:
+        c = corners + np.array([[dx], [dy]])
+        c[0] -= world_w * (c[0].min() >= world_w)
+        c[1] -= world_h * (c[1].min() >= world_h)
+        out.append((c, rgb))
+    return out
+
+
 def save_layout(path, diamonds, size, note="", spawn=None, keys=None):
     """Write the picked diamonds' tile keys ([(corners, rgb)] from pick_diamonds, or `keys` directly), the world size
     they were picked for and (optional) the layout's own shape spawning settings to `path` as JSON."""
