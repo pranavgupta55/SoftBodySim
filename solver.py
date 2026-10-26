@@ -32,6 +32,29 @@ AUTO_GPU_POINTS = 800
 AUTO_CPU_POINTS = 650
 
 
+# XPBD spring compliance from a SoftBody's PBD stiffness (EnvConfig.xpbd). A PBD spring in a Jacobi pass removes
+# about stiffness / count of its error per pass (count = springs at its points, the averaging divisor), so
+# f = 1 - (1 - stiffness / count)^I per substep of I passes. Against a steady load that balances like a spring of
+# compliance alpha = (w_i + w_j) h^2 / f (w = inverse masses): stiffer with shorter substeps, softer with longer ones.
+# XPBD fixes alpha at its value for today's reference schedule (h = 1/240 s, 4 passes), so a body feels the same as
+# with PBD there and keeps that stiffness at any other substep length or count. The (w_i + w_j) factor keeps PBD's
+# mass independence (a heavy body sags as far as a light one). XPBD_CALIBRATION scales the result; measured, 1.0
+# (the formula as is) matches PBD at 4 x 4 best: rest sag (height / rest height) of a resting 12-gon 0.809 vs 0.810,
+# hexagon 0.978 vs 0.980, heptagon 0.989 vs 0.990, 8-point box 0.994 vs 0.995 (stiffness 0.1, skip 2; 0.7 / 0.5 give
+# 0.838 / 0.858 on the 12-gon). The Jacobi passes don't converge the solve at long substeps, so a body is still
+# softer there than at 1/240 s (12-gon at 1/60 s: 0.64 vs PBD's 0.42), but far less so than with PBD.
+XPBD_REF_H = 1 / 240
+XPBD_REF_ITERATIONS = 4
+XPBD_CALIBRATION = 1.0
+
+
+def spring_compliance(stiffness, count):
+    """Per-spring XPBD compliance per unit inverse mass (alpha / (w_i + w_j)) for PBD stiffness and the springs' mean
+    point spring count (see XPBD_REF_H). Stiffness <= 0 gives a near-infinite compliance (no pull)."""
+    f = 1.0 - (1.0 - np.clip(stiffness / count, 0.0, 1.0)) ** XPBD_REF_ITERATIONS
+    return XPBD_CALIBRATION * XPBD_REF_H * XPBD_REF_H / np.maximum(f, 1e-12)
+
+
 def _backend_kind(world):
     """"cpu" or "gpu": this world's backend setting (world.env, else EnvConfig.backend), with "auto" decided from the
     scene. Scenes GpuBackend.pbd_substep can't run (ropes, custom predict / solve_constraints, no edges) are "cpu"."""
@@ -109,6 +132,8 @@ class World:
         self._span_contacts = None  # (candidates, point box lo, point box hi), shared by the span's substeps
         self._span_reach = None  # _solve_contacts' reach, carried across the span's substeps
         self.contact_builds = 0  # contact candidate broad phases run (for debugging)
+        self.last_sim_dt = 0.0  # seconds the last step() simulated (dt * scale after the max_dt clamp)
+        self._h = XPBD_REF_H  # the current substep's length (XPBD springs), set by _pbd_substep
 
     def add(self, body, index=None):
         """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
@@ -239,6 +264,11 @@ class World:
         self.spring_count = np.ones(n_pts)
         for k in soft:
             self.spring_count[offsets[k]:offsets[k + 1]] = bodies[k].spring_count
+        # XPBD (EnvConfig.xpbd): compliance per unit inverse mass, and the mass-splitting counts of both ends
+        i, j = self.springs
+        self.spring_ci, self.spring_cj = self.spring_count[i], self.spring_count[j]
+        self.spring_comp = spring_compliance(self.spring_stiffness, 0.5 * (self.spring_ci + self.spring_cj))
+        self.spring_lambda = np.zeros(self.springs.shape[1])  # Lagrange multipliers, reset every substep
 
         # rigid bodies grouped by point count, so each group is a (bodies, points) block
         groups = defaultdict(list)
@@ -257,7 +287,9 @@ class World:
                 b.solve_constraints()
             return
         P, W = self.P, self.W
-        if self.springs.shape[1]:  # SoftBody.solve_constraints for all soft bodies at once
+        if self.springs.shape[1] and EnvConfig.xpbd:
+            self._xpbd_springs()
+        elif self.springs.shape[1]:  # SoftBody.solve_constraints for all soft bodies at once
             i, j = self.springs
             d = P[:, j] - P[:, i]
             dist = np.maximum(np.hypot(d[0], d[1]), 1e-9)
@@ -284,6 +316,34 @@ class World:
             P[:, idx] += stiffness[:, None] * (goal - pts)
         for b in self.solo_bodies:
             b.solve_constraints()
+
+    def _xpbd_springs(self):
+        """One pass of every SoftBody spring as an XPBD distance constraint (Macklin, Müller, Chentanez 2016), Jacobi
+        with mass splitting (Tonge et al. 2012: each end's inverse mass counted once per spring at that point, so the
+        summed corrections need no averaging and the multipliers stay consistent), plus Rayleigh damping along the
+        spring (XPBD eq. 26, EnvConfig.spring_damping). The multipliers carry across a substep's passes; _pbd_substep
+        resets them. Same arithmetic, in the same order, as solver_jit.xpbd_springs."""
+        P, W, h = self.P, self.W, self._h
+        i, j = self.springs
+        d = P[:, j] - P[:, i]
+        dist = np.maximum(np.hypot(d[0], d[1]), 1e-9)
+        nx, ny = d[0] / dist, d[1] / dist
+        wi, wj = W[i], W[j]
+        at = self.spring_comp * (wi + wj) / (h * h)  # alpha~ = alpha / h^2
+        gamma = at * EnvConfig.spring_damping * h
+        # how fast the spring is stretching this substep (relative motion since the substep's start, along it)
+        rel = nx * ((P[0, j] - self.PREV[0, j]) - (P[0, i] - self.PREV[0, i])) + \
+            ny * ((P[1, j] - self.PREV[1, j]) - (P[1, i] - self.PREV[1, i]))
+        lam = self.spring_lambda
+        num = -(dist - self.spring_rest) - at * lam - gamma * rel
+        den = (1.0 + gamma) * (self.spring_ci * wi + self.spring_cj * wj) + at
+        ok = den > 0  # both ends fixed: no correction
+        dl = np.where(ok, num / np.where(ok, den, 1.0), 0.0)
+        lam += dl
+        ij = np.concatenate([i, j])
+        a, b = -wi * dl, wj * dl
+        for k, n in enumerate((nx, ny)):  # bincount adds in input order: i's shares then j's
+            P[k] += np.bincount(ij, np.concatenate([a * n, b * n]), minlength=P.shape[1])
 
     def _solve_ropes(self):
         """Every rope's solve_constraints, in list order (Gauss-Seidel)."""
@@ -330,7 +390,9 @@ class World:
         round(substeps * scale) substeps (at least 1) and clamps at max_dt * scale, so the substep length stays what
         it is at scale 1 (substeps / max_dt from EnvConfig, or this world's env overrides). frames: how many 1/60 s
         frames this step stands for (EnvConfig.substeps are per 1/60 s frame), e.g. 0.5 at 120 fps: half the
-        substeps, so the substep length doesn't depend on the frame rate."""
+        substeps, so the substep length doesn't depend on the frame rate. Above EnvConfig.max_substeps per 1/60 s
+        (high time scales) the substeps get longer instead, up to EnvConfig.max_substep_dt. Sets last_sim_dt to the
+        seconds actually simulated."""
         if not self.env:
             self._step(dt, scale, frames)
             return
@@ -350,11 +412,18 @@ class World:
             dt, n = min(dt, EnvConfig.max_dt), EnvConfig.substeps
         else:
             dt, n = min(dt, EnvConfig.max_dt) * scale, max(1, round(EnvConfig.substeps * scale * frames))
+        if EnvConfig.max_substeps is not None:  # past the cap, longer substeps instead of more (see EnvConfig)
+            n = min(n, max(1, round(max(EnvConfig.max_substeps, EnvConfig.substeps) * frames)))
+        if EnvConfig.max_substep_dt is not None:  # but never longer than max_substep_dt
+            n = max(n, math.ceil(dt / EnvConfig.max_substep_dt - 1e-9))
+        self.last_sim_dt = dt  # seconds this step simulates (after the max_dt clamp and the time scale)
         h = dt / n
         sec = self._section
         if self.debug is not None:
             self.debug.begin_step(self)
         stride = n if EnvConfig.ccd_stride is None else max(1, min(int(EnvConfig.ccd_stride), n))
+        if EnvConfig.ccd_max_span is not None:  # no CCD span longer than ccd_max_span seconds (see EnvConfig)
+            stride = max(1, min(stride, int(EnvConfig.ccd_max_span / h + 1e-9)))
         if stride > 1:
             for k in range(0, n, stride):
                 self._ccd_span(h, min(stride, n - k))
@@ -478,6 +547,8 @@ class World:
     def _pbd_substep(self, h):
         """Predict, drag, then iterations of body constraints, ropes and soft contacts (moves P, from PREV)."""
         sec = self._section
+        self._h = h  # the XPBD springs' substep length, and a fresh set of multipliers for this substep
+        self.spring_lambda.fill(0.0)
         with sec("predict+grab"):
             if self.batched_predict:  # Body.predict for every body at once
                 self.V += EnvConfig.gravity[:, None] * h * (self.W > 0)

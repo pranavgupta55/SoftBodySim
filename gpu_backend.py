@@ -8,7 +8,8 @@ GPU:
   the same floor() as World._candidates / World._ccd_cells), so the GPU only does integer work: a hash grid over
   point cells (count, prefix sum, scatter) and one thread per edge that walks its cells and emits the (point, edge)
   pairs whose cell ranges overlap, with World._filter_pairs' body rules. The pair set is exactly the CPU one.
-- PBD iterations: spring Jacobi solves, rigid shape matching and proximity contacts (float32, atomic accumulation).
+- PBD iterations: spring Jacobi solves (XPBD with the multipliers kept on the GPU across a substep's passes, or PBD,
+  as EnvConfig.xpbd), rigid shape matching and proximity contacts (float32, atomic accumulation).
   They run on substep-local displacements x = P - PREV, so rounding is relative to the motion, not to world
   coordinates; differences are formed as (PREV_j - PREV_i) + (x_j - x_i). The result is only a proposed motion.
 
@@ -98,11 +99,30 @@ _PAIRS = """
         }
 """
 
-# ---- constraints, accumulate: threads [0, S) are springs, [S, S + R) are rigid-body points. params: [N, S, R]
+# ---- constraints, accumulate: threads [0, S) are springs, [S, S + R) are rigid-body points.
+# params: [N, S, R, xpbd], fparams: [h, spring_damping]. xpbd = 1: XPBD springs as World._xpbd_springs (mass-splitting
+# Jacobi, Rayleigh damping), multipliers read from lam and written to lamout; 0: PBD springs (averaged in con_apply)
 _CON_ACC = """
     uint t = thread_position_in_grid.x;
     int N = params[0], S = params[1], R = params[2];
-    if (t < uint(S)) {
+    if (t < uint(S) && params[3] != 0) {
+        int i = si[t], j = sj[t];
+        float2 d = float2(prev[j] - prev[i], prev[N + j] - prev[N + i]) + float2(x[j] - x[i], x[N + j] - x[N + i]);
+        float dist = max(length(d), 1e-9f);
+        float2 n = d / dist;
+        float wi = w[i], wj = w[j];
+        float h = fparams[0];
+        float at = scomp[t] * (wi + wj) / (h * h);
+        float gamma = at * fparams[1] * h;
+        float rel = dot(n, float2(x[j] - x[i], x[N + j] - x[N + i]));  // x = motion since the substep's start
+        float den = (1.0f + gamma) * (scount[i] * wi + scount[j] * wj) + at;
+        float dl = den > 0.0f ? (-(dist - rest_len[t]) - at * lam[t] - gamma * rel) / den : 0.0f;
+        atomic_store_explicit(&lamout[t], lam[t] + dl, memory_order_relaxed);
+        atomic_fetch_add_explicit(&acc[i], -wi * dl * n.x, memory_order_relaxed);
+        atomic_fetch_add_explicit(&acc[N + i], -wi * dl * n.y, memory_order_relaxed);
+        atomic_fetch_add_explicit(&acc[j], wj * dl * n.x, memory_order_relaxed);
+        atomic_fetch_add_explicit(&acc[N + j], wj * dl * n.y, memory_order_relaxed);
+    } else if (t < uint(S)) {
         int i = si[t], j = sj[t];
         float2 d = float2(prev[j] - prev[i], prev[N + j] - prev[N + i]) + float2(x[j] - x[i], x[N + j] - x[N + i]);
         float dist = max(length(d), 1e-9f);
@@ -125,8 +145,8 @@ _CON_ACC = """
     }
 """
 
-# ---- constraints, apply: one thread per point. kind 2 = rigid (move toward goal), else spring Jacobi average
-# (acc is 0 for points without springs). Rigid covariance from raw sums: sum (q - com) rest^T = sum q rest^T -
+# ---- constraints, apply: one thread per point. kind 2 = rigid (move toward goal), else the springs' summed XPBD
+# corrections (params[3] = 1) or their Jacobi average (PBD; acc is 0 for points without springs). Rigid covariance from raw sums: sum (q - com) rest^T = sum q rest^T -
 # com (sum rest)^T, with q relative to the body's first point so the numbers stay small.
 _CON_APPLY = """
     uint i = thread_position_in_grid.x;
@@ -147,7 +167,7 @@ _CON_APPLY = """
         float2 q = float2(prev[i] - prev[an], prev[N + i] - prev[N + an]) + float2(xi.x - x[an], xi.y - x[N + an]);
         xi += rstiff[k] * (goal - q);
     } else {
-        xi += float2(acc[i], acc[N + i]) / scount[i];
+        xi += float2(acc[i], acc[N + i]) / (params[3] != 0 ? 1.0f : scount[i]);
     }
     xout[i] = xi.x;
     xout[N + i] = xi.y;
@@ -223,8 +243,8 @@ def _kernels():
         k("pairs", ["elo", "ehi", "plo", "bstart", "bcount", "slot_pt", "slot_cx", "slot_cy", "edges", "edge_body",
                     "point_body", "body_fixed", "body_self", "body_counts", "offsets", "params"],
           ["npairs", "out_pt", "out_e"], _PAIRS, True)
-        k("con_acc", ["prev", "x", "w", "si", "sj", "rest_len", "sstiff", "rpt", "rbody", "ranchor", "rrest", "params"],
-          ["acc", "rsum"], _CON_ACC, True)
+        k("con_acc", ["prev", "x", "w", "si", "sj", "rest_len", "sstiff", "scomp", "scount", "lam", "rpt", "rbody",
+                      "ranchor", "rrest", "params", "fparams"], ["acc", "rsum", "lamout"], _CON_ACC, True)
         k("con_apply", ["prev", "x", "acc", "scount", "kinds", "rslot", "rbody", "ranchor", "rn", "rsum", "rrest",
                         "rrestsum", "rstiff", "params"], ["xout"], _CON_APPLY, False)
         k("contact_acc", ["prev", "sref", "x", "w", "cpt", "ce", "npairs", "edges_a", "edges_b", "esign", "params", "fparams"],
@@ -266,6 +286,7 @@ class GpuTopology:
         self.si, self.sj = _i32(world.springs[0]), _i32(world.springs[1])
         self.rest_len, self.sstiff = _f32(world.spring_rest), _f32(world.spring_stiffness)
         self.scount = _f32(world.spring_count)
+        self.scomp = _f32(world.spring_comp)  # XPBD compliance per unit inverse mass (solver.spring_compliance)
 
         kinds = np.zeros(n_pts, dtype=np.int32)
         rslot = np.full(n_pts, -1, dtype=np.int32)
@@ -400,8 +421,9 @@ class GpuBackend:
             prev, inv_mass = _f32(w.PREV.ravel()), _f32(w.W)  # W re-sent each substep in case it was edited
             x0 = _f32((w.P - w.PREV).ravel())
         S, R = g.n_springs, g.n_rigid_pts
-        cparams = _i32([N, S, R])
+        cparams = _i32([N, S, R, 1 if EnvConfig.xpbd else 0])
         fparams = _f32([EnvConfig.contact_radius, EnvConfig.friction])
+        sparams = _f32([h, EnvConfig.spring_damping])
         tg = (_TG, 1, 1)
         with self._gpu_section("gpu pbd"):
             while True:
@@ -412,13 +434,15 @@ class GpuBackend:
                     npairs, cpt, ce = self._pairs(*cells, 0, cap)
                 kparams = _i32([N, cap])
                 x = x0
+                lam = mx.zeros((max(S, 1),), dtype=mx.float32)  # XPBD multipliers, fresh every substep
                 for _ in range(EnvConfig.iterations):
                     if S + R:
-                        acc, rsum = K["con_acc"](
-                            inputs=[prev, x, inv_mass, g.si, g.sj, g.rest_len, g.sstiff, g.rpt, g.rbody, g.ranchor,
-                                    g.rrest, cparams],
-                            grid=_grid(S + R), threadgroup=tg, output_shapes=[(2 * N,), (6 * max(g.n_rigid, 1),)],
-                            output_dtypes=[mx.float32] * 2, init_value=0)
+                        acc, rsum, lam = K["con_acc"](
+                            inputs=[prev, x, inv_mass, g.si, g.sj, g.rest_len, g.sstiff, g.scomp, g.scount, lam, g.rpt,
+                                    g.rbody, g.ranchor, g.rrest, cparams, sparams],
+                            grid=_grid(S + R), threadgroup=tg,
+                            output_shapes=[(2 * N,), (6 * max(g.n_rigid, 1),), (max(S, 1),)],
+                            output_dtypes=[mx.float32] * 3, init_value=0)
                         x, = K["con_apply"](
                             inputs=[prev, x, acc, g.scount, g.kinds, g.rslot, g.rbody, g.ranchor, g.rn, rsum,
                                     g.rrest, g.rrestsum, g.rstiff, cparams],

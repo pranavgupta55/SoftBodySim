@@ -91,8 +91,12 @@ def solve_contacts(world, candidates, reach, r, mu):
 
 def solve_body_constraints(world):
     """The batched springs and shape matching of World._solve_body_constraints (solo bodies stay with World)."""
+    from entities import EnvConfig
     P = world.P
-    if world.springs.shape[1]:
+    if world.springs.shape[1] and EnvConfig.xpbd:
+        xpbd_springs(P, world.PREV, world.W, world.springs[0], world.springs[1], world.spring_rest, world.spring_comp,
+                     world.spring_ci, world.spring_cj, world.spring_lambda, world._h, float(EnvConfig.spring_damping))
+    elif world.springs.shape[1]:
         springs(P, world.W, world.springs[0], world.springs[1], world.spring_rest, world.spring_stiffness,
                 world.spring_count)
     for idx, rest, stiffness in world.rigid_groups:
@@ -278,6 +282,45 @@ def springs(P, W, si, sj, rest, stiff, count):
         P[0, i] += ax[i] / count[i]
     for i in range(n):
         P[1, i] += ay[i] / count[i]
+
+
+@njit(**NB)
+def xpbd_springs(P, PREV, W, si, sj, rest, comp, ci, cj, lam, h, beta):
+    """World._xpbd_springs: one Jacobi XPBD pass (mass splitting, Rayleigh damping) over every spring, in place on P
+    and the multipliers lam, in the numpy reference's expression order."""
+    m = si.size
+    nxs, nys, ash, bsh = np.empty(m), np.empty(m), np.empty(m), np.empty(m)
+    hh = h * h
+    for k in range(m):
+        i, j = si[k], sj[k]
+        dx, dy = P[0, j] - P[0, i], P[1, j] - P[1, i]
+        dist = max(math.hypot(dx, dy), 1e-9)
+        nx, ny = dx / dist, dy / dist
+        wi, wj = W[i], W[j]
+        at = comp[k] * (wi + wj) / hh
+        gamma = at * beta * h
+        rel = nx * ((P[0, j] - PREV[0, j]) - (P[0, i] - PREV[0, i])) + \
+            ny * ((P[1, j] - PREV[1, j]) - (P[1, i] - PREV[1, i]))
+        num = -(dist - rest[k]) - at * lam[k] - gamma * rel
+        den = (1.0 + gamma) * (ci[k] * wi + cj[k] * wj) + at
+        dl = num / den if den > 0 else 0.0
+        lam[k] += dl
+        nxs[k], nys[k] = nx, ny
+        ash[k], bsh[k] = -wi * dl, wj * dl
+    n = P.shape[1]
+    ax, ay = np.zeros(n), np.zeros(n)
+    for k in range(m):  # bincount order: i's shares, then j's
+        ax[si[k]] += ash[k] * nxs[k]
+    for k in range(m):
+        ax[sj[k]] += bsh[k] * nxs[k]
+    for k in range(m):
+        ay[si[k]] += ash[k] * nys[k]
+    for k in range(m):
+        ay[sj[k]] += bsh[k] * nys[k]
+    for i in range(n):
+        P[0, i] += ax[i]
+    for i in range(n):
+        P[1, i] += ay[i]
 
 
 @njit(**NB)
@@ -868,6 +911,7 @@ def warmup():
     moved_max(P, P)
     contact_pass(P, P.copy(), P.copy(), W, i2, i1, np.ones(2), e, e, 3.0, 0.5, 3.0, True)
     springs(P, W, i2, i1, np.ones(2), np.ones(2), np.ones(4))
+    xpbd_springs(P, P.copy(), W, i2, i1, np.ones(2), np.ones(2), np.ones(2), np.ones(2), np.zeros(2), 0.004, 10.0)
     shape_match(P, np.zeros((1, 4), np.int64), np.zeros((1, 2, 4)), np.ones(1))
     rope_pass(P, W, e, e, np.zeros((0, 2, 2)), f, f)
     pc, ec, b = np.zeros((2, 4), np.int64), np.zeros((2, 2), np.int64), np.zeros(4, np.bool_)
