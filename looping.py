@@ -32,8 +32,10 @@ see World._image_topology. set_looping(world, side, True) removes that side's wa
 set_looping(world, side, False) re-adds it only once no movable body lies beyond or straddles its line (every point
 at least contact_radius inside; the same rule in both modes); until then the side is "pending": looping[side]
 already reads False, the wall is retried every frame, and the side stays active meanwhile (wrapping through it, and
-a periodic axis stays periodic) so whatever is out there can come back. When the wall goes in, that axis drops to
-walled mode (mixed). Returns True if applied now.
+a periodic axis stays periodic) so whatever is out there can come back. On a periodic axis whose other side still
+loops, free groups reaching within contact_radius of the pending wall's line are moved one period over to the
+looping side (_periodic_wraps), so the wall comes back within a frame or two (anchored groups don't move and can
+keep it pending). When the wall goes in, that axis drops to walled mode (mixed). Returns True if applied now.
 
 Ropes / chains: bodies tied together by ropes form a group that wraps together by one offset (rope lengths
 unchanged). A group with any fixed end (rope to a Hook, (x, y) anchor or FixedBody) never wraps: on a periodic axis
@@ -44,8 +46,6 @@ keeps pulling toward the cursor's image in the body's frame; in walled mode it n
 World.step calls loop_step once per frame, before the substeps, so a wrap is never part of a substep's straight-line
 motion that CCD checks.
 """
-import math
-
 import numpy as np
 
 from entities import EnvConfig, FixedBody
@@ -443,14 +443,25 @@ def _group_index(world, members):
 
 def _periodic_wraps(world):
     """Translate every free group whose box centre has left the bounds along a periodic axis by the whole periods
-    that bring it back (module doc). Returns the wraps."""
+    that bring it back (module doc). A side whose wall is pending while the opposite side still loops also keeps
+    groups off its wall line: one reaching within contact_radius of the line goes one more period over to the
+    looping side (an isometry of the torus like any wrap), so the wall can come back. Returns the wraps."""
     L, on = world.period, world.period > 0
     origin = np.array(world.bounds[:2], dtype=float)
     span = np.where(on, L, 1.0)
     box_lo, box_hi = body_boxes(world)
     centre = 0.5 * (box_lo + box_hi)
-    out = (world.body_counts > 0) & ~world.body_fixed & np.any(
-        on[:, None] & (np.floor((centre - origin[:, None]) / span[:, None]) != 0), axis=0)
+    movable = (world.body_counts > 0) & ~world.body_fixed
+    out = movable & np.any(on[:, None] & (np.floor((centre - origin[:, None]) / span[:, None]) != 0), axis=0)
+    r = EnvConfig.contact_radius
+    pend = []  # (axis, wall on the high side?, wall line) of pending walls facing a looping side
+    for side in sorted(world.pending_walls):
+        a = AXIS_OF[side]
+        if on[a] and world.looping[OPPOSITE[side]] and world.walls.get(side) is not None:
+            high = side in ("right", "bottom")
+            c = _wall_line(world.walls[side])[1]
+            pend.append((a, high, c))
+            out |= movable & ((box_hi[a] > c - r) if high else (box_lo[a] < c + r))
     if not out.any():
         return []
     groups, anchored = rope_groups(world)
@@ -459,8 +470,13 @@ def _periodic_wraps(world):
     for root, members in groups.items():
         if root in anchored or not any(out[k] for k in members):
             continue
-        c = 0.5 * (box_lo[:, members].min(axis=1) + box_hi[:, members].max(axis=1))
-        d = np.where(on, -np.floor((c - origin) / span) * span, 0.0)
+        g_lo, g_hi = box_lo[:, members].min(axis=1), box_hi[:, members].max(axis=1)
+        d = np.where(on, -np.floor((0.5 * (g_lo + g_hi) - origin) / span) * span, 0.0) + 0.0  # (+ 0.0: no -0.0)
+        for a, high, line in pend:  # (the same every frame, so a group doesn't go back and forth)
+            if high and g_hi[a] + d[a] > line - r:
+                d[a] -= L[a]
+            elif not high and g_lo[a] + d[a] < line + r:
+                d[a] += L[a]
         if not d.any():
             continue
         idx = _group_index(world, members)
@@ -539,6 +555,50 @@ def _walled_wraps(world, active):
                 break
         # every spot taken: leave the group where it is and try again next frame
     return wraps
+
+
+def _reaching(world, lo, hi, s, margin):
+    """Mask of boxes lo..hi (2, m) that, moved by s, reach into the bounds grown by margin."""
+    x0, y0, x1, y1 = world.bounds
+    return ((lo[0] + s[0] <= x1 + margin) & (hi[0] + s[0] >= x0 - margin)
+            & (lo[1] + s[1] <= y1 + margin) & (hi[1] + s[1] >= y0 - margin))
+
+
+def edges_with_images(world, a, b, margin=0.0):
+    """Edge endpoint arrays a, b (2, m) plus their copies one period over across the periodic axes that reach into
+    the bounds (grown by margin): every edge an object placed inside the bounds can come near (editor checks)."""
+    shifts = image_shifts(getattr(world, "period", None))
+    if not shifts or a.shape[1] == 0:
+        return a, b
+    lo, hi = np.minimum(a, b), np.maximum(a, b)
+    out_a, out_b = [a], [b]
+    for s in shifts:
+        k = _reaching(world, lo, hi, s, margin)
+        if k.any():
+            out_a.append(a[:, k] + s[:, None])
+            out_b.append(b[:, k] + s[:, None])
+    return np.concatenate(out_a, axis=1), np.concatenate(out_b, axis=1)
+
+
+def points_with_images(world, pts, margin=0.0):
+    """Points (2, m) plus their copies one period over that land in the bounds (grown by margin)."""
+    shifts = image_shifts(getattr(world, "period", None))
+    out = [pts]
+    for s in shifts:
+        k = _reaching(world, pts, pts, s, margin)
+        if k.any():
+            out.append(pts[:, k] + s[:, None])
+    return np.concatenate(out, axis=1) if len(out) > 1 else pts
+
+
+def polygon_images(world, pts, margin=0.0):
+    """[pts] plus the copies of a body's points (2, n) one period over whose box reaches into the bounds."""
+    out = [pts]
+    if pts.shape[1]:
+        lo, hi = pts.min(axis=1, keepdims=True), pts.max(axis=1, keepdims=True)
+        out += [pts + s[:, None] for s in image_shifts(getattr(world, "period", None))
+                if _reaching(world, lo, hi, s, margin)[0]]
+    return out
 
 
 def image_copies(world):

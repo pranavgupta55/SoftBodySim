@@ -38,6 +38,7 @@ import numpy as np
 import pygame
 
 from entities import Chain, EnvConfig, FixedBody, Hook, RigidBody, Rope, SoftBody, new_chain_id
+import looping
 
 ROTATE_STEP = 15.0  # degrees per Q / E press
 BAD_MOVE = "you cannot put it there"
@@ -285,6 +286,7 @@ class SelectionTools:
             gone = [k for k, b in enumerate(w.bodies) if any(b is x for x in exclude)]
             keep = ~np.isin(w.edge_body, gone)
             a, b = w.P[:, w.edges[0, keep]], w.P[:, w.edges[1, keep]]
+            a, b = looping.edges_with_images(w, a, b, r)  # (and copies across a periodic seam)
             e_lo, e_hi = np.minimum(a, b) - r, np.maximum(a, b) + r
             for body, p in zip(pose.bodies, bodies_new):
                 p_lo, p_hi = p.min(axis=1, keepdims=True), p.max(axis=1, keepdims=True)
@@ -299,7 +301,8 @@ class SelectionTools:
             if any(np.hypot(*(q - p)) < half for q in others + hooks_new[:k]):
                 return False
         if anchors_new:
-            polys = [b.points for b in w.bodies if closed(b) and not any(b is x for x in exclude)]
+            polys = [poly for b in w.bodies if closed(b) and not any(b is x for x in exclude)
+                     for poly in looping.polygon_images(w, b.points)]
             polys += [p for body, p in zip(pose.bodies, bodies_new) if closed(body)]
             for p in anchors_new:
                 if not self._in_box(p) or any(point_in_poly(p, poly) for poly in polys):
