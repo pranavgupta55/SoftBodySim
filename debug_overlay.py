@@ -202,12 +202,13 @@ class DebugOverlays:
 
     def contacts(self, world):
         """Points touching another edge (or a non-neighbouring edge of their own body) right now: unique point ids."""
-        pts, eids = world._candidates()
+        cand = world._candidates()
+        pts, eids = cand[0], cand[1]
         if pts.size == 0:
             return pts
         P = world.P
         a, b = P[:, world.edges[0, eids]], P[:, world.edges[1, eids]]
-        p = P[:, pts]
+        p = P[:, pts] if len(cand) < 3 else P[:, pts] + cand[2]  # (through an image across a periodic seam)
         e = b - a
         t = np.clip(np.sum((p - a) * e, axis=0) / np.maximum(np.sum(e * e, axis=0), 1e-12), 0.0, 1.0)
         dist = np.hypot(*(p - a - t * e))

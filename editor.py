@@ -23,6 +23,7 @@ import numpy as np
 import pygame
 
 import freehand
+import looping
 import ui_style as ui
 from ui_style import HUD
 from peg_layer import PegLayer
@@ -649,9 +650,11 @@ class Editor(SelectionTools):
         for c in self.world.bodies:
             if not closed(c) or any(c is x for x in skip):
                 continue
-            if c not in must and ((c.points.max(axis=1) < lo).any() or (c.points.min(axis=1) > hi).any()):
-                continue  # bounding boxes apart: no point can be inside
-            inside = points_in_poly(new, c.points)
+            inside = np.zeros(new.shape[1], dtype=bool)
+            for poly in looping.polygon_images(self.world, c.points):  # (and its copies across a periodic seam)
+                if c not in must and ((poly.max(axis=1) < lo).any() or (poly.min(axis=1) > hi).any()):
+                    continue  # bounding boxes apart: no point can be inside
+                inside |= points_in_poly(new, poly)
             if (not inside.all()) if c in must else inside.any():
                 return False
         return True
@@ -663,10 +666,18 @@ class Editor(SelectionTools):
         must = self._target()[1]
         lo, hi = new.min(axis=1), new.max(axis=1)
         for b in self.world.bodies:
-            if b not in must and ((b.points.max(axis=1) < lo).any() or (b.points.min(axis=1) > hi).any()):
-                continue
-            inside = points_in_poly(b.points, new)
-            if not (inside.all() if b in must else not inside.any()):
+            # a body's copies across a periodic seam count too: a must body needs one copy wholly inside, any other
+            # body none of its points inside
+            fits = []
+            for poly in looping.polygon_images(self.world, b.points):
+                if (poly.max(axis=1) < lo).any() or (poly.min(axis=1) > hi).any():
+                    fits.append(None)
+                    continue
+                fits.append(points_in_poly(poly, new))
+            if b in must:
+                if not any(f is not None and f.all() for f in fits):
+                    return False
+            elif any(f is not None and f.any() for f in fits):
                 return False
         return True
 
@@ -690,15 +701,17 @@ class Editor(SelectionTools):
         interior, can't be picked. None if nothing is there."""
         reach = PICK_UI_PX / self.zoom
         best, best_area = None, math.inf
-        p = np.asarray(wp, dtype=float).reshape(2, 1)
-        for b in self._near(p[:, 0], reach):
-            if self._is_wall(b) or (self.relation == "inside" and not closed(b)):
-                continue
-            a, c = b.points[:, b.edges[0]], b.points[:, b.edges[1]]
-            hit = (closed(b) and point_in_poly(p[:, 0], b.points)) or point_seg_dist(p, a, c).min() <= reach
-            area = poly_area(b.points) if closed(b) else 0.0
-            if hit and area < best_area:
-                best, best_area = b, area
+        # on either visible copy of a body straddling a periodic seam: wp moved back by each image offset too
+        for s in [np.zeros(2)] + looping.image_shifts(getattr(self.world, "period", None)):
+            p = (np.asarray(wp, dtype=float) - s).reshape(2, 1)
+            for b in self._near(p[:, 0], reach):
+                if self._is_wall(b) or (self.relation == "inside" and not closed(b)):
+                    continue
+                a, c = b.points[:, b.edges[0]], b.points[:, b.edges[1]]
+                hit = (closed(b) and point_in_poly(p[:, 0], b.points)) or point_seg_dist(p, a, c).min() <= reach
+                area = poly_area(b.points) if closed(b) else 0.0
+                if hit and area < best_area:
+                    best, best_area = b, area
         return best
 
     def _select(self, wp):
@@ -741,6 +754,7 @@ class Editor(SelectionTools):
         has_edges = bool(world.bodies) and world.edges.shape[1] > 0
         if has_edges:
             a, b = world.P[:, world.edges[0]], world.P[:, world.edges[1]]
+            a, b = looping.edges_with_images(world, a, b, r)  # (and copies across a periodic seam)
             if point_seg_dist(new[:, :, None], a[:, None, :], b[:, None, :]).min() < r:
                 return False  # a point too close to an edge
         if not self._region_ok(new):
@@ -781,8 +795,8 @@ class Editor(SelectionTools):
         in `skip` don't count), and the two ends not the same point. Ropes don't collide, so the line itself may
         cross bodies."""
         lo, hi_x, hi_y = self.inset, self.world_w - self.inset, self.world_h - self.inset
-        polygons = [body.points for body in self.world.bodies
-                    if body.edges.shape[1] >= 3 and not any(body is x for x in skip)]
+        polygons = [poly for body in self.world.bodies if body.edges.shape[1] >= 3 and not any(body is x for x in skip)
+                    for poly in looping.polygon_images(self.world, body.points)]
         for p, snap in zip(pts, snaps):
             if not (lo < p[0] < hi_x and lo < p[1] < hi_y):
                 return False
@@ -905,6 +919,8 @@ class Editor(SelectionTools):
         keep = ~np.isin(world.edge_body, gone)
         a, b = world.P[:, world.edges[0, keep]], world.P[:, world.edges[1, keep]]
         others = world.P[:, ~np.isin(world.point_body, gone)]
+        a, b = looping.edges_with_images(world, a, b, r)  # (and copies across a periodic seam)
+        others = looping.points_with_images(world, others, r)
         ends = np.concatenate([np.roll(box, -1, axis=1) for box in boxes], axis=1)
         # only world edges whose bounding box comes within r of some box's bounding box can be that close
         box_lo = np.array([box.min(axis=1) for box in boxes]).T - r  # (2, n_boxes)

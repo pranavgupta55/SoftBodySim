@@ -155,22 +155,18 @@ FLUID_COUNT = 450  # hexagons in the "fluid" preset
 FLUID_DEPTH = 0.4  # the share of the world's height they fill, from the bottom
 FLUID_BLUES = ([18, 60, 130], [90, 200, 240])  # darkest and lightest shade: each hexagon is a random mix
 FLUID_FRICTION = 0.05  # slippery, so the pile flows (this world's own setting, World.env)
-FLUID_SIDE_BAND = 40.0   # off-screen walls this far past the left / right edges keep the pile from spreading out
-                         # along the floor (which runs far past the screen); a body in the band wraps around
 
 
 def build_fluid(world_width, world_height, count=FLUID_COUNT, seed=0):
     """A few hundred small soft hexagons in shades of blue, packed into the bottom FLUID_DEPTH of the world, with low
-    friction so they slosh around like a fluid. Left / right looping is on (no side walls): what flows out one side
-    comes in the other."""
+    friction so they slosh around like a fluid. Left / right looping is on (no side walls), so the x axis is periodic
+    (looping.py): the pile is one continuous ring, hexagons near one edge press on those near the other, and what
+    flows out one side comes in the other at the same height and speed."""
     from scene import Endesga, INSET, add_world_box
     world = World()
     add_world_box(world, world_width, world_height, INSET, col=Endesga.greyD)
     _set_looping(world, ("left", "right"))
     bodies = []  # added in one go at the end (one repack instead of one per body)
-    for x in (-FLUID_SIDE_BAND, world_width + FLUID_SIDE_BAND):
-        bodies.append(FixedBody(np.array([[x, x], [-world_height, 2 * world_height]]), point_radius=1, stick_width=2,
-                                **_style(Endesga.greyD)))
     world.env["friction"] = FLUID_FRICTION
     rng = np.random.default_rng(seed)
     x0, x1 = INSET, world_width - INSET

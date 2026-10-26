@@ -22,12 +22,14 @@ Anything not handled here falls back to pygame: World.draw / draw_grid / Trails.
 """
 import inspect
 import os
+from types import SimpleNamespace
 
 import moderngl
 import numpy as np
 import pygame
 
 from entities import Body, EnvConfig
+import looping
 from solver import World
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
@@ -101,6 +103,21 @@ class _Topology:
         k = self.key
         return k[0] is world.P and k[1] is world.edges and k[2] == len(world.bodies)
 
+    def subset(self, mask):
+        """The fill / segment lists restricted to the bodies in `mask` (bool per body), for drawing their periodic
+        copies (looping.image_copies): an object with the attributes _fills and _segments read."""
+        keep = mask[self.fill_bodies]
+        lens = self.loop_len[keep]
+        starts = np.cumsum(lens) - lens
+        pos = np.arange(int(lens.sum()))
+        first, n = np.repeat(starts, lens), np.repeat(lens, lens)
+        sel = mask[self.loop_body]
+        seg = mask[self.seg_bodies]
+        return SimpleNamespace(fill_bodies=self.fill_bodies[keep], loop_len=lens, loop_start=starts,
+                               loop_idx=self.loop_idx[sel], loop_body=self.loop_body[sel],
+                               loop_next=np.where(pos - first + 1 < n, pos + 1, first),
+                               seg_bodies=self.seg_bodies[seg], seg_first=self.seg_first[seg])
+
 
 class WorldPacker:
     """World -> instance arrays for the three draw calls (pure numpy, no GL: testable on its own).
@@ -135,6 +152,28 @@ class WorldPacker:
                 dots = np.ones(nb, dtype=bool)  # the points view: Body.draw for every body
             if dots.any():
                 self._points(t, P, dots, body_layer, bodies, lines, stamps, radii)
+            # bodies sticking out past a periodic edge also draw one period over (World.draw does the same), on
+            # their own layers, so a body straddling the seam shows on both sides
+            groups = {}
+            for k, s in looping.image_copies(world):
+                groups.setdefault((float(s[0]), float(s[1])), []).append(k)
+            for s, ks in groups.items():
+                mask = np.zeros(nb, dtype=bool)
+                mask[ks] = True
+                Ps = (world.P + np.array(s)[:, None]) * zoom
+                if filled:
+                    sub = t.subset(mask)
+                    if sub.fill_bodies.size:
+                        f2, v2 = self._fills(sub, Ps, fill_c, body_layer, lines, bodies)
+                        f2[:, 0] += len(verts)
+                        fills, verts = np.concatenate([fills, f2]), np.concatenate([verts, v2])
+                    if sub.seg_bodies.size:
+                        self._segments(sub, Ps, fill_c, body_layer, bodies, lines, stamps, radii)
+                    d = dots & mask
+                else:
+                    d = mask
+                if d.any():
+                    self._points(t, Ps, d, body_layer, bodies, lines, stamps, radii)
         layer = 2 * nb
         for r in world.ropes:
             if r.width >= 1:

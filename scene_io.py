@@ -505,6 +505,10 @@ def install(world, bodies, ropes, hooks, state=None):
         world.palette = None
     if hasattr(world, "last_wraps"):
         world.last_wraps = []
+    if hasattr(world, "period"):  # periodic axes are re-derived from the looping state on the next step (looping.py)
+        world.periodic, world.period = (False, False), None
+        world.__dict__.pop("_periodic_wait", None)
+        world.__dict__.pop("_wrap_wait", None)
     for key, value in (state or {}).items():
         if not hasattr(world, key):
             continue
