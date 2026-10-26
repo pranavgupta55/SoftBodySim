@@ -1,6 +1,7 @@
 from collections import defaultdict
 from contextlib import nullcontext
 import math
+import time
 
 import numpy as np
 import pygame
@@ -134,6 +135,8 @@ class World:
         self.contact_builds = 0  # contact candidate broad phases run (for debugging)
         self.last_sim_dt = 0.0  # seconds the last step() simulated (dt * scale after the max_dt clamp)
         self._h = XPBD_REF_H  # the current substep's length (XPBD springs), set by _pbd_substep
+        self._substep_cost = None  # running mean of seconds per substep (EnvConfig.physics_budget)
+        self.clock = time.perf_counter  # what _substep_cost is measured with (a benchmark may swap in thread time)
 
     def add(self, body, index=None):
         """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
@@ -412,12 +415,25 @@ class World:
             dt, n = min(dt, EnvConfig.max_dt), EnvConfig.substeps
         else:
             dt, n = min(dt, EnvConfig.max_dt) * scale, max(1, round(EnvConfig.substeps * scale * frames))
-        if EnvConfig.max_substeps is not None:  # past the cap, longer substeps instead of more (see EnvConfig)
-            n = min(n, max(1, round(max(EnvConfig.max_substeps, EnvConfig.substeps) * frames)))
+        # High time scales: fewer, longer substeps than round(substeps * scale * frames) when over a cap (see EnvConfig).
+        # Never below the scale-1 count, so steps at scale <= 1 are untouched (and deterministic)
+        base = max(1, round(EnvConfig.substeps * frames))
+        if EnvConfig.max_substeps is not None:
+            n = min(n, max(base, round(EnvConfig.max_substeps * frames)))
+        if EnvConfig.physics_budget is not None and self._substep_cost:
+            n = min(n, max(base, int(EnvConfig.physics_budget * frames / self._substep_cost)))
         if EnvConfig.max_substep_dt is not None:  # but never longer than max_substep_dt
             n = max(n, math.ceil(dt / EnvConfig.max_substep_dt - 1e-9))
         self.last_sim_dt = dt  # seconds this step simulates (after the max_dt clamp and the time scale)
-        h = dt / n
+        t0 = self.clock()
+        self._substeps(n, dt / n)
+        # running mean of the time a substep takes, for physics_budget (the first one includes no compile stalls:
+        # solver_jit compiles at import / warmup)
+        cost = (self.clock() - t0) / n
+        self._substep_cost = cost if self._substep_cost is None else 0.7 * self._substep_cost + 0.3 * cost
+
+    def _substeps(self, n, h):
+        """n substeps of length h, with CCD per substep or per span (ccd_stride, ccd_max_span)."""
         sec = self._section
         if self.debug is not None:
             self.debug.begin_step(self)

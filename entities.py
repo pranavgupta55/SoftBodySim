@@ -63,9 +63,10 @@ class EnvConfig:
     # stiffness falls with the substep length (a 4x longer substep stretches shapes ~16x further).
     xpbd = True
     # XPBD Rayleigh damping (XPBD paper eq. 26) along each spring, gamma = alpha~ * spring_damping * h. Replaces the
-    # numerical damping that PBD springs had at 4 x 4 (measured on a 120 px drop of a soft 12-gon: rebound 12.9 px
-    # with PBD; XPBD 12.6 / 12.1 / 9.9 px at 0 / 3 / 10, and more damping slows the solve at long substeps).
-    spring_damping = 2.0
+    # numerical damping that PBD springs had at 4 x 4. Measured: a resting soft 12-gon's RMS point speed after 5 s
+    # (research 10 soft_rest) is 0.26 px/s with PBD and 1.72 / 0.93 / 0.26 with XPBD at 2 / 5 / 10; a 120 px drop
+    # rebounds 12.9 px with PBD, 12.6 / 12.1 / 9.9 px at 0 / 3 / 10 (research 01 also found ~10).
+    spring_damping = 10.0
     # Most substeps one World.step runs per 1/60 s frame (World.step's frames=1), however high the time scale: 16 =
     # today's count at 400%. Past it the substeps get longer instead of more numerous, so a high time scale costs
     # no more per frame than 400% and the frame rate (and with it the delivered speed) holds; XPBD springs keep
@@ -73,9 +74,15 @@ class EnvConfig:
     # ccd_max_span 1/30 s): substeps of 1/96, 1/48, 1/32 s keep the worst edge stretch at 2.1-2.4x (PBD springs at
     # 1/60 s: 4-21x); at 1/16 s and longer CCD needs impact zones and a frame costs 10x more. None: no cap.
     max_substeps = 16
+    # s of physics wall time per 1/60 s frame (World.step's frames=1) that a high time scale may use: past it the
+    # substeps get longer instead of more numerous, from a running mean of what a substep takes on this machine. Half
+    # the frame (1/120 s per 1/60 s), so at 120 fps a frame has room left to draw and the frame rate holds instead of
+    # spiralling down (slower frames -> more substeps per frame -> slower frames). It never cuts below the scale-1
+    # count, so speeds <= 100% are untouched and deterministic. None: no budget (max_substeps only).
+    physics_budget = 1 / 120
     # s; longest substep: when max_substeps would make them longer, more substeps run instead (frames get slower).
     # None: no limit.
-    max_substep_dt = 1 / 30
+    max_substep_dt = 1 / 40
 
 
 # Small steps (research 01 and 10 F8): more substeps, fewer solver passes. Energy, free fall, chain stretch and
