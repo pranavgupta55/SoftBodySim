@@ -127,6 +127,7 @@ class World:
         self.period = None
         self.grab_shift = np.zeros(2)  # the held point's frame minus the cursor's (an image offset; see grab)
         self._image_topo = None  # (edges array, points, edges) that take part in image pairs (_image_topology)
+        self._ccd_box_cache = None  # (D, _ccd_float_boxes(D)) with a periodic axis
         self.env = {}  # per-world EnvConfig overrides (attribute name -> value), in effect only during step()
         self.background = None  # per-world background color (rgb), None for the default (main_opengl.py)
         self.palette = None  # the palettes.py palette this world's colors come from (None: it has none)
@@ -736,9 +737,18 @@ class World:
         t = self._image_topo
         if t is None or t[0] is not self.edges:
             wall = np.array([looping.is_world_wall(self, b) for b in self.bodies], dtype=bool)
-            t = (self.edges, ~wall[self.point_body], ~wall[self.edge_body])
+            t = (self.edges, ~wall[self.point_body], ~wall[self.edge_body], None, None)
             self._image_topo = t
         return t[1], t[2]
+
+    def _image_shifts(self):
+        """looping.image_shifts(self.period) as one (k, 2) array, cached per period (the kernels' form)."""
+        self._image_topology()  # (rebuilt on a repack)
+        t = self._image_topo
+        if t[3] is None or not np.array_equal(t[3], self.period):
+            t = self._image_topo = t[:3] + (self.period.copy(),
+                                             np.array(looping.image_shifts(self.period), dtype=float).reshape(-1, 2))
+        return t[4]
 
     def _image_pairs(self, plo, phi, elo, ehi):
         """(point, edge, offset (2, m)) pairs that meet only through an image: the point's float box plo..phi moved
@@ -750,8 +760,8 @@ class World:
         empty = np.empty(0, dtype=np.int64)
         point_ok, edge_ok = self._image_topology()
         if _jit():
-            return solver_jit.image_pairs(self, plo, phi, elo, ehi, point_ok, edge_ok,
-                                          looping.image_shifts(self.period), EnvConfig.cell_size)
+            return solver_jit.image_pairs(self, plo, phi, elo, ehi, point_ok, edge_ok, self._image_shifts(),
+                                          EnvConfig.cell_size)
         out_i, out_e, out_o = [], [], []
         if edge_ok.any():
             cell = EnvConfig.cell_size
@@ -781,6 +791,33 @@ class World:
         if not out_i:
             return empty, empty, np.empty((2, 0))
         return np.concatenate(out_i), np.concatenate(out_e), np.concatenate(out_o, axis=1)
+
+    def _image_extras(self, plo, phi, elo, ehi):
+        """The pairs _merge_images would add to the direct broad phase of the same float boxes, without that direct
+        list: image pairs (_image_pairs) whose direct cell ranges don't overlap (a direct pair needs just that, since
+        image pairs already join two bodies that aren't both fixed), the first image of each (point, edge) only.
+        (pts, eids, off (2, m)), in no particular order: for the GPU backend, which runs them as a second contact
+        list next to its own direct pairs (its atomics don't keep an order anyway)."""
+        if _jit():
+            return solver_jit.image_extras(self, plo, phi, elo, ehi, *self._image_topology(), self._image_shifts(),
+                                           EnvConfig.cell_size)
+        i, e, off = self._image_pairs(plo, phi, elo, ehi)
+        if i.size == 0:
+            return i, e, off
+        cell = EnvConfig.cell_size
+        a, b = (np.floor(box / cell).astype(np.int64) for box in (plo[:, i], phi[:, i]))
+        c, d = (np.floor(box / cell).astype(np.int64) for box in (elo[:, e], ehi[:, e]))
+        fresh = np.flatnonzero(~np.all((a <= d) & (b >= c), axis=0))  # not met directly
+        _, first = np.unique(i[fresh] * max(self.edges.shape[1], 1) + e[fresh], return_index=True)
+        keep = fresh[first]
+        return i[keep], e[keep], off[:, keep]
+
+    def _with_images(self, direct, boxes):
+        """_merge_images(direct, _image_pairs(*boxes)): with the kernels in one call (the same result)."""
+        if _jit():
+            return solver_jit.merge_with_images(self, direct, *boxes, *self._image_topology(), self._image_shifts(),
+                                                EnvConfig.cell_size)
+        return self._merge_images(direct, self._image_pairs(*boxes))
 
     def _merge_images(self, direct, image):
         """Direct pairs (sorted by (point, edge), unique) plus image pairs -> (pts, eids, off), sorted by (point,
@@ -820,7 +857,7 @@ class World:
         direct = self._direct_candidates()
         if self.period is None:
             return direct
-        return self._merge_images(direct, self._image_pairs(*self._contact_boxes()))
+        return self._with_images(direct, self._contact_boxes())
 
     def _direct_candidates(self):
         if _jit():
@@ -873,7 +910,7 @@ class World:
             plo, phi = boxes[0], boxes[1]
             r, (ea, eb) = EnvConfig.contact_radius, self.edges
             elo, ehi = np.minimum(plo[:, ea], plo[:, eb]) - 2 * r, np.maximum(phi[:, ea], phi[:, eb]) + 2 * r
-            candidates = self._merge_images(candidates, self._image_pairs(plo, phi, elo, ehi))
+            candidates = self._with_images(candidates, (plo, phi, elo, ehi))
         self.contact_builds += 1
         self._span_contacts = (candidates, boxes[0], boxes[1])
         return candidates, None
@@ -965,10 +1002,19 @@ class World:
 
     # ---------------- Continuous collision detection (the no-intersection guarantee)
     def _ccd_float_boxes(self, D):
-        """_ccd_boxes, from the compiled kernel when it runs (the same values)."""
+        """_ccd_boxes, from the compiled kernel when it runs (the same values). With a periodic axis the boxes of
+        the latest D are kept: _ccd_cells, _ccd_pairs and _ccd_new_pairs all need them for the same D (PREV doesn't
+        change while a D is in use, and every D is a fresh array)."""
+        c = getattr(self, "_ccd_box_cache", None)
+        if c is not None and c[0] is D:
+            return c[1]
         if _jit():
-            return solver_jit.ccd_boxes(self.PREV, D, *solver_jit._topology(self)[1:3])
-        return self._ccd_boxes(D)
+            boxes = solver_jit.ccd_boxes(self.PREV, D, *solver_jit._topology(self)[1:3])
+        else:
+            boxes = self._ccd_boxes(D)
+        if self.period is not None:
+            self._ccd_box_cache = (D, boxes)
+        return boxes
 
     def _ccd_boxes(self, D):
         """Swept boxes of the straight-line paths PREV -> PREV + D: (point lo, point hi, edge lo, edge hi), each
@@ -982,6 +1028,11 @@ class World:
 
     def _ccd_cells(self, D):
         """Grid cell ranges of the swept boxes: (point lo, point hi, edge lo, edge hi) cell indices."""
+        if self.period is not None:  # (the float boxes are kept for the image pairs)
+            boxes = self._ccd_float_boxes(D)
+            if _jit():
+                return [solver_jit.floor_cells(box, EnvConfig.cell_size) for box in boxes]
+            return [np.floor(box / EnvConfig.cell_size).astype(int) for box in boxes]
         if _jit():
             return solver_jit.ccd_cells(self, D, EnvConfig.cell_size)
         return [np.floor(box / EnvConfig.cell_size).astype(int) for box in self._ccd_boxes(D)]
@@ -992,7 +1043,7 @@ class World:
         if self.period is not None:  # direct pairs on the CPU, plus the pairs through images (_merge_images)
             direct = (solver_jit.ccd_pairs(self, cells) if _jit()
                       else self._filter_pairs(*self._cell_pairs(*cells), contact=False))
-            return self._merge_images(direct, self._image_pairs(*self._ccd_float_boxes(D)))
+            return self._with_images(direct, self._ccd_float_boxes(D))
         pairs = None if self.backend is None else self.backend.ccd_pairs(cells)  # None: use the CPU code below
         if pairs is not None:
             return pairs
@@ -1292,10 +1343,10 @@ class World:
             return changed[pts] | changed[E[0, eids]] | changed[E[1, eids]]
 
         pts, eids = pairs[0], pairs[1]
-        moved = touches(pts, eids)
-        new = self._ccd_detect(D, tuple(a[..., moved] for a in pairs))  # (offsets (2, m) too, if periodic)
-        kept = ~touches(hits[0], hits[1])
-        merged = [np.concatenate([old[..., kept], fresh], axis=-1) for old, fresh in zip(hits, new)]
+        moved = np.flatnonzero(touches(pts, eids))  # (indices: a take is much faster than a mask on (2, m) offsets)
+        new = self._ccd_detect(D, tuple(a.take(moved, axis=-1) for a in pairs))  # (offsets (2, m) too, if periodic)
+        kept = np.flatnonzero(~touches(hits[0], hits[1]))
+        merged = [np.concatenate([old.take(kept, axis=-1), fresh], axis=-1) for old, fresh in zip(hits, new)]
         order = np.argsort(merged[0] * E.shape[1] + merged[1], kind="stable")  # back to (point, edge) order
         return tuple(a[..., order] for a in merged)
 

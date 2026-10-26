@@ -221,12 +221,30 @@ _CONTACT_ACC = """
     atomic_fetch_add_explicit(&cnt[ib], 1.0f, memory_order_relaxed);
 """
 
-# the same with a periodic axis: pairs from World's CPU broad phase, each with the image offset added to its point
-# (coff: x offsets then y offsets, cap of each). Only the start offset q0 changes: the rest works on differences.
-_CONTACT_ACC_OFF = _CONTACT_ACC.replace(
+# the same with a periodic axis, in the same dispatch: threads cap .. cap + m - 1 take the m pairs met only through an
+# image (World._image_extras, from the CPU: ipt, ie, and ioff = x offsets then y offsets), each with the image offset
+# added to its point. Only the start offset q0 changes: the rest works on differences. params: [N, cap, m]
+_CONTACT_ACC_IMG = _CONTACT_ACC.replace(
+    """    int N = params[0], cap = params[1];
+    if (int(t) >= min(npairs[0], cap)) return;
+    int ip = cpt[t], ed = ce[t];""",
+    """    int N = params[0], cap = params[1], m = params[2];
+    int ip, ed;
+    float2 off = float2(0.0f, 0.0f);
+    if (int(t) < min(npairs[0], cap)) {
+        ip = cpt[t];
+        ed = ce[t];
+    } else if (int(t) >= cap && int(t) < cap + m) {
+        int u = int(t) - cap;
+        ip = ipt[u];
+        ed = ie[u];
+        off = float2(ioff[u], ioff[m + u]);
+    } else {
+        return;
+    }""").replace(
     "float2 q0 = float2(prev[ip] - prev[ia], prev[N + ip] - prev[N + ia]);",
-    "float2 q0 = float2(prev[ip] - prev[ia], prev[N + ip] - prev[N + ia]) + float2(coff[t], coff[cap + t]);")
-assert _CONTACT_ACC_OFF != _CONTACT_ACC
+    "float2 q0 = float2(prev[ip] - prev[ia], prev[N + ip] - prev[N + ia]) + off;")
+assert _CONTACT_ACC_IMG.count("ipt[u]") == 1 and _CONTACT_ACC_IMG.count("+ off;") == 1
 
 _CONTACT_APPLY = """
     uint i = thread_position_in_grid.x;
@@ -256,8 +274,8 @@ def _kernels():
                         "rrestsum", "rstiff", "params"], ["xout"], _CON_APPLY, False)
         k("contact_acc", ["prev", "sref", "x", "w", "cpt", "ce", "npairs", "edges_a", "edges_b", "esign", "params", "fparams"],
           ["acc", "cnt"], _CONTACT_ACC, True)
-        k("contact_acc_off", ["prev", "sref", "x", "w", "cpt", "ce", "coff", "npairs", "edges_a", "edges_b", "esign",
-                              "params", "fparams"], ["acc", "cnt"], _CONTACT_ACC_OFF, True)
+        k("contact_acc_img", ["prev", "sref", "x", "w", "cpt", "ce", "npairs", "ipt", "ie", "ioff", "edges_a",
+                              "edges_b", "esign", "params", "fparams"], ["acc", "cnt"], _CONTACT_ACC_IMG, True)
         k("contact_apply", ["x", "acc", "cnt", "params"], ["xout"], _CONTACT_APPLY, False)
     return _K
 
@@ -408,27 +426,37 @@ class GpuBackend:
         g, K = self._topology(), _kernels()
         N = g.n_pts
         cell, pad = EnvConfig.cell_size, 2 * EnvConfig.contact_radius
-        span = w._span_contacts  # inside a multi-substep CCD span: (GPU pairs or None, point box lo, hi)
-        if w.period is not None:
-            return self._pbd_periodic(h)
+        # inside a multi-substep CCD span: (GPU pairs or None, point box lo, hi, image pairs or None)
+        span = w._span_contacts
+        img = None  # with a periodic axis: World._image_extras, the pairs met only through an image (CPU)
         with sec("upload"):
             if w._span_start is None:
                 # contact candidate cell ranges, exactly as World._candidates computes them
                 a, b = w.P[:, w.edges[0]], w.P[:, w.edges[1]]
-                elo = np.floor((np.minimum(a, b) - pad) / cell).astype(np.int64)
-                ehi = np.floor((np.maximum(a, b) + pad) / cell).astype(np.int64)
+                flo, fhi = np.minimum(a, b) - pad, np.maximum(a, b) + pad
+                elo = np.floor(flo / cell).astype(np.int64)
+                ehi = np.floor(fhi / cell).astype(np.int64)
                 pc = np.floor(w.P / cell).astype(np.int64)
                 cells = (pc, pc, elo, ehi)
                 w.contact_builds += 1
                 sref = mx.zeros((2 * N,), dtype=mx.float32)
+                if w.period is not None:
+                    img = w._image_extras(w.P, w.P, flo, fhi)
             else:
                 # World._span_candidates on the GPU: the span's swept-box pairs, rebuilt when a point leaves its box
                 if span is None or (w.P < span[1]).any() or (w.P > span[2]).any():
                     boxes = w._span_boxes()
                     cells = [np.floor(box / cell).astype(np.int64) for box in boxes]
-                    w._span_contacts = span = (None, boxes[0], boxes[1])
+                    img = None if w.period is None else w._image_extras(*boxes)
+                    w._span_contacts = span = (None, boxes[0], boxes[1], img)
                     w.contact_builds += 1
+                img = span[3]
                 sref = _f32((w._span_start - w.PREV).ravel())
+            if img is not None and img[0].size:  # uploaded once per substep, used by every iteration
+                m = int(img[0].size)
+                ipt, ie, ioff = _i32(img[0]), _i32(img[1]), _f32(img[2].ravel())  # (x offsets, then y offsets)
+            else:
+                img, m = None, 0
             prev, inv_mass = _f32(w.PREV.ravel()), _f32(w.W)  # W re-sent each substep in case it was edited
             x0 = _f32((w.P - w.PREV).ravel())
         S, R = g.n_springs, g.n_rigid_pts
@@ -443,7 +471,7 @@ class GpuBackend:
                     npairs, cpt, ce = span[0]
                 else:
                     npairs, cpt, ce = self._pairs(*cells, 0, cap)
-                kparams = _i32([N, cap])
+                kparams = _i32([N, cap, m])
                 x = x0
                 lam = mx.zeros((max(S, 1),), dtype=mx.float32)  # XPBD multipliers, fresh every substep
                 for _ in range(EnvConfig.iterations):
@@ -458,70 +486,28 @@ class GpuBackend:
                             inputs=[prev, x, acc, g.scount, g.kinds, g.rslot, g.rbody, g.ranchor, g.rn, rsum,
                                     g.rrest, g.rrestsum, g.rstiff, cparams],
                             grid=_grid(N), threadgroup=tg, output_shapes=[(2 * N,)], output_dtypes=[mx.float32])
-                    acc, cnt = K["contact_acc"](
-                        inputs=[prev, sref, x, inv_mass, cpt, ce, npairs, g.edges_a, g.edges_b, g.esign, kparams, fparams],
-                        grid=_grid(cap), threadgroup=tg, output_shapes=[(2 * N,), (N,)],
-                        output_dtypes=[mx.float32] * 2, init_value=0)
+                    if img is None:
+                        acc, cnt = K["contact_acc"](
+                            inputs=[prev, sref, x, inv_mass, cpt, ce, npairs, g.edges_a, g.edges_b, g.esign, kparams,
+                                    fparams],
+                            grid=_grid(cap), threadgroup=tg, output_shapes=[(2 * N,), (N,)],
+                            output_dtypes=[mx.float32] * 2, init_value=0)
+                    else:  # plus the image pairs, into the same Jacobi average
+                        acc, cnt = K["contact_acc_img"](
+                            inputs=[prev, sref, x, inv_mass, cpt, ce, npairs, ipt, ie, ioff, g.edges_a, g.edges_b,
+                                    g.esign, kparams, fparams],
+                            grid=_grid(cap + m), threadgroup=tg, output_shapes=[(2 * N,), (N,)],
+                            output_dtypes=[mx.float32] * 2, init_value=0)
                     x, = K["contact_apply"](inputs=[x, acc, cnt, kparams], grid=_grid(N), threadgroup=tg,
                                             output_shapes=[(2 * N,)], output_dtypes=[mx.float32])
                 mx.eval(x, npairs)
                 n = int(npairs.item())
                 if n <= cap:
                     if span is not None:
-                        w._span_contacts = (npairs, cpt, ce), span[1], span[2]
+                        w._span_contacts = (npairs, cpt, ce), span[1], span[2], span[3]
                     break
                 self.stats["pbd_retries"] += 1
                 self.contact_cap = _pow2(int(n * 1.5))
         # P = PREV + x in float64; points nothing moved (fixed bodies) get x == 0 exactly, so they stay bit-exact
-        w.P[:] = w.PREV + np.array(x).astype(np.float64).reshape(2, N)
-        return True
-
-    def _pbd_periodic(self, h):
-        """pbd_substep's GPU part with a periodic axis (looping.py), after predict: the contact candidates, image
-        pairs and their offsets included, come from World's CPU broad phase (_candidates / _span_candidates, which
-        also keep the span's list); the iterations run on the GPU as usual, with contact_acc_off."""
-        w = self.world
-        sec = w._section
-        g, K = self._topology(), _kernels()
-        N = g.n_pts
-        with sec("contacts"):
-            cand = w._candidates() if w._span_start is None else w._span_candidates()[0]
-        with sec("upload"):
-            m = int(cand[0].size)
-            cap = max(m, 1)
-            cpt, ce = _i32(np.resize(cand[0], cap)), _i32(np.resize(cand[1], cap))
-            coff = _f32(np.concatenate([np.resize(cand[2][0], cap), np.resize(cand[2][1], cap)]))
-            npairs = _i32([m])
-            sref = (mx.zeros((2 * N,), dtype=mx.float32) if w._span_start is None
-                    else _f32((w._span_start - w.PREV).ravel()))
-            prev, inv_mass = _f32(w.PREV.ravel()), _f32(w.W)
-            x = _f32((w.P - w.PREV).ravel())
-        S, R = g.n_springs, g.n_rigid_pts
-        cparams, kparams = _i32([N, S, R, 1 if EnvConfig.xpbd else 0]), _i32([N, cap])
-        fparams = _f32([EnvConfig.contact_radius, EnvConfig.friction])
-        sparams = _f32([h, EnvConfig.spring_damping])
-        tg = (_TG, 1, 1)
-        with self._gpu_section("gpu pbd"):
-            lam = mx.zeros((max(S, 1),), dtype=mx.float32)  # XPBD multipliers, fresh every substep
-            for _ in range(EnvConfig.iterations):
-                if S + R:
-                    acc, rsum, lam = K["con_acc"](
-                        inputs=[prev, x, inv_mass, g.si, g.sj, g.rest_len, g.sstiff, g.scomp, g.scount, lam, g.rpt,
-                                g.rbody, g.ranchor, g.rrest, cparams, sparams],
-                        grid=_grid(S + R), threadgroup=tg,
-                        output_shapes=[(2 * N,), (6 * max(g.n_rigid, 1),), (max(S, 1),)],
-                        output_dtypes=[mx.float32] * 3, init_value=0)
-                    x, = K["con_apply"](
-                        inputs=[prev, x, acc, g.scount, g.kinds, g.rslot, g.rbody, g.ranchor, g.rn, rsum,
-                                g.rrest, g.rrestsum, g.rstiff, cparams],
-                        grid=_grid(N), threadgroup=tg, output_shapes=[(2 * N,)], output_dtypes=[mx.float32])
-                acc, cnt = K["contact_acc_off"](
-                    inputs=[prev, sref, x, inv_mass, cpt, ce, coff, npairs, g.edges_a, g.edges_b, g.esign, kparams,
-                            fparams],
-                    grid=_grid(cap), threadgroup=tg, output_shapes=[(2 * N,), (N,)],
-                    output_dtypes=[mx.float32] * 2, init_value=0)
-                x, = K["contact_apply"](inputs=[x, acc, cnt, kparams], grid=_grid(N), threadgroup=tg,
-                                        output_shapes=[(2 * N,)], output_dtypes=[mx.float32])
-            mx.eval(x)
         w.P[:] = w.PREV + np.array(x).astype(np.float64).reshape(2, N)
         return True

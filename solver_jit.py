@@ -141,17 +141,82 @@ def solve_ropes(world):
     return True
 
 
-def image_pairs(world, plo, phi, elo, ehi, point_ok, edge_ok, shifts, cell):
-    """World._image_pairs: the same (point, edge) pairs for each image offset, grouped by offset in the same order
-    (within an offset sorted by (point, edge), like World._cell_pairs)."""
-    empty = np.empty(0, np.int64)
-    if not shifts:
+def image_pairs(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell):
+    """World._image_pairs: the same (point, edge) pairs for each image offset (S: (k, 2), World._image_shifts),
+    grouped by offset in the same order (within an offset sorted by (point, edge), like World._cell_pairs)."""
+    if S.shape[0] == 0:
+        empty = np.empty(0, np.int64)
         return empty, empty, np.empty((2, 0))
-    S = np.array(shifts, dtype=np.float64)
-    i, e, k = image_pair_kernel(np.ascontiguousarray(plo), np.ascontiguousarray(phi), np.ascontiguousarray(elo),
-                                np.ascontiguousarray(ehi), point_ok.astype(np.bool_), edge_ok.astype(np.bool_), S, cell,
-                                world.point_body, world.edge_body, _topology(world)[5])
+    i, e, k = image_pair_kernel(*_image_args(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell))
     return i, e, np.ascontiguousarray(S[k].T)
+
+
+def _image_args(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell):
+    c = np.ascontiguousarray
+    return (c(plo), c(phi), c(elo), c(ehi), point_ok.astype(np.bool_, copy=False),
+            edge_ok.astype(np.bool_, copy=False), S, cell, world.point_body, world.edge_body, _topology(world)[5])
+
+
+def merge_with_images(world, direct, plo, phi, elo, ehi, point_ok, edge_ok, S, cell):
+    """World._merge_images(direct, World._image_pairs(plo, phi, elo, ehi)) in one kernel call: the same result."""
+    i_d, e_d = direct
+    if S.shape[0] == 0:
+        return i_d, e_d, np.zeros((2, i_d.size))
+    pts, eids, ox, oy = image_merge_kernel(np.ascontiguousarray(i_d, dtype=np.int64),
+                                           np.ascontiguousarray(e_d, dtype=np.int64), max(world.edges.shape[1], 1),
+                                           *_image_args(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell))
+    return pts, eids, np.stack([ox, oy])
+
+
+def image_extras(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell):
+    """World._image_extras: the same pairs (in another order, which it leaves open)."""
+    if S.shape[0] == 0:
+        empty = np.empty(0, np.int64)
+        return empty, empty, np.empty((2, 0))
+    i, e, k = image_extras_kernel(max(world.edges.shape[1], 1),
+                                  *_image_args(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell))
+    return i, e, np.ascontiguousarray(S[k].T)
+
+
+@njit(**NB)
+def image_merge_kernel(i_d, e_d, n_edges, plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body,
+                       body_fixed):
+    """merge_with_images: image_pair_kernel, then merge_kernel."""
+    i, e, k = image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body, body_fixed)
+    if i.size == 0:
+        return i_d.copy(), e_d.copy(), np.zeros(i_d.size), np.zeros(i_d.size)
+    ox, oy = np.empty(i.size), np.empty(i.size)
+    for q in range(i.size):
+        ox[q], oy[q] = S[k[q], 0], S[k[q], 1]
+    return merge_kernel(i_d, e_d, i, e, ox, oy, n_edges)
+
+
+@njit(**NB)
+def image_extras_kernel(n_edges, plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body, body_fixed):
+    """image_extras: the image pairs whose direct cell ranges don't overlap, the first image of each (point, edge)
+    only. Returns (points, edges, offset index)."""
+    i, e, k = image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body, body_fixed)
+    keep = np.empty(i.size, np.int64)
+    n = 0
+    for q in range(i.size):
+        p, d = i[q], e[q]
+        if not (math.floor(plo[0, p] / cell) <= math.floor(ehi[0, d] / cell)
+                and math.floor(phi[0, p] / cell) >= math.floor(elo[0, d] / cell)
+                and math.floor(plo[1, p] / cell) <= math.floor(ehi[1, d] / cell)
+                and math.floor(phi[1, p] / cell) >= math.floor(elo[1, d] / cell)):
+            keep[n] = q
+            n += 1
+    keep = keep[:n]
+    keys = i[keep] * n_edges + e[keep]
+    order = np.argsort(keys, kind="mergesort")  # stable: the first image of a key comes first
+    sel = np.empty(n, np.int64)
+    m = 0
+    for r in range(n):
+        if m == 0 or keys[order[r]] != keys[order[r - 1]]:
+            sel[m] = keep[order[r]]
+            m += 1
+    sel = sel[:m]
+    return i[sel], e[sel], k[sel]
 
 
 @njit(**NB)
@@ -171,53 +236,134 @@ def image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body
     empty = np.empty(0, np.int64)
     if not anyedge:
         return empty, empty, empty
-    pts = np.empty(N, np.int64)
+    K = S.shape[0]
+    # Points near a seam first: an offset's test below passes only if the test of its nonzero x or y part does, so
+    # points failing those for every offset (most of them) are skipped; the rest get the same float tests as before
+    xs, ys = np.empty(K), np.empty(K)  # the distinct nonzero x and y parts of the offsets
+    nx = ny = 0
+    for k in range(K):
+        if S[k, 0] != 0.0 and not (S[k, 0] == xs[:nx]).any():
+            xs[nx] = S[k, 0]
+            nx += 1
+        if S[k, 1] != 0.0 and not (S[k, 1] == ys[:ny]).any():
+            ys[ny] = S[k, 1]
+            ny += 1
+    near = np.empty(N, np.int64)
+    nn = 0
+    for i in range(N):
+        if not point_ok[i]:
+            continue
+        hit = False
+        for j in range(nx):
+            if plo[0, i] + xs[j] <= ext[2] and phi[0, i] + xs[j] >= ext[0]:
+                hit = True
+        for j in range(ny):
+            if plo[1, i] + ys[j] <= ext[3] and phi[1, i] + ys[j] >= ext[1]:
+                hit = True
+        if hit:
+            near[nn] = i
+            nn += 1
+    pts = np.empty((K, nn), np.int64)  # per offset: its points, ascending
+    npts = np.zeros(K, np.int64)
+    ub = np.empty((K, 4))  # per offset: union box of its moved points (lo x, lo y, hi x, hi y)
+    for k in range(K):
+        sx, sy = S[k, 0], S[k, 1]
+        ulx, uly, uhx, uhy = np.inf, np.inf, -np.inf, -np.inf
+        for q in range(nn):
+            i = near[q]
+            lx, ly, hx, hy = plo[0, i] + sx, plo[1, i] + sy, phi[0, i] + sx, phi[1, i] + sy
+            if lx <= ext[2] and hx >= ext[0] and ly <= ext[3] and hy >= ext[1]:
+                pts[k, npts[k]] = i
+                npts[k] += 1
+                ulx, uly, uhx, uhy = min(ulx, lx), min(uly, ly), max(uhx, hx), max(uhy, hy)
+        ub[k, 0], ub[k, 1], ub[k, 2], ub[k, 3] = ulx, uly, uhx, uhy
     eds = np.empty(E, np.int64)
+    ec = np.empty((4, E), np.int64)  # cell ranges of the selected edges: x lo, x hi, y lo, y hi
     cap = 1024
     oi, oe, ok = np.empty(cap, np.int64), np.empty(cap, np.int64), np.empty(cap, np.int64)
     m = 0
-    for k in range(S.shape[0]):
+    for k in range(K):
         sx, sy = S[k, 0], S[k, 1]
-        npt = 0
-        ulx, uly, uhx, uhy = np.inf, np.inf, -np.inf, -np.inf
-        for i in range(N):
-            if not point_ok[i]:
-                continue
-            lx, ly, hx, hy = plo[0, i] + sx, plo[1, i] + sy, phi[0, i] + sx, phi[1, i] + sy
-            if lx <= ext[2] and hx >= ext[0] and ly <= ext[3] and hy >= ext[1]:
-                pts[npt] = i
-                npt += 1
-                ulx, uly, uhx, uhy = min(ulx, lx), min(uly, ly), max(uhx, hx), max(uhy, hy)
+        npt = npts[k]
         if npt == 0:
             continue
+        ulx, uly, uhx, uhy = ub[k, 0], ub[k, 1], ub[k, 2], ub[k, 3]
         ned = 0
         for e in range(E):
             if edge_ok[e] and elo[0, e] <= uhx and ehi[0, e] >= ulx and elo[1, e] <= uhy and ehi[1, e] >= uly:
                 eds[ned] = e
+                # the edge's cell range, floored once per offset (the pair loop below only compares integers)
+                ec[0, ned] = np.int64(math.floor(elo[0, e] / cell))
+                ec[1, ned] = np.int64(math.floor(ehi[0, e] / cell))
+                ec[2, ned] = np.int64(math.floor(elo[1, e] / cell))
+                ec[3, ned] = np.int64(math.floor(ehi[1, e] / cell))
                 ned += 1
         for q in range(npt):
-            i = pts[q]
+            i = pts[k, q]
             cx0 = np.int64(math.floor((plo[0, i] + sx) / cell))
             cy0 = np.int64(math.floor((plo[1, i] + sy) / cell))
             cx1 = np.int64(math.floor((phi[0, i] + sx) / cell))
             cy1 = np.int64(math.floor((phi[1, i] + sy) / cell))
             pb = point_body[i]
             for r in range(ned):
+                if not (ec[0, r] <= cx1 and ec[1, r] >= cx0 and ec[2, r] <= cy1 and ec[3, r] >= cy0):
+                    continue
                 e = eds[r]
                 eb = edge_body[e]
                 if pb == eb or (body_fixed[pb] and body_fixed[eb]):
                     continue
-                if (np.int64(math.floor(elo[0, e] / cell)) <= cx1 and np.int64(math.floor(ehi[0, e] / cell)) >= cx0
-                        and np.int64(math.floor(elo[1, e] / cell)) <= cy1
-                        and np.int64(math.floor(ehi[1, e] / cell)) >= cy0):
-                    if m == cap:
-                        cap *= 2
-                        ni, ne, nk = np.empty(cap, np.int64), np.empty(cap, np.int64), np.empty(cap, np.int64)
-                        ni[:m], ne[:m], nk[:m] = oi[:m], oe[:m], ok[:m]
-                        oi, oe, ok = ni, ne, nk
-                    oi[m], oe[m], ok[m] = i, e, k
-                    m += 1
+                if m == cap:
+                    cap *= 2
+                    ni, ne, nk = np.empty(cap, np.int64), np.empty(cap, np.int64), np.empty(cap, np.int64)
+                    ni[:m], ne[:m], nk[:m] = oi[:m], oe[:m], ok[:m]
+                    oi, oe, ok = ni, ne, nk
+                oi[m], oe[m], ok[m] = i, e, k
+                m += 1
     return oi[:m].copy(), oe[:m].copy(), ok[:m].copy()
+
+
+@njit(**NB)
+def merge_kernel(i_d, e_d, i_m, e_m, ox_m, oy_m, n_edges):
+    """merge_with_images' merge (World._merge_images): drop image pairs whose key i * n_edges + e is a direct one,
+    keep the first image (in list order) of each remaining key, and merge them into the sorted direct list (direct
+    keys are sorted and unique)."""
+    nd, nm = i_d.size, i_m.size
+    keys_m = i_m * n_edges + e_m
+    fresh = np.empty(nm, np.int64)
+    nf = 0
+    for k in range(nm):  # not met directly (binary search in the direct keys)
+        key = keys_m[k]
+        lo, hi = 0, nd
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if i_d[mid] * n_edges + e_d[mid] < key:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo >= nd or i_d[lo] * n_edges + e_d[lo] != key:
+            fresh[nf] = k
+            nf += 1
+    fresh = fresh[:nf]
+    order = fresh[np.argsort(keys_m[fresh], kind="mergesort")]  # stable: the first image of a key comes first
+    sel = np.empty(nf, np.int64)
+    ns = 0
+    for q in range(nf):
+        if ns == 0 or keys_m[order[q]] != keys_m[sel[ns - 1]]:
+            sel[ns] = order[q]
+            ns += 1
+    n = nd + ns
+    pts, eids = np.empty(n, np.int64), np.empty(n, np.int64)
+    ox, oy = np.zeros(n), np.zeros(n)
+    a, b = 0, 0
+    for k in range(n):  # merge; an image key never equals a direct one
+        if b < ns and (a >= nd or keys_m[sel[b]] < i_d[a] * n_edges + e_d[a]):
+            j = sel[b]
+            pts[k], eids[k], ox[k], oy[k] = i_m[j], e_m[j], ox_m[j], oy_m[j]
+            b += 1
+        else:
+            pts[k], eids[k] = i_d[a], e_d[a]
+            a += 1
+    return pts, eids, ox, oy
 
 
 def ccd_cells(world, D, cell):
@@ -239,7 +385,7 @@ def ccd_detect(world, D, pts, eids, gap, tau, off=None):
                      tau, ox, oy)
     if off is None:
         return out[:5]
-    return out[:5] + (np.stack([out[5], out[6]]),)
+    return out[:5] + (out[5],)
 
 
 def ccd_impulses(world, pts, eids, ts, ss, sides, h, push, off=None):
@@ -735,14 +881,14 @@ def _tau_hit(rr, e0x, e0y, dex, dey, q0x, q0y, dqx, dqy, tau2):
 def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau, offx, offy):
     """World._ccd_detect after the broad phase: the swept-box pre-reject inline, then the quadratic per pair
     (textbook roots, verified; the float64-robust solve where they find nothing). Returns (pts, edge_ids, t, s,
-    side, offset x, offset y) of the hits, in pair order. offx / offy: per pair image offsets added to the point
+    side, offsets (2, m)) of the hits, in pair order. offx / offy: per pair image offsets added to the point
     (periodic axis), or empty for none (the returned offsets are then empty too)."""
     m = pts.size
     has_off = offx.size > 0
     tau2 = tau * tau
     hp, he = np.empty(m, np.int64), np.empty(m, np.int64)
     ht, hs, hside = np.empty(m), np.empty(m), np.empty(m)
-    hox, hoy = np.empty(m if has_off else 0), np.empty(m if has_off else 0)
+    ho = np.empty((2, m if has_off else 0))
     nh = 0
     for k in range(m):
         ip = pts[k]
@@ -820,11 +966,10 @@ def ccd_narrow(X0, D, ea, eb, pts, eids, gap, tau, offx, offy):
         if th != np.inf:
             hp[nh], he[nh], ht[nh], hs[nh], hside[nh] = ip, e, th, sh, side
             if has_off:
-                hox[nh], hoy[nh] = offx[k], offy[k]
+                ho[0, nh], ho[1, nh] = offx[k], offy[k]
             nh += 1
     no = nh if has_off else 0
-    return (hp[:nh].copy(), he[:nh].copy(), ht[:nh].copy(), hs[:nh].copy(), hside[:nh].copy(), hox[:no].copy(),
-            hoy[:no].copy())
+    return (hp[:nh].copy(), he[:nh].copy(), ht[:nh].copy(), hs[:nh].copy(), hside[:nh].copy(), ho[:, :no].copy())
 
 
 @njit(**NB)
@@ -1052,6 +1197,9 @@ def warmup():
     floor_cells(ccd_boxes(P, P, i2, i1)[0], 24.0)
     ccd_narrow(P, P, i2, i1, e, e, 0.01, 1e-6, f, f)
     impulse_pass(P.copy(), W, P, i2, i1, e, e, f, f, f, e, 0.004, 0.25, f, f)
-    image_pair_kernel(P, P, np.zeros((2, 2)), np.zeros((2, 2)), np.ones(4, np.bool_), np.ones(2, np.bool_), np.zeros((1, 2)), 24.0,
-                      np.array([0, 0, 1, 1], np.int64), np.zeros(2, np.int64), b)
+    img = (P, P, np.zeros((2, 2)), np.zeros((2, 2)), np.ones(4, np.bool_), np.ones(2, np.bool_), np.zeros((1, 2)), 24.0,
+           np.array([0, 0, 1, 1], np.int64), np.zeros(2, np.int64), b)
+    image_merge_kernel(np.array([0, 1], np.int64), np.zeros(2, np.int64), 2, *img)
+    image_pair_kernel(*img)
+    image_extras_kernel(2, *img)
     bounce_pass(P, P.copy(), W, np.array([0, 2, 4], np.int64), np.array([0, 1, 2], np.int64), i2, i1, e, f, 3.0, 0.004)
