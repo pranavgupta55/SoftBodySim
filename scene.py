@@ -180,6 +180,7 @@ PENROSE_CUP_GAP = 60.0  # CUP_GAP for the penrose tiling (the "pair" rule only: 
 # Since 2026-10-26 new penrose layouts use the "outline" cup rule (see DIAMONDS_CUPS): only touching tiles count, so
 # 50% more tiles fit (695 on 1800x1169; at gap 60 only ~578 did). Files without "cups" keep "pair"
 PENROSE_CUPS = "outline"
+PENROSE_NEAR = 30.0  # outline rule: tile corners closer than this (~ a large shape) count as touching
 # a fat rhombus per golden ratio of thin ones: the mean tile area
 _PHI = (1 + math.sqrt(5)) / 2
 PENROSE_MEAN_AREA = PENROSE_SIDE ** 2 * (_PHI * math.sin(math.radians(72)) + math.sin(math.radians(36))) / (_PHI + 1)
@@ -215,6 +216,8 @@ def _layout_tiling(layout, tiling=None, pentagrid_seed=None):
         info.setdefault("cups", PENROSE_CUPS)
         if info["cups"] == "pair":
             info.setdefault("cup_gap", PENROSE_CUP_GAP)
+        else:
+            info.setdefault("near", PENROSE_NEAR)
     return info
 
 
@@ -272,7 +275,7 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     keys, size = load_layout(layout) if isinstance(layout, str) else layout if layout is not None else (None, None)
     gap = float(info.get("cup_gap", CUP_GAP))
     cups = info.get("cups", DIAMONDS_CUPS)
-    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=gap, cups=cups,
+    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=gap, cups=cups, near=float(info.get("near", 0.0)),
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
                              add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)),
                              bias=float(info.get("bias", 0.0)))
