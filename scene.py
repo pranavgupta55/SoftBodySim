@@ -166,7 +166,7 @@ DIAMONDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", 
 DIAMONDS_LAYOUT = os.path.join(DIAMONDS_DIR, "evolved 1.json")  # the default one
 
 # the "penrose" worlds: the same scene over a Penrose P3 rhombus tiling (diamonds_map.penrose_tiles) instead
-PENROSE_SIDE = 24.0  # edge length of its fat (72 degree) and thin (36 degree) rhombi
+PENROSE_SIDE = 33.6  # (24 before 2026-10-27) edge length of its fat (72 degree) and thin (36 degree) rhombi
 PENROSE_SEED = 1  # the pentagrid offsets' seed of a new layout (saved layouts keep their own)
 # Penrose edges run in 5 directions 36 degrees apart, so some always slope 18 degrees or less, under the friction
 # angle (atan 0.5 = 26.6 degrees). Measured on random layouts (30 s, 2 seeds; shapes under 5 px/s of 168, random
@@ -176,10 +176,12 @@ PENROSE_SEED = 1  # the pentagrid offsets' seed of a new layout (saved layouts k
 # 18 gives 12-17 (and the density is still reached; at 80 it isn't, ~390 of 464 tiles)
 PENROSE_ROTATION = 18.0  # degrees: no horizontal edges
 PENROSE_MIN_SLOPE = 0.0  # pick only tiles whose edges all slope at least this (diamonds_map.steep_tiles; 0: all)
-PENROSE_CUP_GAP = 60.0  # CUP_GAP for the penrose tiling (the "pair" rule only: layouts saved before "outline")
-# cup rule of new penrose layouts (see DIAMONDS_CUPS): "pair" (the gap rule, PENROSE_CUP_GAP) or "outline" (only
-# touching tiles, plus PENROSE_NEAR). Outline fits all 695 tiles of the density on 1800x1169 (pair at gap 60: ~536)
-# but jammed 106-168 of 168 shapes in tests (2026-10-27), pair 12-17. Files without "cups" load as "pair"
+# CUP_GAP of new penrose layouts per tile edge (the "pair" rule only): 2.5 x edge, i.e. 60 at edge 24 (the numbers
+# above), 84 at 33.6. Saved layouts keep their own "cup_gap"
+PENROSE_CUP_GAP_PER_EDGE = 2.5
+# cup rule of new penrose layouts (see DIAMONDS_CUPS): "pair" (the gap rule, PENROSE_CUP_GAP_PER_EDGE) or "outline" (only
+# touching tiles, plus PENROSE_NEAR). At edge 24 / density 1.5x, outline fit all 695 tiles on 1800x1169 (pair at gap
+# 60: ~536) but jammed 106-168 of 168 shapes in tests (2026-10-27), pair 12-17. Files without "cups" load as "pair"
 PENROSE_CUPS = "pair"
 PENROSE_NEAR = 30.0  # outline rule: tile corners closer than this (~ a large shape) count as touching
 # a fat rhombus per golden ratio of thin ones: the mean tile area
@@ -188,9 +190,9 @@ PENROSE_MEAN_AREA = PENROSE_SIDE ** 2 * (_PHI * math.sin(math.radians(72)) + mat
 PENROSE_SPAWN = {
     **DIAMONDS_SPAWN,
     # tiles per square world unit: the same share of the world's area as maps/diamonds/evolved 3 (302 diamonds,
-    # each a 60 degree rhombus of edge DIAMOND_SIDE): 10.3%, ~464 Penrose tiles on 1800x1169; then 50% more
-    # (15.5%, 695 tiles), which the outline cup rule leaves room for
-    "density": 1.5 * 302 * DIAMOND_SIDE ** 2 * math.sin(math.radians(60)) / PENROSE_MEAN_AREA / (1800 * 1169),
+    # each a 60 degree rhombus of edge DIAMOND_SIDE): 10.3%; times 1.5 x 1.3 = 1.95 (~20.2% of the area, ~461
+    # tiles of edge 33.6 on 1800x1169)
+    "density": 1.95 * 302 * DIAMOND_SIDE ** 2 * math.sin(math.radians(60)) / PENROSE_MEAN_AREA / (1800 * 1169),
 }
 PENROSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "penrose")
 
@@ -217,7 +219,7 @@ def _layout_tiling(layout, tiling=None, pentagrid_seed=None):
         info.setdefault("min_slope", PENROSE_MIN_SLOPE)
         info.setdefault("cups", PENROSE_CUPS)
         if info["cups"] == "pair":
-            info.setdefault("cup_gap", PENROSE_CUP_GAP)
+            info.setdefault("cup_gap", PENROSE_CUP_GAP_PER_EDGE * info["edge"])
         else:
             info.setdefault("near", PENROSE_NEAR)
     return info
