@@ -31,7 +31,7 @@ PALETTES = {
     "sunset": {"background": _hex("0a1624")[0], "wall": _hex("1f3c4e"),
                "diamond": _hex("1f3c4e", "6e3746", "b84f48"), "hexagon": _hex("f5ce8c", "e88a55")},
 }
-DEFAULT = "dusk"
+DEFAULT = "forest"
 
 
 def apply_palette(world, name):

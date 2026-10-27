@@ -368,7 +368,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     parser.add_argument("--window", help="windowed mode at WxH screen px instead of fullscreen, e.g. 1280x800")
     parser.add_argument("--basic", action="store_true", help="the Framework pipeline: CPU composite, one texture")
     folders = sorted({name.split("/", 1)[0] for name in PRESETS if "/" in name})
-    parser.add_argument("--scene", default="default", choices=sorted(PRESETS) + folders,
+    parser.add_argument("--scene", default="penrose/evolved 1", choices=sorted(PRESETS) + folders,
                         help="preset scene to start with (a folder name: its first world)")
     parser.add_argument("--steps", metavar="SxI",
                         help="physics schedule for every world: substeps x solver iterations per frame, e.g. 8x1 "
