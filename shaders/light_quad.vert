@@ -1,7 +1,9 @@
 // Lights pass (gl_lights.py): one instance per light, a 4-vertex triangle strip covering the pixels it can reach.
 // Point lights: the box of their radius; spot lights: the box of their cone sector; directional lights: the whole
 // surface. On a periodic axis a box that crosses the seam widens to the whole axis, so the fragment shader's
-// minimum-image distance lights the far side too.
+// light images (light_accum.frag adds every image within the radius) light the far side too. That covers them all:
+// an image one period over can only reach a pixel on the surface if the box crosses the seam on that axis. (The
+// dark corner rectangles of S5 were a wrapped shadow ending where the nearest image switched, not these bounds.)
 layout(std140) uniform Lights {
     vec4 u_lights[1024];  // 4 vec4 per light (gl_lights.pack_lights)
 };
