@@ -6,6 +6,7 @@ Exit status 1 on the first failed check.
 """
 import os
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -48,7 +49,12 @@ def main():
         check(np.abs(img[y, x] - ambient_only(h, x, y)).max() <= 1, f"no lights: ({x}, {y}) = albedo x ambient")
     check((img[CYAN_BOX[1], CYAN_BOX[0]] == albedo[CYAN_BOX[1], CYAN_BOX[0]]).all(), "unlit flag: albedo unchanged")
     check((img[BG[1], BG[0]] == albedo[BG[1], BG[0]]).all(), "background passes through")
-    check((img[GLOW[1], GLOW[0]] == 255).all(), "glow material: emissive added")
+    # (albedo x ambient + white emissive is over 1 in every channel: the tone shoulder rolls it off just under white)
+    check(img[GLOW[1], GLOW[0]].min() >= 230, "glow material: emissive added")
+    gl_lights.TONEMAP = False
+    img = h.run([], ambient=AMB)
+    gl_lights.TONEMAP = True
+    check((img[GLOW[1], GLOW[0]] == 255).all(), "TONEMAP off: emissive clips to white")
 
     # point light: nearer is brighter, past the radius is ambient only, unlit stays albedo even under the light
     lt = Light(pos=(200, 480), radius=300, intensity=1.5, height=40)
@@ -128,15 +134,24 @@ def main():
 
     # many lights: 300 (two batches) dim lights equal one bright one
     one = Light(pos=(450, 450), radius=400, intensity=1.5, color=(1, 1, 1))
-    # read where the sum is ~0.4: RGBA16F rounds each of the 300 additions to half an ulp (2^-12 below 1, 2^-13
-    # below 0.5), which at a sum near 1 alone drifts ~8%
+    # past F4_MIN_LIGHTS lights the targets are RGBA32F (RGBA16F would round each of the 300 additions to half an
+    # ulp, 2^-12 below 1, drifting ~8% at a sum near 1)
+    gl_lights.LIGHT_DTYPE = "f4"
     h.run([one], sdf=False)
     a = h.read("light")[FLOOR_Y, 650, 0]
+    gl_lights.LIGHT_DTYPE = None
+    h.run([one], sdf=False)
+    check(h.frame.shared["light"].dtype == "f2", "1 light: RGBA16F targets")
     h.run([one.copy(intensity=0.005)] * 300, sdf=False)
+    check(h.frame.shared["light"].dtype == "f4", "300 lights: RGBA32F targets")
     b = h.read("light")[FLOOR_Y, 650, 0]
-    check(abs(a - b) < 0.05 * a, f"300 lights add up like one (RGBA16F sums: {a:.3f} vs {b:.3f})")
+    check(abs(a - b) < 0.01 * a, f"300 lights add up like one (fp32 sums: {a:.4f} vs {b:.4f})")
     h.run([one.copy(intensity=0.0)] * 299 + [one], sdf=False)
-    check(h.read("light")[FLOOR_Y, 650, 0] == a, "the 300th light (second batch) draws")
+    check(abs(h.read("light")[FLOOR_Y, 650, 0] - a) < 1e-6, "the 300th light (second batch) draws")
+    h.run([one] * 30, sdf=False)
+    check(h.frame.shared["light"].dtype == "f4", "30 lights after 300: still RGBA32F (hysteresis)")
+    h.run([one] * 24, sdf=False)
+    check(h.frame.shared["light"].dtype == "f2", "24 lights: back to RGBA16F")
     h.run([one.copy(enabled=False)], sdf=False)
     check(h.read("light").max() == 0, "disabled lights draw nothing")
 
@@ -158,6 +173,41 @@ def main():
     check((q != base).any() and len(np.unique(q[FLOOR_Y, 300:600, 0])) < len(np.unique(base[FLOOR_Y, 300:600, 0])),
           "LIGHT_LEVELS quantises")
 
+    # tone mapping (TONEMAP, on by default): mid tones unchanged (only the dither, < 1/255), over-bright colours keep
+    # their hue
+    lt = Light(pos=(450, 450), radius=400, intensity=1.0)
+    toned = h.run([lt], ambient=AMB, sdf=False).astype(int)
+    gl_lights.TONEMAP = False
+    plain = h.run([lt], ambient=AMB, sdf=False).astype(int)
+    gl_lights.TONEMAP = True
+    mid = plain.max(axis=2) <= 0.8 * 255
+    check(np.abs(toned - plain)[mid].max() <= 1, "tone map: pixels below the knee unchanged within 1/255")
+    flat = h.read("light")[FLOOR_Y, :, 0]
+    x5 = int(np.argmin(np.abs(flat - 0.5)))
+    check(abs(flat[x5] - 0.5) < 0.05 and np.abs(toned[FLOOR_Y, x5] - plain[FLOOR_Y, x5]).max() <= 1,
+          f"a pixel with light 0.5 unchanged within 1/255 (x={x5})")
+    white = lambda im: int((im >= 254).all(axis=2).sum())  # noqa: E731
+    check(white(toned) <= white(plain), f"tone map: no more flat white ({white(toned)} vs {white(plain)} px)")
+    # an orange emitter at x3 strength: the glow material's row swapped for one
+    table = np.frombuffer(h.material_tex.read(), np.float32).reshape(-1, lh.MAT_TEXELS * 4).copy()
+    saved_table = table.copy()
+    orange = lh.materials.Material(emissive=(1.0, 0.5, 0.1), emissive_strength=3.0, casts_shadow=False)
+    table[lh.MAT_ID["glow"]] = lh.pack_material(orange)
+    h.material_tex.write(table.tobytes())
+    img = h.run([], ambient=AMB, sdf=False).astype(float)
+    a = h.scene["albedo"][GLOW[1], GLOW[0], :3] / 255.0
+    want = a * np.array(AMB) + np.array(orange.emissive) * 3.0
+    got = img[GLOW[1], GLOW[0]]
+    ratio_want, ratio_got = want[1] / want[0], got[1] / got[0]
+    check(abs(ratio_got / ratio_want - 1) < 0.05, f"orange emissive x3 keeps its g/r ({ratio_got:.3f} vs "
+                                                  f"{ratio_want:.3f}) and stays orange {got}")
+    h.material_tex.write(saved_table.tobytes())
+    # world.exposure scales the lit colour; bad values count as 1
+    h.run([lt], ambient=AMB, sdf=False)
+    check(gl_lights.exposure(SimpleNamespace(exposure=float("nan"))) == 1.0
+          and gl_lights.exposure(SimpleNamespace()) == 1.0 and gl_lights.exposure(SimpleNamespace(exposure=0)) == 0.0,
+          "exposure: default 1, NaN -> 1, 0 kept")
+
     # the G-buffer's albedo may be GLWorld.tex itself: compose reads a copy
     lt = Light(pos=(450, 450), radius=400)
     ref = h.run([lt], ambient=AMB, sdf=False)
@@ -168,7 +218,38 @@ def main():
     h.gbuf["albedo"] = saved
     check((alias == ref).all(), "albedo aliasing GLWorld.tex")
     h.release()
+    gi_checks()
     print("all lights checks passed")
+
+
+def gi_checks():
+    """GI (gl_sdf) from an emitter whose material is unlit: none (rc_scene gates emission by Mat.lit); lit: some.
+    And a world with no lights and no ambient keeps the dim default ambient (user decision: no full-bright default)."""
+    import lights
+    import gl_sdf
+    import sdf_harness as sh
+    hz = sh.Harness()
+    table = np.frombuffer(hz.mats.read(), np.float32).reshape(hz.n_mats, -1).copy()
+    glow = lh.materials.PRESETS["glow"]
+    gl_sdf.GI_ENABLED = True
+    try:
+        res = {}
+        for lit in (True, False):
+            table[2] = np.asarray(lh.materials.pack(lh.materials.Material(**{**glow.__dict__, "lit": lit})),
+                                  np.float32).ravel()
+            hz.mats.write(table.tobytes())
+            flags = sh.OCCLUDER | (sh.LIT if lit else 0)
+            scene = [sh.Poly(sh.regular(450, 300, 25, 6), (1.0, 0.6, 0.2), flags=flags, mat=2)]
+            res[lit] = float(hz.gi_array(hz.run(hz.frame(scene)))[..., :3].max())
+        check(res[True] > 0.01, f"a lit emitter gives GI ({res[True]:.3f})")
+        check(res[False] == 0.0, f"an unlit emitter gives zero GI ({res[False]})")
+    finally:
+        gl_sdf.GI_ENABLED = False
+        for e in hz.effects:
+            e.release()
+    check(lights.of_world(SimpleNamespace())[1] == lights.DEFAULT_AMBIENT
+          and lights.of_world(SimpleNamespace(lights=[], ambient=None))[1] == lights.DEFAULT_AMBIENT,
+          "no lights, no ambient: the default (dim) ambient")
 
 
 if __name__ == "__main__":

@@ -35,7 +35,13 @@ void main() {
     vec3 col = u_background;
     // Same "over" blend pygame uses when blitting a per-pixel-alpha surface: dst = src * a + dst * (1 - a)
     if (u_world_on) {
-        vec4 world = fetch(u_world, p - u_shake);
+        // the surfaces are the window size / SCALE_DOWN rounded down, so an odd window leaves a strip under one
+        // surface px at the right / bottom: it takes the world's edge px (not u_background, which on a lit world
+        // can be far brighter than the lit scene: a light line along the bottom)
+        vec2 edge = vec2(textureSize(u_world, 0)) * u_scale;
+        vec2 q = p - u_shake;
+        q = mix(q, min(q, edge - 0.5), lessThan(q, edge + u_scale));
+        vec4 world = fetch(u_world, q);
         col = mix(col, world.rgb, world.a);
     }
     vec4 game = fetch(u_game, p - u_shake);

@@ -1,8 +1,12 @@
 // Compose (gl_lights.py, effect order 300): the lit scene into GLWorld.tex.
-//     out = albedo * (ambient + light + gi + caustics) + spec + emissive (none on a body's black border: flag bit3)
-// Unlit pixels (flag bit2 clear: background, grid, trails, lit=False bodies) keep their albedo unchanged. Missing
-// inputs are bound to a black texture. With u_levels > 0 the light term is quantised to that many levels per unit
-// with a 4x4 Bayer dither (gl_lights.LIGHT_LEVELS).
+//     out = tone(exposure x (albedo * (ambient + light + gi + caustics) + spec + emissive))
+// (no emissive on a body's black border: flag bit3). Unlit pixels (flag bit2 clear: background, grid, trails,
+// lit=False bodies) keep their albedo unchanged, byte for byte. Missing inputs are bound to a black texture.
+// With u_levels > 0 the light term's luminance is quantised to that many levels per unit with a 4x4 Bayer dither
+// (gl_lights.LIGHT_LEVELS), its hue kept. tone (gl_lights.TONEMAP, u_tonemap): a hue-preserving shoulder (the
+// brightest channel m above u_knee rolls off as knee + (1 - knee)(1 - exp(-(m - knee) / (1 - knee))) towards 1, all
+// three channels scaled alike, so over-bright colours keep their hue instead of clipping to white) and a +-0.5/255
+// ordered dither against banding; off: a plain clamp.
 // Included before it: material.glsl (Mat, mat_fetch).
 uniform sampler2D u_albedo;
 uniform sampler2D u_normal;
@@ -14,6 +18,9 @@ uniform sampler2D u_gi;
 uniform sampler2D u_caustics;
 uniform vec3 u_ambient;
 uniform float u_levels;
+uniform bool u_tonemap;
+uniform float u_knee;
+uniform float u_exposure;
 
 out vec4 f_color;
 
@@ -21,6 +28,16 @@ float bayer4(ivec2 p) {
     int x = p.x & 3, y = p.y & 3;
     int m[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
     return (float(m[y * 4 + x]) + 0.5) / 16.0;
+}
+
+vec3 tone(vec3 col, ivec2 px) {
+    col = max(col, vec3(0.0));
+    float m = max(col.r, max(col.g, col.b));
+    if (m > u_knee) {
+        float s = 1.0 - u_knee;
+        col *= (u_knee + s * (1.0 - exp(-(m - u_knee) / s))) / m;
+    }
+    return col + (bayer4(px) - 0.5) / 255.0;
 }
 
 void main() {
@@ -34,10 +51,13 @@ void main() {
     vec3 light = u_ambient + texelFetch(u_light, px, 0).rgb + texelFetch(u_gi, px, 0).rgb
                + texelFetch(u_caustics, px, 0).rgb;
     if (u_levels > 0.0) {
-        light = floor(light * u_levels + bayer4(px)) / u_levels;
+        float y = dot(max(light, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+        float q = floor(y * u_levels + bayer4(px)) / u_levels;
+        light = y > 1e-6 ? light * (q / y) : vec3(0.0);
     }
     Mat m = mat_fetch(u_mat_table, texelFetch(u_mat, px, 0).r);
     vec3 emit = (flags & 8u) == 0u ? m.emissive * m.emissive_strength : vec3(0.0);  // (not on black borders)
-    vec3 col = albedo.rgb * light + texelFetch(u_spec, px, 0).rgb + emit;
+    vec3 col = (albedo.rgb * light + texelFetch(u_spec, px, 0).rgb + emit) * u_exposure;
+    if (u_tonemap) col = tone(col, px);
     f_color = vec4(clamp(col, 0.0, 1.0), 1.0);
 }
