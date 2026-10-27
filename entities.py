@@ -116,7 +116,7 @@ def polygon_points(cx, cy, radius, n, angle=-math.pi / 2):
     return np.array([cx + radius * np.cos(angles), cy + radius * np.sin(angles)])
 
 
-FILL_EXPAND = 2  # px the no-outline filled view grows each shape outward (Body.draw_filled, gl_world)
+FILL_EXPAND = 1  # px the no-outline filled view grows each shape outward (Body.draw_filled, gl_world)
 
 
 class Body:
