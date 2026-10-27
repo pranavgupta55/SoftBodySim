@@ -1306,19 +1306,22 @@ class World:
             self.zone_count += 1
             self._impact_zones(h)
 
-    def _ccd_normal(self, i, ia, ib, t, side, h, off=None):
-        """_ccd_impulses' push direction for point i against edge (ia, ib): from the closest point on the edge to the
-        point at the start of the substep, or the edge normal at the hit time t (towards `side`) if they touch.
-        off: the point's image offset (periodic axis), or None."""
+    def _ccd_normals(self, i, ia, ib, t, side, h, off=None):
+        """_ccd_impulses' push directions, (2, m), for points i against edges (ia, ib) (arrays of m): from the
+        closest point on the edge to the point at the start of the substep, or the edge normal at the hit time t
+        (towards `side`) if they touch. off: the points' (2, m) image offsets (periodic axis), or None."""
         V, X0 = self.V, self.PREV
         xi = X0[:, i] if off is None else X0[:, i] + off
-        e0 = X0[:, ib] - X0[:, ia]
-        u = min(max((xi - X0[:, ia]) @ e0 / max(e0 @ e0, 1e-12), 0.0), 1.0)
-        sep = xi - (X0[:, ia] + u * e0)
-        if np.hypot(*sep) > 1e-9:
-            return sep / np.hypot(*sep)
-        e = (X0[:, ib] + t * h * V[:, ib]) - (X0[:, ia] + t * h * V[:, ia])
-        return side * np.array([-e[1], e[0]]) / max(np.hypot(*e), 1e-12)
+        a, b = X0[:, ia], X0[:, ib]
+        e0 = b - a
+        u = np.clip(np.sum((xi - a) * e0, axis=0) / np.maximum(np.sum(e0 * e0, axis=0), 1e-12), 0.0, 1.0)
+        sep = xi - (a + u * e0)
+        d = np.hypot(sep[0], sep[1])
+        th = t * h
+        e = (b + th * V[:, ib]) - (a + th * V[:, ia])
+        touch = side * np.array([-e[1], e[0]]) / np.maximum(np.hypot(e[0], e[1]), 1e-12)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(d > 1e-9, sep / d, touch)
 
     def _inelastic_zones(self, h, V_pre, pgs_iters=300):
         """Fallback when the impulse passes leave hits: inelastic projection (Harmon et al. 2008, "Robust treatment
@@ -1341,7 +1344,13 @@ class World:
         push = EnvConfig.ccd_push
         V_entry = V.copy()
         V_pre = V_entry if V_pre is None else V_pre
-        cons = {}  # (point, edge) -> (i, a, b, s, n, rhs), in first-seen order
+        n_edges = max(E.shape[1], 1)
+        row_of = {}  # (point, edge) key -> constraint row, rows in first-seen order
+        # the constraint rows: point, edge ends, s, normal (as columns), rhs
+        R_i, R_a, R_b = (np.empty(0, dtype=np.int64) for _ in range(3))
+        R_s, R_n, R_rhs = np.empty(0), np.empty((2, 0)), np.empty(0)
+        compiled = _jit()  # else the kernels' same code runs as Python (bit-identical)
+        groups_of = solver_jit.row_groups if compiled else solver_jit._row_groups
         projected = False
         for _ in range(rounds):
             hits = self._ccd_detect(V * h)
@@ -1349,59 +1358,43 @@ class World:
             if pts.size == 0:
                 self.projection_count += projected
                 return True
-            offs = hits[5].T if len(hits) > 5 else [None] * pts.size  # image offsets (periodic axis)
-            for i, e, t, s, side, o in zip(pts.tolist(), eids.tolist(), ts.tolist(), ss.tolist(), sides.tolist(), offs):
-                ia, ib = int(E[0, e]), int(E[1, e])
-                n = self._ccd_normal(i, ia, ib, t, side, h, o)
-                xi = X0[:, i] if o is None else X0[:, i] + o
-                gap0 = (xi - ((1 - s) * X0[:, ia] + s * X0[:, ib])) @ n
-                cons[(i, e)] = (i, ia, ib, s, n, (push - gap0) / h)
-            parent = {}
-
-            def find(x):
-                parent.setdefault(x, x)
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
-
-            for i, ia, ib, *_ in cons.values():
-                for j in (ia, ib):
-                    ri, rj = find(i), find(j)
-                    if ri != rj:
-                        parent[rj] = ri
-            groups = {}
-            for c in cons.values():
-                groups.setdefault(find(c[0]), []).append(c)
-            for cs in groups.values():
-                members = sorted({p for c in cs for p in c[:3]})
-                loc = {p: k for k, p in enumerate(members)}
-                m, k = len(members), len(cs)
-                G = np.zeros((k, 2 * m))
-                rhs = np.empty(k)
-                for row, (i, ia, ib, s, n, b) in enumerate(cs):
-                    for p, wgt in ((i, 1.0), (ia, -(1 - s)), (ib, -s)):
-                        G[row, 2 * loc[p]:2 * loc[p] + 2] += wgt * n
-                    rhs[row] = b
-                Minv = np.repeat(W[members], 2)
-                diag = np.einsum("ij,ij->i", G * Minv, G)
-                lam = np.zeros(k)
-                v = V_pre[:, members].T.reshape(-1).copy()
-                for _ in range(pgs_iters):
-                    worst = 0.0
-                    for row in range(k):
-                        if diag[row] < 1e-12:
-                            continue
-                        viol = rhs[row] - G[row] @ v
-                        new = max(lam[row] + viol / diag[row], 0.0)
-                        if new != lam[row]:
-                            v += Minv * G[row] * (new - lam[row])
-                            lam[row] = new
-                        if lam[row] > 0 or viol > 0:
-                            worst = max(worst, abs(viol))
-                    if worst < 1e-9:
-                        break
-                V[:, members] = v.reshape(m, 2).T
+            off = hits[5] if len(hits) > 5 else None  # image offsets (periodic axis)
+            ia, ib = E[0, eids], E[1, eids]
+            n = self._ccd_normals(pts, ia, ib, ts, sides, h, off)
+            xi = X0[:, pts] if off is None else X0[:, pts] + off
+            sep0 = xi - ((1 - ss) * X0[:, ia] + ss * X0[:, ib])
+            gap0 = sep0[0] * n[0] + sep0[1] * n[1]
+            # a pair hit again keeps its row (and place) with the new values
+            rows = np.array([row_of.setdefault(key, len(row_of)) for key in (pts * n_edges + eids).tolist()],
+                            dtype=np.int64)
+            k = len(row_of)
+            if k > R_i.size:
+                grow = k - R_i.size
+                R_i, R_a, R_b = (np.concatenate([r, np.zeros(grow, dtype=np.int64)]) for r in (R_i, R_a, R_b))
+                R_s, R_rhs = np.concatenate([R_s, np.zeros(grow)]), np.concatenate([R_rhs, np.zeros(grow)])
+                R_n = np.concatenate([R_n, np.zeros((2, grow))], axis=1)
+            R_i[rows], R_a[rows], R_b[rows], R_s[rows], R_n[:, rows] = pts, ia, ib, ss, n
+            R_rhs[rows] = (push - gap0) / h
+            # connected groups of rows (shared points); rows of a group stay in row order
+            label = groups_of(R_i, R_a, R_b, X0.shape[1])
+            order = np.argsort(label, kind="stable")
+            cuts = np.flatnonzero(np.diff(label[order])) + 1
+            # G in sparse form: each row touches its point and the edge's two ends (solver_jit.pgs_solve)
+            ends = np.stack([R_i, R_a, R_b], axis=1)
+            wgt = np.stack([np.ones(k), -(1 - R_s), -R_s], axis=1)
+            g_all = wgt[:, :, None] * R_n.T[:, None, :]
+            for r in np.split(order, cuts):
+                members = np.unique(ends[r])
+                cols = np.searchsorted(members, ends[r])
+                g = g_all[r]
+                # a point twice in a row (never expected): one slot, as a dense row would sum it
+                for j, l in ((1, 0), (2, 0), (2, 1)):
+                    dup = np.flatnonzero((cols[:, j] == cols[:, l]) & g[:, j].any(axis=1))
+                    g[dup, l] += g[dup, j]
+                    g[dup, j] = 0.0
+                v = V_pre[:, members].T.copy()
+                solver_jit.pgs_solve(cols, g, R_rhs[r], W[members], v, pgs_iters, compiled)
+                V[:, members] = v.T
             projected = True
         V[:] = V_entry
         return False
@@ -1487,7 +1480,12 @@ class World:
                     if ri != rj:
                         parent[rj] = ri
                         merged = True
-            roots = np.array([find(x) for x in range(n_pts)])
+            while True:  # every point straight to its root (find on each point, vectorized)
+                up = parent[parent]
+                if np.array_equal(up, parent):
+                    break
+                parent[:] = up
+            roots = parent.copy()
             for root in np.unique(roots[pts]):
                 members = np.flatnonzero(roots == root)
                 if self.debug is not None:
@@ -1548,7 +1546,13 @@ class World:
                         merged = True
                     elif np.abs(shift[:, i] - shift[:, j] - o).max() > 1.0:  # (sums of whole periods: exact)
                         wrapped.add(ri)
-            roots = np.array([find(x) for x in range(n_pts)])
+            while True:  # every point straight to its root with its total shift (find on each point, vectorized;
+                up = parent[parent]  # pointer jumping: roots hold shift 0, so they stay put)
+                if np.array_equal(up, parent):
+                    break
+                shift += shift[:, parent]
+                parent[:] = up
+            roots = parent.copy()
             for root in np.unique(roots[pts]):
                 members = np.flatnonzero(roots == root)
                 if self.debug is not None:
