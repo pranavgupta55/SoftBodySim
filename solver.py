@@ -98,7 +98,8 @@ def _outline_gap(a, b):
 
 
 class World:
-    """Owns all bodies and steps them. Per CCD span (EnvConfig.ccd_stride substeps, by default the whole frame):
+    """Owns all bodies and steps them, in fixed ticks of one substep (step). Per CCD span (one tick's substep;
+    _substeps called directly with n > 1: EnvConfig.ccd_stride substeps, by default all n):
 
     1. PBD substeps: predict, drag, then springs / shape matching + soft contacts (thickness and friction).
     2. Turn the span's motion into velocities and run continuous collision detection (CCD) on the straight-line
@@ -119,8 +120,10 @@ class World:
         # grab_target + its offset, i.e. the cursor's copy nearest it (offset = minus its image shift)
         self.grab_set = None
         self.grab_radius = None  # the area grab's radius while it is held, else None
-        self._grab_move = np.zeros(2)  # mouse motion since the last step (area grab), spread over its substeps
-        self._grab_step_move = np.zeros(2)  # the current step's share of it
+        self._grab_move = np.zeros(2)  # mouse motion since the last tick (area grab), spread over the next step's ticks
+        self._grab_step_move = np.zeros(2)  # the current tick's share of it
+        self._grab_from = None  # grab_target at the last tick (the point grab's hand moves on from there), or None
+        self._grab_aim = None  # where the point grab pulls during the current tick (between _grab_from and the cursor)
         self.zone_count = 0  # how many CCD passes needed the rigid impact zone fallback (for debugging)
         self.projection_count = 0  # how many CCD passes the inelastic projection fallback fixed (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
@@ -155,10 +158,13 @@ class World:
         self._span_contacts = None  # (candidates, point box lo, point box hi), shared by the span's substeps
         self._span_reach = None  # _solve_contacts' reach, carried across the span's substeps
         self.contact_builds = 0  # contact candidate broad phases run (for debugging)
-        self.last_sim_dt = 0.0  # seconds the last step() simulated (dt * scale after the max_dt clamp and budget)
+        self.last_sim_dt = 0.0  # seconds the last step() simulated (its ticks x tick length)
         self.last_requested_dt = 0.0  # seconds the last step() was asked for (dt * scale, before any clamp)
+        self._tick_acc = 0.0  # s of requested time not yet simulated (less than one tick; see step)
+        self.ticks = 0  # ticks run so far (each one substep of tick_length(); see step)
+        self._step_len = XPBD_REF_H  # the current tick's length (the area grab spreads its push over it)
         self._h = XPBD_REF_H  # the current substep's length (XPBD springs), set by _pbd_substep
-        self._substep_cost = None  # running mean of seconds per substep (EnvConfig.physics_budget)
+        self._substep_cost = None  # running mean of seconds per tick (EnvConfig.physics_budget)
         self.clock = time.perf_counter  # what _substep_cost is measured with (a benchmark may swap in thread time)
 
     def add(self, body, index=None):
@@ -400,6 +406,7 @@ class World:
             self.grabbed = i
             self.grab_shift = shift
             self.grab_target = np.array(pos, dtype=float) - shift if shift.any() else np.array(pos, dtype=float)
+            self._grab_from = None  # the hand starts at the cursor (no move spread from the last grab)
 
     def grab_area(self, pos, radius):
         """Start an area grab: a force field pulling every movable point inside the circle of `radius` around the
@@ -411,6 +418,7 @@ class World:
         self.grab_target = np.array(pos, dtype=float)
         self.grab_radius = float(radius)
         self._grab_move = np.zeros(2)
+        self._grab_from = None
         self._area_pick()
 
     def _area_pick(self):
@@ -460,18 +468,19 @@ class World:
         self.grabbed = self.grab_set = self.grab_radius = None
         self.grab_shift = np.zeros(2)
         self._grab_move = np.zeros(2)
+        self._grab_from = None
 
     def _apply_grab(self, h):
         """Nudge the held point toward the cursor once per substep of length h, so contacts (solved after) can
         out-vote the hand. The pull is set per second, so dragging feels the same at any substep count."""
         if self.grab_set is not None:  # an area grab: each held point moves with the mouse (none while it's still),
-            idx, _, _, w = self.grab_set  # its share of the step's mouse motion x GRAB_AREA_FORCE x its weight
-            frac = h / max(self.last_sim_dt, 1e-12)
+            idx, _, _, w = self.grab_set  # its share of the tick's mouse motion x GRAB_AREA_FORCE x its weight
+            frac = h / max(self._step_len, 1e-12)
             self.P[:, idx] += self._grab_step_move[:, None] * (frac * GRAB_AREA_FORCE * w)
             return
         if self.grabbed is None:
             return
-        gap = self.grab_target - self.P[:, self.grabbed]
+        gap = self._pull_target() - self.P[:, self.grabbed]
         step = gap * -math.expm1(-EnvConfig.grab_stiffness * h)
         length = np.hypot(*step)
         max_step = EnvConfig.grab_max_speed * h
@@ -479,74 +488,109 @@ class World:
             step *= max_step / length
         self.P[:, self.grabbed] += step
 
+    def _pull_target(self):
+        """Where the point grab pulls this tick: the hand's position partway along the cursor's move (_run_ticks)."""
+        return self.grab_target if self._grab_aim is None else self._grab_aim
+
     def _section(self, name):
         """A profiler timing section, or a shared no-op context when no profiler is attached."""
         return _NO_SECTION if self.profiler is None else self.profiler.section(name)
 
-    def step(self, dt, scale=1.0, frames=1.0):
-        """Advance dt * scale seconds. scale is the time scale (slow motion, timectl.py): the step then runs
-        round(substeps * scale) substeps (at least 1) and clamps at max_dt * scale, so the substep length stays what
-        it is at scale 1 (substeps / max_dt from EnvConfig, or this world's env overrides). frames: how many 1/60 s
-        frames this step stands for (EnvConfig.substeps are per 1/60 s frame), e.g. 0.5 at 120 fps: half the
-        substeps, so the substep length doesn't depend on the frame rate. Above EnvConfig.max_substeps per 1/60 s
-        (high time scales) the substeps get longer instead, up to EnvConfig.max_substep_dt. Sets last_sim_dt to the
-        seconds actually simulated."""
+    @staticmethod
+    def tick_length():
+        """Seconds one physics tick simulates: one substep, 1 / (60 * EnvConfig.substeps) (1/240 s at the default
+        4 substeps per 1/60 s frame). Inside step() it is this world's own (its env overrides apply)."""
+        return 1.0 / (60.0 * EnvConfig.substeps)
+
+    def step(self, dt, scale=1.0, frames=None):
+        """Advance dt * scale seconds in whole fixed ticks (see _step): the time goes into an accumulator and every
+        whole tick_length() in it runs, the remainder waits for the next call. A tick is one complete step of one
+        substep, so the trajectory depends only on how many ticks ran, never on how time was cut into calls: 600 x
+        step(1/60) headless and the app's variable frame times give bit-identical states at the same tick count.
+        scale is the time scale (timectl.py): more or fewer ticks per call, never longer or shorter ones. dt is
+        clamped at max_dt first (a hitch drops time instead of piling up ticks), and above scale 1 physics_budget
+        may cap the ticks of a call (the excess time is dropped). frames is ignored (it used to set the substep count
+        per frame; kept so old callers still work). Sets last_sim_dt to the seconds actually simulated (ticks run x
+        tick length), last_requested_dt to dt * scale and last_wraps to the looping moves of every tick run."""
+        self._with_env(self._step, dt, scale)
+
+    def step_frame(self, scale=1.0):
+        """N while paused (timectl.py): one 1/60 s frame at the time scale, round(substeps * scale) ticks (at least
+        one, so 0.25x steps a single 1/240 s tick at a time). Runs them directly: the accumulator is untouched."""
+        self._with_env(self._step_frame, scale)
+
+    def _with_env(self, fn, *args):
         if not self.env:
-            self._step(dt, scale, frames)
+            fn(*args)
             return
         saved = {name: getattr(EnvConfig, name) for name in self.env}
         try:  # this world's overrides apply for the whole step (backend included), then the globals come back
             for name, value in self.env.items():
                 setattr(EnvConfig, name, value)
-            self._step(dt, scale, frames)
+            fn(*args)
         finally:
             for name, value in saved.items():
                 setattr(EnvConfig, name, value)
 
-    def _step(self, dt, scale=1.0, frames=1.0):
-        # before the substeps, where the state is settled and intersection-free
-        if self.pending_walls or any(self.looping.values()):
-            self.last_wraps = looping.loop_step(self)
-        else:
-            self.last_wraps = []
-            if self.period is not None:
-                looping.clear_periodic(self)
+    def _step(self, dt, scale):
+        tick = self.tick_length()
         self.last_requested_dt = dt * scale  # what the caller asked for (before the max_dt clamp)
-        if scale == 1.0 and frames == 1.0:
-            dt, n = min(dt, EnvConfig.max_dt), EnvConfig.substeps
-        else:
-            dt, n = min(dt, EnvConfig.max_dt) * scale, max(1, round(EnvConfig.substeps * scale * frames))
-        # High time scales: fewer, longer substeps than round(substeps * scale * frames) when over a cap (see EnvConfig).
-        # Never below the scale-1 count, so steps at scale <= 1 are untouched (and deterministic)
-        base = max(1, round(EnvConfig.substeps * frames))
-        if EnvConfig.max_substeps is not None:
-            n = min(n, max(base, round(EnvConfig.max_substeps * frames)))
-        budget = None  # most substeps physics_budget allows this step
+        dt = min(dt, EnvConfig.max_dt)  # hitch clamp, on real time: a long stall drops time, no burst of ticks
+        self._tick_acc += dt * scale
+        n = max(0, int(self._tick_acc / tick + 1e-6))  # whole ticks (the tolerance absorbs float rounding)
+        self._tick_acc -= n * tick
+        if abs(self._tick_acc) < 1e-6 * tick:
+            self._tick_acc = 0.0
         if EnvConfig.physics_budget is not None and self._substep_cost:
-            budget = max(base, int(EnvConfig.physics_budget * frames / self._substep_cost))
-            n = min(n, budget)
-        if EnvConfig.max_substep_dt is not None:  # but never longer than max_substep_dt
-            need = math.ceil(dt / EnvConfig.max_substep_dt - 1e-9)
-            if EnvConfig.budget_limits_speed and budget is not None and need > budget:
-                # out of budget: run the budget's substeps at max_substep_dt and simulate less than asked
-                n = max(n, budget)
-                dt = n * EnvConfig.max_substep_dt
-            else:
-                n = max(n, need)
-        self.last_sim_dt = dt  # seconds this step simulates (after the max_dt clamp, time scale and budget)
-        self._grab_step_move, self._grab_move = self._grab_move, np.zeros(2)  # area grab: spread over the substeps
+            # at most physics_budget of wall time per 1/60 s of real time; never below what scale 1 needs (dt / tick
+            # plus one for the carried remainder), so scales <= 1 are never cut. The excess is dropped, not carried
+            base = int(dt / tick + 1e-6) + 1
+            n = min(n, max(base, int(EnvConfig.physics_budget * 60.0 * dt / self._substep_cost)))
+        self._run_ticks(n, tick)
+
+    def _step_frame(self, scale):
+        self.last_requested_dt = scale / 60.0
+        self._run_ticks(max(1, round(EnvConfig.substeps * scale)), self.tick_length())
+
+    def _run_ticks(self, n, tick):
+        """n ticks of length tick. The mouse motion since the last tick (area grab) and the cursor's move (point
+        grab) are spread evenly over them; with n = 0 they wait for the next call."""
+        self.last_sim_dt = n * tick  # seconds simulated (after the max_dt clamp, time scale and budget)
+        self.last_wraps = []
+        if self.debug is not None:
+            self.debug.begin_step(self)  # (the recorder collects every tick of this call)
+        if n == 0:
+            return
+        move, self._grab_move = self._grab_move / n, np.zeros(2)
+        # the point grab's hand moves from where it was at the last tick to the cursor in n even steps. Kept as its
+        # lag behind the cursor, which a periodic wrap of the held body (it moves grab_target) leaves unchanged
+        lag = None if self._grab_from is None else np.asarray(self._grab_from, dtype=float) - self.grab_target
         t0 = self.clock()
-        self._substeps(n, dt / n)
-        # running mean of the time a substep takes, for physics_budget (the first one includes no compile stalls:
+        for k in range(n):
+            self._grab_step_move = move
+            self._grab_aim = None if lag is None or k == n - 1 else self.grab_target + lag * ((n - 1 - k) / n)
+            self._tick(tick)
+            self.ticks += 1
+        self._grab_aim = None
+        self._grab_from = np.array(self.grab_target, dtype=float)
+        # running mean of the time a tick takes, for physics_budget (the first one includes no compile stalls:
         # solver_jit compiles at import / warmup)
         cost = (self.clock() - t0) / n
         self._substep_cost = cost if self._substep_cost is None else 0.7 * self._substep_cost + 0.3 * cost
 
+    def _tick(self, h):
+        """One tick: looping, then one substep of length h with its own CCD pass."""
+        # before the substep, where the state is settled and intersection-free
+        if self.pending_walls or any(self.looping.values()):
+            self.last_wraps += looping.loop_step(self)
+        elif self.period is not None:
+            looping.clear_periodic(self)
+        self._step_len = h
+        self._substeps(1, h)
+
     def _substeps(self, n, h):
         """n substeps of length h, with CCD per substep or per span (ccd_stride, ccd_max_span)."""
         sec = self._section
-        if self.debug is not None:
-            self.debug.begin_step(self)
         stride = n if EnvConfig.ccd_stride is None else max(1, min(int(EnvConfig.ccd_stride), n))
         if EnvConfig.ccd_max_span is not None:  # no CCD span longer than ccd_max_span seconds (see EnvConfig)
             stride = max(1, min(stride, int(EnvConfig.ccd_max_span / h + 1e-9)))
@@ -995,13 +1039,13 @@ class World:
         end = self.P + self.V * t + 0.5 * EnvConfig.gravity[:, None] * t * t * (self.W > 0)
         if self.grabbed is not None:  # the hand pulls toward the cursor at up to grab_max_speed
             g = self.grabbed
-            pull = self.grab_target - self.P[:, g]
+            pull = self._pull_target() - self.P[:, g]
             reach = EnvConfig.grab_max_speed * t
             dist = float(np.hypot(*pull))
             end[:, g] = self.P[:, g] + self.V[:, g] * t + (pull if dist <= reach else pull * (reach / dist))
         if self.grab_set is not None:  # an area grab: the same reach for each held point
-            idx, _, _, w = self.grab_set  # the mouse motion still to come this step
-            push = self._grab_step_move[:, None] * (t / max(self.last_sim_dt, 1e-12) * GRAB_AREA_FORCE * w)
+            idx, _, _, w = self.grab_set  # the mouse motion still to come this tick
+            push = self._grab_step_move[:, None] * (t / max(self._step_len, 1e-12) * GRAB_AREA_FORCE * w)
             end[:, idx] += push
         return np.minimum(self.P, end) - r, np.maximum(self.P, end) + r
 

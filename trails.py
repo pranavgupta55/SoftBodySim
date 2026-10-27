@@ -35,7 +35,7 @@ MAX_ALPHA = 0.6  # opacity of the newest part of a trail
 FADE_BANDS = 4  # opacity steps between MAX_ALPHA and 0 (pixel-art banding instead of a smooth gradient)
 JUMP = 120.0  # world units per frame; a bigger centroid move is a teleport and breaks the trail
 MIN_SEGMENT_PX = 0.35  # segments shorter than this (surface px) are skipped: resting bodies leave nothing
-HISTORY = 96  # ring size in samples: FADE_SECONDS at up to ~120 fps (at 60 fps 45 samples are in use)
+HISTORY = 128  # ring size in samples: FADE_SECONDS at up to ~170 fps (main_opengl.FPS 160; at 60 fps 45 are in use)
 
 
 class Trails:
