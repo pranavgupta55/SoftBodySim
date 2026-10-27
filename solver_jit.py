@@ -141,60 +141,66 @@ def solve_ropes(world):
     return True
 
 
-def image_pairs(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell):
-    """World._image_pairs: the same (point, edge) pairs for each image offset (S: (k, 2), World._image_shifts),
-    grouped by offset in the same order (within an offset sorted by (point, edge), like World._cell_pairs)."""
-    if S.shape[0] == 0:
-        empty = np.empty(0, np.int64)
-        return empty, empty, np.empty((2, 0))
-    i, e, k = image_pair_kernel(*_image_args(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell))
-    return i, e, np.ascontiguousarray(S[k].T)
+def image_ctx(world, point_ok, edge_ok, S):
+    """The image kernels' fixed arguments after the boxes and the cell size: (point mask, edge mask, shifts (k, 2),
+    point body, edge body, body fixed), in the kernels' dtypes. World._image_ctx caches it (per repack and period),
+    so a call only passes the boxes."""
+    return (point_ok.astype(np.bool_), edge_ok.astype(np.bool_), np.ascontiguousarray(S, dtype=np.float64),
+            np.ascontiguousarray(world.point_body, dtype=np.int64),
+            np.ascontiguousarray(world.edge_body, dtype=np.int64), _topology(world)[5])
 
 
-def _image_args(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell):
+def _boxes(plo, phi, elo, ehi):
     c = np.ascontiguousarray
-    return (c(plo), c(phi), c(elo), c(ehi), point_ok.astype(np.bool_, copy=False),
-            edge_ok.astype(np.bool_, copy=False), S, cell, world.point_body, world.edge_body, _topology(world)[5])
+    return c(plo), c(phi), c(elo), c(ehi)
 
 
-def merge_with_images(world, direct, plo, phi, elo, ehi, point_ok, edge_ok, S, cell):
+def image_pairs(plo, phi, elo, ehi, cell, ctx):
+    """World._image_pairs: the same (point, edge) pairs for each image offset (ctx: image_ctx), grouped by offset in
+    the same order (within an offset sorted by (point, edge), like World._cell_pairs)."""
+    return image_pairs_kernel(*_boxes(plo, phi, elo, ehi), cell, *ctx)
+
+
+def merge_with_images(direct, n_edges, plo, phi, elo, ehi, cell, ctx):
     """World._merge_images(direct, World._image_pairs(plo, phi, elo, ehi)) in one kernel call: the same result."""
     i_d, e_d = direct
-    if S.shape[0] == 0:
-        return i_d, e_d, np.zeros((2, i_d.size))
-    pts, eids, ox, oy = image_merge_kernel(np.ascontiguousarray(i_d, dtype=np.int64),
-                                           np.ascontiguousarray(e_d, dtype=np.int64), max(world.edges.shape[1], 1),
-                                           *_image_args(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell))
-    return pts, eids, np.stack([ox, oy])
+    return image_merge_kernel(np.ascontiguousarray(i_d, dtype=np.int64), np.ascontiguousarray(e_d, dtype=np.int64),
+                              n_edges, *_boxes(plo, phi, elo, ehi), cell, *ctx)
 
 
-def image_extras(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell):
+def image_extras(n_edges, plo, phi, elo, ehi, cell, ctx):
     """World._image_extras: the same pairs (in another order, which it leaves open)."""
-    if S.shape[0] == 0:
-        empty = np.empty(0, np.int64)
-        return empty, empty, np.empty((2, 0))
-    i, e, k = image_extras_kernel(max(world.edges.shape[1], 1),
-                                  *_image_args(world, plo, phi, elo, ehi, point_ok, edge_ok, S, cell))
-    return i, e, np.ascontiguousarray(S[k].T)
+    return image_extras_kernel(n_edges, *_boxes(plo, phi, elo, ehi), cell, *ctx)
 
 
 @njit(**NB)
-def image_merge_kernel(i_d, e_d, n_edges, plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body,
+def _shift_cols(S, k):
+    """The (2, m) offsets S[k].T."""
+    off = np.empty((2, k.size))
+    for q in range(k.size):
+        off[0, q], off[1, q] = S[k[q], 0], S[k[q], 1]
+    return off
+
+
+@njit(**NB)
+def image_pairs_kernel(plo, phi, elo, ehi, cell, point_ok, edge_ok, S, point_body, edge_body, body_fixed):
+    """image_pairs: image_pair_kernel with the offsets themselves, (points, edges, offsets (2, m))."""
+    i, e, k = image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body, body_fixed)
+    return i, e, _shift_cols(S, k)
+
+
+@njit(**NB)
+def image_merge_kernel(i_d, e_d, n_edges, plo, phi, elo, ehi, cell, point_ok, edge_ok, S, point_body, edge_body,
                        body_fixed):
     """merge_with_images: image_pair_kernel, then merge_kernel."""
     i, e, k = image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body, body_fixed)
-    if i.size == 0:
-        return i_d.copy(), e_d.copy(), np.zeros(i_d.size), np.zeros(i_d.size)
-    ox, oy = np.empty(i.size), np.empty(i.size)
-    for q in range(i.size):
-        ox[q], oy[q] = S[k[q], 0], S[k[q], 1]
-    return merge_kernel(i_d, e_d, i, e, ox, oy, n_edges)
+    return merge_kernel(i_d, e_d, i, e, k, S, n_edges)
 
 
 @njit(**NB)
-def image_extras_kernel(n_edges, plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body, body_fixed):
+def image_extras_kernel(n_edges, plo, phi, elo, ehi, cell, point_ok, edge_ok, S, point_body, edge_body, body_fixed):
     """image_extras: the image pairs whose direct cell ranges don't overlap, the first image of each (point, edge)
-    only. Returns (points, edges, offset index)."""
+    only. Returns (points, edges, offsets (2, m))."""
     i, e, k = image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body, edge_body, body_fixed)
     keep = np.empty(i.size, np.int64)
     n = 0
@@ -216,7 +222,7 @@ def image_extras_kernel(n_edges, plo, phi, elo, ehi, point_ok, edge_ok, S, cell,
             sel[m] = keep[order[r]]
             m += 1
     sel = sel[:m]
-    return i[sel], e[sel], k[sel]
+    return i[sel], e[sel], _shift_cols(S, k[sel])
 
 
 @njit(**NB)
@@ -323,13 +329,15 @@ def image_pair_kernel(plo, phi, elo, ehi, point_ok, edge_ok, S, cell, point_body
 
 
 @njit(**NB)
-def merge_kernel(i_d, e_d, i_m, e_m, ox_m, oy_m, n_edges):
+def merge_kernel(i_d, e_d, i_m, e_m, k_m, S, n_edges):
     """merge_with_images' merge (World._merge_images): drop image pairs whose key i * n_edges + e is a direct one,
     keep the first image (in list order) of each remaining key, and merge them into the sorted direct list (direct
-    keys are sorted and unique)."""
+    keys are sorted and unique). Image pair q has offset S[k_m[q]]. Returns (points, edges, offsets (2, n)); with
+    no image pair left, the direct arrays themselves (as World._merge_images does without image pairs)."""
     nd, nm = i_d.size, i_m.size
     keys_m = i_m * n_edges + e_m
     fresh = np.empty(nm, np.int64)
+    at = np.empty(nm, np.int64)  # insertion point in the direct list (first direct key above it)
     nf = 0
     for k in range(nm):  # not met directly (binary search in the direct keys)
         key = keys_m[k]
@@ -342,7 +350,10 @@ def merge_kernel(i_d, e_d, i_m, e_m, ox_m, oy_m, n_edges):
                 hi = mid
         if lo >= nd or i_d[lo] * n_edges + e_d[lo] != key:
             fresh[nf] = k
+            at[k] = lo
             nf += 1
+    if nf == 0:
+        return i_d, e_d, np.zeros((2, nd))
     fresh = fresh[:nf]
     order = fresh[np.argsort(keys_m[fresh], kind="mergesort")]  # stable: the first image of a key comes first
     sel = np.empty(nf, np.int64)
@@ -353,17 +364,21 @@ def merge_kernel(i_d, e_d, i_m, e_m, ox_m, oy_m, n_edges):
             ns += 1
     n = nd + ns
     pts, eids = np.empty(n, np.int64), np.empty(n, np.int64)
-    ox, oy = np.zeros(n), np.zeros(n)
-    a, b = 0, 0
-    for k in range(n):  # merge; an image key never equals a direct one
-        if b < ns and (a >= nd or keys_m[sel[b]] < i_d[a] * n_edges + e_d[a]):
-            j = sel[b]
-            pts[k], eids[k], ox[k], oy[k] = i_m[j], e_m[j], ox_m[j], oy_m[j]
-            b += 1
-        else:
-            pts[k], eids[k] = i_d[a], e_d[a]
-            a += 1
-    return pts, eids, ox, oy
+    off = np.zeros((2, n))
+    a = o = 0
+    for b in range(ns):  # merge: the direct run below each image pair (keys ascending), then the pair
+        j = sel[b]
+        c = at[j] - a
+        pts[o:o + c] = i_d[a:a + c]
+        eids[o:o + c] = e_d[a:a + c]
+        o += c
+        a += c
+        pts[o], eids[o] = i_m[j], e_m[j]
+        off[0, o], off[1, o] = S[k_m[j], 0], S[k_m[j], 1]
+        o += 1
+    pts[o:] = i_d[a:]
+    eids[o:] = e_d[a:]
+    return pts, eids, off
 
 
 def ccd_cells(world, D, cell):
@@ -1197,9 +1212,9 @@ def warmup():
     floor_cells(ccd_boxes(P, P, i2, i1)[0], 24.0)
     ccd_narrow(P, P, i2, i1, e, e, 0.01, 1e-6, f, f)
     impulse_pass(P.copy(), W, P, i2, i1, e, e, f, f, f, e, 0.004, 0.25, f, f)
-    img = (P, P, np.zeros((2, 2)), np.zeros((2, 2)), np.ones(4, np.bool_), np.ones(2, np.bool_), np.zeros((1, 2)), 24.0,
+    img = (P, P, np.zeros((2, 2)), np.zeros((2, 2)), 24.0, np.ones(4, np.bool_), np.ones(2, np.bool_), np.zeros((1, 2)),
            np.array([0, 0, 1, 1], np.int64), np.zeros(2, np.int64), b)
     image_merge_kernel(np.array([0, 1], np.int64), np.zeros(2, np.int64), 2, *img)
-    image_pair_kernel(*img)
+    image_pairs_kernel(*img)
     image_extras_kernel(2, *img)
     bounce_pass(P, P.copy(), W, np.array([0, 2, 4], np.int64), np.array([0, 1, 2], np.int64), i2, i1, e, f, 3.0, 0.004)
