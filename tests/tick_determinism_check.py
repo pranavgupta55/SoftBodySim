@@ -8,6 +8,8 @@ backend: "cpu" (default) or "gpu". For each preset (default: penrose/evolved 1, 
 2. chunked: the app's variable frame times, random chunks uniform in 1/200 .. 1/25 s (seeded; the ones over max_dt
    are clamped, so fewer ticks run), then flushed with half-tick steps to run 1's tick count.
 3. slow: the same chunks at time scale 0.5, then a headless run flushed to its tick count.
+4. split: calls of 1, 2, 3, 5, 1, 2, ... ticks (step(k * tick length)), so CCD spans (World.span_ticks ticks,
+   aligned to the tick counter) begin in one call and end in a later one, against 1's tick count.
 Each pair must end with bitwise equal positions and velocities (np.array_equal). On the GPU backend the MLX solves
 use float32 atomics, so it reports the largest difference instead (and run-to-run with identical chunking).
 Exit status 1 if a CPU comparison differs.
@@ -55,6 +57,17 @@ def chunked(name, seconds, scale, seed):
     return w
 
 
+def split(name, ticks, sizes=(1, 2, 3, 5)):
+    w = build(name)
+    k = 0
+    while w.ticks < ticks:
+        n = min(sizes[k % len(sizes)], ticks - w.ticks)
+        w.step(n * w.tick_length())
+        k += 1
+    flush(w, ticks)
+    return w
+
+
 def diff(a, b):
     """(equal, max |dP|, max |dV|)"""
     eq = np.array_equal(a.P, b.P) and np.array_equal(a.V, b.V)
@@ -77,6 +90,8 @@ def main(argv):
         d = headless(name, 0)
         flush(d, c.ticks)
         rows.append(("scale 0.5 vs headless", c, d, f"{c.ticks} ticks"))
+        e = split(name, a.ticks)
+        rows.append(("1/2/3/5 split vs headl.", e, a, f"{e.ticks} ticks, spans of {a.span_ticks(a.tick_length())}"))
         if EnvConfig.backend != "cpu":
             a2 = headless(name, frames)
             rows.append(("headless run-to-run", a, a2, f"{a.ticks} ticks"))

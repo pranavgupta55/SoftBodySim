@@ -173,7 +173,10 @@ def _world_state(world, index, arr, col):
 def capture(world, box=None, as_json=True):
     """The world's bodies, hooks and ropes (and optional world settings, "state") as a dict. as_json: plain lists
     (for json.dump); False keeps numpy copies (the cheaper in-memory undo snapshot). box (width, height, inset)
-    marks the walls (also any body in world.walls)."""
+    marks the walls (also any body in world.walls). Ends the world's open CCD span first (World.settle): a mid-span
+    state isn't CCD-checked, may overlap, and a scene saved from it could fail parse's intersection check."""
+    if hasattr(world, "settle"):
+        world.settle()
     arr = (lambda a: np.asarray(a).tolist()) if as_json else (lambda a: np.array(a))
     col = (lambda c: [int(v) for v in c]) if as_json else tuple
     index = {id(b): k for k, b in enumerate(world.bodies)}
