@@ -27,6 +27,10 @@ class TimeControl:
         self.scales = tuple(scales)
         self.index = self.scales.index(scale)
         self.pending = 0  # frame steps requested (N) and not yet run
+        self.actual = None  # delivered speed (simulated / wall seconds) over the last WINDOW s of running frames
+        self._window = []  # [(wall s, simulated s)] of recent running frames
+
+    WINDOW = 1.0  # s of running frames the delivered speed is averaged over
 
     @property
     def scale(self):
@@ -47,6 +51,27 @@ class TimeControl:
     def label(self):
         """The scale as a percentage, as shown on the Controls card, e.g. "1%", "25%", "100%", "10000%"."""
         return f"{self.scale * 100:g}%"
+
+    def note(self, wall, sim):
+        """A running frame took `wall` seconds and simulated `sim` (World.last_sim_dt), for the delivered speed."""
+        self._window.append((wall, sim))
+        total = sum(w for w, _ in self._window)
+        while len(self._window) > 1 and total - self._window[0][0] >= self.WINDOW:
+            total -= self._window.pop(0)[0]
+        self.actual = sum(t for _, t in self._window) / total if total > 0 else None
+
+    def reset_actual(self):
+        """Forget the delivered speed (paused: nothing is being delivered)."""
+        self._window.clear()
+        self.actual = None
+
+    def readout(self, short=False):
+        """The Controls card's speed text: "speed 500%", or "speed 500% (actual 380%)" while the sim delivers under
+        95% of the request (a slow machine, the max_dt clamp or EnvConfig.budget_limits_speed). short: "500%" /
+        "500% (380%)", for a narrow card."""
+        lagging = self.actual is not None and self.actual < 0.95 * self.scale
+        extra = (f" ({self.actual * 100:.0f}%)" if short else f" (actual {self.actual * 100:.0f}%)") if lagging else ""
+        return (self.label() if short else f"speed {self.label()}") + extra
 
     def request_step(self):
         self.pending += 1

@@ -577,7 +577,10 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         stepped = not editor.paused
         if stepped:
             world.step(*time_ctl.step_args(dt / fps), frames=60 / fps)
+            time_ctl.note(dt / fps, getattr(world, "last_sim_dt", 0.0))  # the delivered speed (Controls card)
             overlays.after_step(world)
+        else:
+            time_ctl.reset_actual()
         for _ in range(time_ctl.take_steps() if editor.paused else 0):  # N: one nominal frame per press
             world.step(*time_ctl.step_args(1 / fps), frames=60 / fps)
             overlays.after_step(world)
