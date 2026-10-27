@@ -118,11 +118,20 @@ float mat_pattern_value(int pattern, vec2 q) {
     return 1.0;
 }
 
-// col with the pattern applied at rest-frame position rest_px (render px)
+// The pattern's average value over many cells (what a sub-pixel pattern should read as): dots cover pi 0.3^2 of
+// a cell, noise averages about 0.5.
+float mat_pattern_mean(int pattern) {
+    return pattern == PATTERN_DOTS ? 1.0 - 3.14159265 * 0.09 : 0.5;
+}
+
+// col with the pattern applied at rest-frame position rest_px (render px). Cells under about 2 px can't be drawn
+// (they alias into moire), so the pattern fades to its mean there; big cells are untouched.
 vec3 mat_patterned(Mat m, vec3 col, vec2 rest_px) {
     if (m.pattern == PATTERN_NONE || m.pattern_strength <= 0.0) {
         return col;
     }
-    float v = mat_pattern_value(m.pattern, rest_px / max(m.pattern_scale, 1e-3));
+    float cell_px = max(m.pattern_scale, 1e-3);
+    float v = mat_pattern_value(m.pattern, rest_px / cell_px);
+    v = mix(mat_pattern_mean(m.pattern), v, smoothstep(1.0, 2.5, cell_px));
     return col * (1.0 - m.pattern_strength * (1.0 - v));
 }
