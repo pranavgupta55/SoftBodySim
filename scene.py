@@ -148,6 +148,11 @@ DIAMONDS_SEED = 12  # its tiling colors, shape placement and palette picks (and 
 DIAMOND_SIDE = 28.8  # edge length of its diamonds (world units)
 DIAMOND_CHAIN_WIDTH = 120.0  # a cluster of touching diamonds is at most this wide (tall is fine): no long ledges
 CUP_GAP = 40.0  # diamonds whose corners are closer than this can't form a cup either
+# the cup rule (diamonds_map.pick_diamonds' `cups`): "pair" (forms_cup on each pair of diamonds, corners up to
+# CUP_GAP apart counting as touching) or "outline" (only touching tiles; a cup is an upward notch in the outline of
+# their union, cup_at). Switch the diamonds tiling over by setting this to "outline" (its saved layouts are trusted,
+# so they load the same; new random ones change)
+DIAMONDS_CUPS = "pair"
 # shape spawning, for a new layout (each saved layout keeps its own: the file's "spawn", over these defaults)
 DIAMONDS_SPAWN = {
     "shapes": 168,  # falling soft shapes
@@ -171,24 +176,29 @@ PENROSE_SEED = 1  # the pentagrid offsets' seed of a new layout (saved layouts k
 # 18 gives 12-17 (and the density is still reached; at 80 it isn't, ~390 of 464 tiles)
 PENROSE_ROTATION = 18.0  # degrees: no horizontal edges
 PENROSE_MIN_SLOPE = 0.0  # pick only tiles whose edges all slope at least this (diamonds_map.steep_tiles; 0: all)
-PENROSE_CUP_GAP = 60.0  # CUP_GAP for the penrose tiling
+PENROSE_CUP_GAP = 60.0  # CUP_GAP for the penrose tiling (the "pair" rule only: layouts saved before "outline")
+# Since 2026-10-26 new penrose layouts use the "outline" cup rule (see DIAMONDS_CUPS): only touching tiles count, so
+# 50% more tiles fit (695 on 1800x1169; at gap 60 only ~578 did). Files without "cups" keep "pair"
+PENROSE_CUPS = "outline"
 # a fat rhombus per golden ratio of thin ones: the mean tile area
 _PHI = (1 + math.sqrt(5)) / 2
 PENROSE_MEAN_AREA = PENROSE_SIDE ** 2 * (_PHI * math.sin(math.radians(72)) + math.sin(math.radians(36))) / (_PHI + 1)
 PENROSE_SPAWN = {
     **DIAMONDS_SPAWN,
     # tiles per square world unit: the same share of the world's area as maps/diamonds/evolved 3 (302 diamonds,
-    # each a 60 degree rhombus of edge DIAMOND_SIDE): 10.3%, ~464 Penrose tiles on 1800x1169
-    "density": 302 * DIAMOND_SIDE ** 2 * math.sin(math.radians(60)) / PENROSE_MEAN_AREA / (1800 * 1169),
+    # each a 60 degree rhombus of edge DIAMOND_SIDE): 10.3%, ~464 Penrose tiles on 1800x1169; then 50% more
+    # (15.5%, 695 tiles), which the outline cup rule leaves room for
+    "density": 1.5 * 302 * DIAMOND_SIDE ** 2 * math.sin(math.radians(60)) / PENROSE_MEAN_AREA / (1800 * 1169),
 }
 PENROSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "penrose")
 
 
 def _layout_tiling(layout, tiling=None, pentagrid_seed=None):
-    """{"tiling": ..., "pentagrid_seed": ..., "edge": ..., "rotation": ..., "min_slope": ..., "cup_gap": ...} a
-    diamonds world is built on: the layout file's own (if `layout` is one), else `tiling` (a name, "diamonds" by
-    default, or such a dict) and, for "penrose", `pentagrid_seed` (PENROSE_SEED) and the PENROSE_* defaults where
-    not given."""
+    """{"tiling": ..., "pentagrid_seed": ..., "edge": ..., "rotation": ..., "min_slope": ..., "cups": ...,
+    "cup_gap": ...} a diamonds world is built on: the layout file's own (if `layout` is one; a penrose file without
+    "cups" is "pair"), else `tiling` (a name, "diamonds" by default, or such a dict) and, for "penrose",
+    `pentagrid_seed` (PENROSE_SEED) and the PENROSE_* defaults where not given ("cup_gap" only for the "pair" rule).
+    The diamonds tiling gets no "cups" key (build_diamonds_scene uses DIAMONDS_CUPS)."""
     from diamonds_map import layout_tiling
     if isinstance(layout, str):
         info = layout_tiling(layout)
@@ -201,7 +211,9 @@ def _layout_tiling(layout, tiling=None, pentagrid_seed=None):
         info.setdefault("edge", PENROSE_SIDE)
         info.setdefault("rotation", PENROSE_ROTATION)
         info.setdefault("min_slope", PENROSE_MIN_SLOPE)
-        info.setdefault("cup_gap", PENROSE_CUP_GAP)
+        info.setdefault("cups", PENROSE_CUPS)
+        if info["cups"] == "pair":
+            info.setdefault("cup_gap", PENROSE_CUP_GAP)
     return info
 
 
@@ -234,9 +246,9 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     dropped and added (diamonds_map.pick_diamonds).
     tiling: "diamonds" (default) or "penrose": a Penrose P3 tiling (diamonds_map.penrose_tiles, edge PENROSE_SIDE,
     rotated PENROSE_ROTATION, pentagrid offsets seeded by `pentagrid_seed`, default PENROSE_SEED) whose picked rhombi
-    are the obstacles, by the same cup / cluster rules (cup gap PENROSE_CUP_GAP); or a dict of those (see
-    _layout_tiling). A layout file's own tiling ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope",
-    "cup_gap") overrides both."""
+    are the obstacles, by the cluster rule and the PENROSE_CUPS cup rule; or a dict of those (see _layout_tiling).
+    A layout file's own tiling ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap")
+    overrides both. The diamonds tiling's cup rule is DIAMONDS_CUPS."""
     from diamonds_map import (lattice_diamonds, layout_shift, load_layout, penrose_tiles, pick_diamonds,
                               place_hexagons, shift_diamonds, steep_tiles)
     from palettes import DEFAULT, apply_palette
@@ -258,7 +270,8 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
         tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed, y0=DIAMOND_SIDE)
     keys, size = load_layout(layout) if isinstance(layout, str) else layout if layout is not None else (None, None)
     gap = float(info.get("cup_gap", CUP_GAP))
-    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=gap,
+    cups = info.get("cups", DIAMONDS_CUPS)
+    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=gap, cups=cups,
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
                              add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)))
     if isinstance(layout, str):  # the layout file's own offset (diamonds_map.layout_shift), if any
