@@ -208,6 +208,19 @@ def _corner_gap(p, q):
     return float(np.hypot(*(p[:, :, None] - q[:, None, :])).min())
 
 
+def _snap(q, p, near):
+    """q (2, n) with each corner closer than `near` to a corner of p moved onto that corner: a near miss counts as
+    touching, so the outline cup test sees a U / V across the small gap."""
+    d = np.hypot(*(q[:, :, None] - p[:, None, :]))  # (q corner, p corner)
+    j = d.argmin(axis=1)
+    hit = d[np.arange(q.shape[1]), j] < near
+    if not hit.any():
+        return q
+    q = q.copy()
+    q[:, hit] = p[:, j[hit]]
+    return q
+
+
 def _stack(diamonds):
     """The diamonds' corners as one (n, 2, k) float array, or None if their corner arrays differ in shape."""
     shapes = {np.shape(d[0]) for d in diamonds}
@@ -248,10 +261,12 @@ def layout_tiling(path):
     A penrose file without "cups" predates the outline rule: "pair"."""
     with open(path) as f:
         data = json.load(f)
-    keys = ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap")
+    keys = ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap", "near")
     info = {k: data[k] for k in keys if k in data} or {"tiling": "diamonds"}
     if info["tiling"] == "penrose":
         info.setdefault("cups", "pair")
+        if info["cups"] == "outline":
+            info.setdefault("near", 0.0)  # saved before the near-miss ban
     return info
 
 
@@ -282,7 +297,8 @@ def save_layout(path, diamonds, size, note="", spawn=None, keys=None, tiling=Non
 
 
 def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, gap=0.0, max_width=None,
-                  layout=None, layout_size=None, remove=0, add=0, add_seed=0, count=None, cups="pair", cup_log=None):
+                  layout=None, layout_size=None, remove=0, add=0, add_seed=0, count=None, cups="pair", cup_log=None,
+                  near=30.0):
     """A seeded random `fraction` (or `count`) of the diamonds (corners, rgb, face) lying wholly inside the world (0, 0, world_w,
     world_h), which wraps on every side (looping, no walls). A diamond that would form a cup with one already picked
     (forms_cup; corners up to `gap` apart count as touching) is skipped and the next random one tried, as is one that
@@ -321,8 +337,9 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     if cups not in ("pair", "outline"):
         raise ValueError(f"cups: {cups!r}")
     gap = 0.0 if outline else gap  # the outline rule links only tiles that touch
-    link = max(gap, 1e-6 * size)
-    reach = 2 * size + gap  # centers farther apart than this can't touch, cup or link
+    near = float(near) if outline else 0.0  # near-miss ban: corners closer than this count as touching (snapped)
+    link = max(gap, near, 1e-6 * size)
+    reach = 2 * size + max(gap, near)  # centers farther apart than this can't touch, cup or link
     # each diamond's center = its corners' mean, the same reduction as d[0].mean(axis=1), for all of them at once
     centers = corners.mean(axis=2) if corners is not None else np.array([d[0].mean(axis=1) for d in inside])
     shifts = [(dx, dy) for dx in (0.0, -world_w, world_w) for dy in (0.0, -world_h, world_h)]
@@ -341,7 +358,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                 break
             if k in cluster or k in banned:
                 continue
-            p, near, touching, ok = inside[k][0], [], [], True
+            p, linked, touching, ok = inside[k][0], [], [], True
             n = len(chosen)
             far = ((np.abs(cx_picked[:n, None] + shift_x - centers[k][0]) > reach)
                    | (np.abs(cy_picked[:n, None] + shift_y - centers[k][1]) > reach))
@@ -353,8 +370,8 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                 elif _corner_gap(p, q) <= link:
                     if dx:
                         ok = trusted  # no cluster through the left / right seam
-                    near.append(m)
-                    touching.append(q)
+                    linked.append(m)
+                    touching.append(_snap(q, p, near) if near > 0 else q)
                 if not ok:
                     break
             if ok and outline and not trusted:
@@ -365,7 +382,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                         cup_log.append(cup_pattern(cup[1]))
             if not ok:
                 continue
-            merged = {id(c): c for c in (cluster[m] for m in near)}.values()
+            merged = {id(c): c for c in (cluster[m] for m in linked)}.values()
             members = list(dict.fromkeys([int(k)] + [m for c in merged for m in c]))
             if max_width is not None and not trusted:
                 xs = np.concatenate([inside[m][0][0] for m in members])
