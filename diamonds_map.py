@@ -526,7 +526,9 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                                    .sum(axis=1).mean() ** 0.5) for j in cand]
                 else:
                     score = np.abs((centers[cand] - centers[k]) @ normal).tolist()
-                noise = 0.1 if kind == "round" else 0.35  # round: radii of gyration differ little, keep noise small
+                # round: radii of gyration differ little, so a small noise keeps blobs circular; settings
+                # "round_noise" (x edge, default 0.1) larger lets them grow irregular (still touching, so connected)
+                noise = settings.get("round_noise", 0.1) if kind == "round" else 0.35
                 score = np.array(score) + rng.uniform(0.0, noise * size, len(cand))
                 j = cand[int(np.argmin(score))]
                 tried.add(j)
