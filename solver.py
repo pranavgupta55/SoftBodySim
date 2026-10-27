@@ -741,18 +741,34 @@ class World:
         t = self._image_topo
         if t is None or t[0] is not self.edges:
             wall = np.array([looping.is_world_wall(self, b) for b in self.bodies], dtype=bool)
-            t = (self.edges, ~wall[self.point_body], ~wall[self.edge_body], None, None)
+            t = (self.edges, ~wall[self.point_body], ~wall[self.edge_body], None, None, None)
             self._image_topo = t
         return t[1], t[2]
 
     def _image_shifts(self):
-        """looping.image_shifts(self.period) as one (k, 2) array, cached per period (the kernels' form)."""
-        self._image_topology()  # (rebuilt on a repack)
+        """looping.image_shifts(self.period) as one (k, 2) array, cached per period (the kernels' form). The period
+        array is remembered by identity too (looping._set_periodic sets a new one, nothing edits it in place), so
+        repeated calls in a frame skip the value compare."""
         t = self._image_topo
-        if t[3] is None or not np.array_equal(t[3], self.period):
-            t = self._image_topo = t[:3] + (self.period.copy(),
-                                             np.array(looping.image_shifts(self.period), dtype=float).reshape(-1, 2))
+        if t is None or t[0] is not self.edges:  # (rebuilt on a repack)
+            self._image_topology()
+            t = self._image_topo
+        p = self.period
+        if t[3] is not p:
+            if t[3] is None or not np.array_equal(t[3], p):
+                t = t[:3] + (p, np.array(looping.image_shifts(p), dtype=float).reshape(-1, 2), None)
+            else:
+                t = t[:3] + (p,) + t[4:]
+            self._image_topo = t
         return t[4]
+
+    def _image_ctx(self):
+        """solver_jit.image_ctx (the image kernels' masks, shifts and body tables), cached with _image_shifts."""
+        S = self._image_shifts()
+        t = self._image_topo
+        if t[5] is None:
+            t = self._image_topo = t[:5] + (solver_jit.image_ctx(self, t[1], t[2], S),)
+        return t[5]
 
     def _image_pairs(self, plo, phi, elo, ehi):
         """(point, edge, offset (2, m)) pairs that meet only through an image: the point's float box plo..phi moved
@@ -761,11 +777,10 @@ class World:
         are tried, so this costs O(points near a seam). Same-body pairs are left out (a body meets its own image
         only if it is bigger than the period). solver_jit.image_pairs gives the same pairs per offset (the merge then
         orders them the same), so the two CPU paths stay identical."""
+        if _jit():
+            return solver_jit.image_pairs(plo, phi, elo, ehi, EnvConfig.cell_size, self._image_ctx())
         empty = np.empty(0, dtype=np.int64)
         point_ok, edge_ok = self._image_topology()
-        if _jit():
-            return solver_jit.image_pairs(self, plo, phi, elo, ehi, point_ok, edge_ok, self._image_shifts(),
-                                          EnvConfig.cell_size)
         out_i, out_e, out_o = [], [], []
         if edge_ok.any():
             cell = EnvConfig.cell_size
@@ -803,8 +818,8 @@ class World:
         (pts, eids, off (2, m)), in no particular order: for the GPU backend, which runs them as a second contact
         list next to its own direct pairs (its atomics don't keep an order anyway)."""
         if _jit():
-            return solver_jit.image_extras(self, plo, phi, elo, ehi, *self._image_topology(), self._image_shifts(),
-                                           EnvConfig.cell_size)
+            return solver_jit.image_extras(max(self.edges.shape[1], 1), plo, phi, elo, ehi, EnvConfig.cell_size,
+                                           self._image_ctx())
         i, e, off = self._image_pairs(plo, phi, elo, ehi)
         if i.size == 0:
             return i, e, off
@@ -819,8 +834,8 @@ class World:
     def _with_images(self, direct, boxes):
         """_merge_images(direct, _image_pairs(*boxes)): with the kernels in one call (the same result)."""
         if _jit():
-            return solver_jit.merge_with_images(self, direct, *boxes, *self._image_topology(), self._image_shifts(),
-                                                EnvConfig.cell_size)
+            return solver_jit.merge_with_images(direct, max(self.edges.shape[1], 1), *boxes, EnvConfig.cell_size,
+                                                self._image_ctx())
         return self._merge_images(direct, self._image_pairs(*boxes))
 
     def _merge_images(self, direct, image):
