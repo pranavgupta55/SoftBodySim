@@ -271,8 +271,9 @@ def _with_contents(data, world, box):
     """data plus the world's contents; the world's own friction / damping / terminal velocity (World.env) go in
     data["env"] only (a load puts them back into World.env), so a file states each setting once."""
     data.update(capture(world, box))
-    if isinstance(getattr(world, "lighting", None), bool):  # the lit renderer's switch (a file's, not an undo step's)
-        data.setdefault("state", {})["lighting"] = world.lighting
+    for key in ("lighting", "caustics"):  # the lit renderer's switches (a file's, not an undo step's)
+        if isinstance(getattr(world, key, None), bool):
+            data.setdefault("state", {})[key] = getattr(world, key)
     ids = {}  # chain ids numbered 1, 2, ... in order (a load gives them fresh ones anyway): stable save -> load -> save
     for d in data["bodies"] + data["ropes"]:
         if "chain_id" in d:
@@ -622,7 +623,7 @@ def install(world, bodies, ropes, hooks, state=None):
     world._rebuild()
 
 
-LIGHTING_KEYS = ("lights", "ambient", "lighting")
+LIGHTING_KEYS = ("lights", "ambient", "lighting", "caustics")
 
 
 def _install_lighting(world, key, value):
@@ -630,8 +631,8 @@ def _install_lighting(world, key, value):
         world.lights = list(value)
     elif key == "ambient":
         world.ambient = tuple(value)
-    else:
-        world.lighting = bool(value)
+    else:  # "lighting" / "caustics": the lit renderer's switches
+        setattr(world, key, bool(value))
 
 
 def apply_env(env, world=None):

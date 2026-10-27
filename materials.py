@@ -67,8 +67,12 @@ def resolve(preset=None, overrides=None):
 
 
 def of_body(body):
-    """A body's effective Material (its `material` / `material_over`, both optional)."""
-    return resolve(getattr(body, "material", None), getattr(body, "material_over", None))
+    """A body's effective Material (its `material` / `material_over`, both optional). World box walls (wall_side)
+    cast no shadow unless their material says so: they'd shade the whole room from a directional light."""
+    over = getattr(body, "material_over", None)
+    if getattr(body, "wall_side", None) is not None and "casts_shadow" not in (over or {}):
+        over = {**(over or {}), "casts_shadow": False}
+    return resolve(getattr(body, "material", None), over)
 
 
 # ---------------- GPU packing (gl_world.GLWorld.material_tex, shaders/material.glsl)
