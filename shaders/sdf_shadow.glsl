@@ -19,6 +19,7 @@
 const int SDF_EXIT_STEPS = 16;   // walk-out steps from inside a body
 const int SDF_MARCH_STEPS = 64;   // sphere-tracing steps toward the light
 const float SDF_MIN_STEP = 1.0;  // px
+const float SDF_INSIDE_STEP = 0.5;  // px, march step while inside an occluder
 const float SDF_OWN_MARGIN = 1.0;  // px: see sdf_shadow's own-body phase
 
 // The field at p (bilinear). Off a non-periodic texture, a lower bound from the nearest texel centre (occluders
@@ -62,7 +63,10 @@ float sdf_shadow(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softness_px
             res = min(res, k * h / s);
             if (res <= -1.0) break;
         }
-        s += max(abs(h), SDF_MIN_STEP);
+        // Inside an occluder (h < 0: a penumbra's dark side, the ray clipping a corner) step a fixed
+        // SDF_INSIDE_STEP: stepping |h| there makes the sampled minimum of h jump as the step positions slide from
+        // pixel to pixel, which drew wavy contour bands across penumbras. Deep inside, res hits -1 and breaks.
+        s += h < 0.0 ? SDF_INSIDE_STEP : max(h, SDF_MIN_STEP);
     }
     res = clamp(res, -1.0, 1.0);
     return 0.25 * (1.0 + res) * (1.0 + res) * (2.0 - res);
