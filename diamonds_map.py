@@ -406,6 +406,8 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                 ok = False
                 if cup_log is not None:
                     cup_log.append(cup_pattern(cup[1]))
+        if ok and not trusted and sealed and any(m in sealed and m not in growing for m in linked):
+            ok = False  # finished archetype clusters keep their shape: nothing else links onto them
         if not ok:
             return False
         merged = {id(c): c for c in (cluster[m] for m in linked)}.values()
@@ -423,6 +425,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     settings = cluster_settings(clusters)
     touch = 1e-3 * size  # tiles of the tiling that share an edge or a corner have corners this close
     archetypes = []  # (kind, [picked indices], angle or None)
+    sealed, growing = set(), set()  # picked tiles of archetype clusters; those of the one growing now
 
     def touching_tiles(k):  # tiles of the tiling (inside the world) sharing an edge or a corner with tile k
         near_k = np.flatnonzero(np.hypot(*(centers - centers[k]).T) <= 2 * size + touch)
@@ -442,9 +445,11 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
             if not free:
                 break
             k = free[int(rng.integers(len(free)))]
+            growing.clear()
             if not try_add(k):
                 continue
             members, tried, fails = [k], {k}, 0
+            growing.add(k)
             # the kind behind its round_share of the tiles placed so far (round ones lose more to the cup veto)
             n_round = sum(len(m) for kd, m, _ in archetypes if kd == "round")
             n_all = sum(len(m) for _, m, _ in archetypes)
@@ -476,15 +481,19 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                                    .sum(axis=1).mean() ** 0.5) for j in cand]
                 else:
                     score = np.abs((centers[cand] - centers[k]) @ normal).tolist()
-                score = np.array(score) + rng.uniform(0.0, 0.35 * size, len(cand))  # some randomness
+                noise = 0.1 if kind == "round" else 0.35  # round: radii of gyration differ little, keep noise small
+                score = np.array(score) + rng.uniform(0.0, noise * size, len(cand))
                 j = cand[int(np.argmin(score))]
                 tried.add(j)
                 if try_add(j):
                     members.append(j)
+                    growing.add(j)
                 else:
                     fails += 1
             placed += len(members)
             archetypes.append((kind, members, angle))
+            sealed.update(members)
+        growing.clear()
         return placed
 
     if layout is None:
