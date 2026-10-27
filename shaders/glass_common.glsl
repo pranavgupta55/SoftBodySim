@@ -76,19 +76,94 @@ vec2 edge_normal(ivec2 c, vec2 fallback) {
     return fallback;
 }
 
-// The outward normal of the boundary a ray crossed between `inner` (the body pixel) and `air` (the point just outside
-// it): with the SDF its gradient taken on the air side (smooth, and right on outlines, which carry a flat G-buffer
-// normal); else edge_normal of the body pixel.
-vec2 hit_normal(vec2 inner, vec2 air, vec2 fallback) {
 #ifdef USE_SDF
-    vec2 sg = vec2(sdf_at(u_sdf, air + vec2(2.0, 0.0), u_period) - sdf_at(u_sdf, air - vec2(2.0, 0.0), u_period),
-                   sdf_at(u_sdf, air + vec2(0.0, 2.0), u_period) - sdf_at(u_sdf, air - vec2(0.0, 2.0), u_period));
+vec2 sdf_grad(vec2 q, float h) {
+    return vec2(sdf_at(u_sdf, q + vec2(h, 0.0), u_period) - sdf_at(u_sdf, q - vec2(h, 0.0), u_period),
+                sdf_at(u_sdf, q + vec2(0.0, h), u_period) - sdf_at(u_sdf, q - vec2(0.0, h), u_period));
+}
+#endif
+
+#ifdef RIM_SMOOTH_PX
+// A smooth outward boundary normal for the rim pixel c of a body (caustics_normals.frag stores it per pixel for the
+// caustics march, u_rim). The sdf is the distance to the rasterised outline: its gradient at the boundary follows the
+// pixel stairs, up to ~20 degrees off the real edge, which fans refracted light into streaks. The G-buffer bevel
+// normal of the body's rim pixels is the polygon edge's own perpendicular (analytic, F's world_fill), but the outline
+// drawn over the rim carries a flat normal: from taps across +-RIM_SMOOTH_PX along the tangent, look inward up to
+// RIM_DEPTH px for the first pixel of this body with a bevel normal, and average those (tent weights), which also
+// blends the polygon's facets into a smooth curve. Taps more than RIM_CORNER (a cosine) off the centre tap's normal
+// are past a sharp corner (a lens tip, a box corner): left out, so corners stay sharp. vec2(0) if c has none.
+vec2 rim_normal(ivec2 c) {
+    uint body = mat_id(c);
+    vec2 n0 = bevel_n(c);  // only the direction to search inward along
+#ifdef USE_SDF
+    if (dot(n0, n0) <= 0.01) n0 = sdf_grad(vec2(c) + 0.5, 1.5);  // outline pixels carry a flat normal
+#endif
+    n0 = dot(n0, n0) > 1e-6 ? normalize(n0) : edge_normal(c, vec2(0.0));
+    if (body == 0u || dot(n0, n0) < 0.5) return vec2(0.0);
+    vec2 tg = vec2(-n0.y, n0.x), q = vec2(c) + 0.5;
+    vec2 acc = vec2(0.0), centre = vec2(0.0);
+    for (int j = 0; j <= 2 * RIM_TAPS; j++) {
+        int i = (j + 1) / 2 * ((j & 1) == 1 ? 1 : -1);  // 0, 1, -1, 2, -2, ...: the centre tap first
+        float f = float(i) / float(RIM_TAPS);
+        vec2 base = q + tg * (f * RIM_SMOOTH_PX);
+        for (int k = -1; k <= RIM_DEPTH; k++) {
+            ivec2 d = pix(base - n0 * float(k));
+            vec2 b = bevel_n(d);
+            if (mat_id(d) == body && dot(b, b) > 0.01) {
+                b = normalize(b);
+                if (j == 0) centre = b;
+                if (j == 0 || dot(b, centre) > RIM_CORNER) acc += (1.0 - 0.5 * abs(f)) * b;
+                break;
+            }
+        }
+        if (j == 0 && dot(centre, centre) == 0.0) return vec2(0.0);
+    }
+    return normalize(acc);
+}
+#endif
+
+#ifdef USE_RIM_TEX
+uniform sampler2D u_rim;  // rim_normal per pixel (caustics_normals.frag), 0 where there is none
+#endif
+
+// The outward normal of the boundary a ray crossed between `inner` (the body pixel) and `air` (the point just outside
+// it): the smoothed rim normal when the includer has u_rim (USE_RIM_TEX); else with the SDF its gradient taken on the
+// air side (smooth-ish, and right on outlines, which carry a flat G-buffer normal); else edge_normal of the body pixel.
+vec2 hit_normal(vec2 inner, vec2 air, vec2 fallback) {
+#ifdef USE_RIM_TEX
+    // bilinear over the rim texels around `inner` that have a normal (a per-pixel constant would bunch the rays
+    // crossing one pixel into fine streaks)
+    vec2 g = inner - 0.5, fl = floor(g), fr = g - fl;
+    vec2 rn = vec2(0.0);
+    for (int k = 0; k < 4; k++) {
+        ivec2 o = ivec2(k & 1, k >> 1);
+        vec2 n = texelFetch(u_rim, pixi(ivec2(fl) + o), 0).rg;
+        float w = (o.x == 1 ? fr.x : 1.0 - fr.x) * (o.y == 1 ? fr.y : 1.0 - fr.y);
+        if (dot(n, n) > 0.25) rn += w * n;
+    }
+    if (dot(rn, rn) > 1e-6) return normalize(rn);
+    rn = texelFetch(u_rim, pix(inner), 0).rg;
+    if (dot(rn, rn) > 0.25) return normalize(rn);
+#endif
+#ifdef USE_SDF
+    vec2 sg = sdf_grad(air, 2.0);
     if (dot(sg, sg) > 1e-4) return normalize(sg);
 #endif
     return edge_normal(pix(inner), fallback);
 }
 
 // ---------------------------------------------------------------- in-plane ray march
+// MARCH_HOOK(at, r, inside, t), if the includer defines it, sees the path: it is called with the ray's state for the
+// straight piece that ends at `at` (a boundary point where an interaction is about to change r, or the final r.pos
+// when the march returns), `inside` = that piece ran inside a medium, t = the path length there. The caustics
+// splat each air piece as a line from these calls.
+#ifdef CAUSTIC_PIECES  // caustics_rays.geom defines caustic_piece
+void caustic_piece(vec2 at, vec3 thr, int events, int refr, bool inside, float t);
+#define MARCH_HOOK(at, r, inside, t) caustic_piece(at, r.thr, r.events, r.refr, inside, t)
+#endif
+#ifndef MARCH_HOOK
+#define MARCH_HOOK(at, r, inside, t)
+#endif
 // Light / view rays travelling in the plane: air (background, id 0) -> sdf steps; glass / fluid -> Snell in, march
 // inside with Beer-Lambert absorption toward the body's colour, Snell out or total internal reflection; mirror ->
 // reflect (tinted); opaque body -> stop. MARCH_BOUNCES interactions at most.
@@ -152,7 +227,7 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
     vec3 body_col = vec3(1.0);
     vec2 prev = r.pos;
     for (int i = 0; i < MARCH_STEPS; i++) {
-        if (t >= max_t || off_view(r.pos)) { r.end = inside ? 2 : 0; return r; }
+        if (t >= max_t || off_view(r.pos)) { r.end = inside ? 2 : 0; MARCH_HOOK(r.pos, r, inside, t); return r; }
         ivec2 c = pix(r.pos);
         uint id = mat_id(c);
         int k = kind_of(id);
@@ -160,11 +235,12 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
         if (!inside) {
             if (k == KIND_OPAQUE) {
                 vec4 e = refine(prev, r.pos, 0);
-                r.pos = e.zw; r.end = 1; return r;
+                r.pos = e.zw; r.end = 1; MARCH_HOOK(r.pos, r, false, t); return r;
             }
             if (k >= 0) {  // mirror, glass or fluid: an interaction
-                if (r.events >= MARCH_BOUNCES) { r.end = 2; return r; }
                 vec4 e = refine(prev, r.pos, 0);
+                if (r.events >= MARCH_BOUNCES) { r.end = 2; MARCH_HOOK(e.xy, r, false, t); return r; }
+                MARCH_HOOK(e.xy, r, false, t);
                 ivec2 hc = pix(e.zw);
                 kind_of(mat_id(hc));
                 Mat m = g_mat;
@@ -203,6 +279,7 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
             } else {  // left the medium between prev and pos
                 vec4 e = refine(prev, r.pos, 1);
                 ivec2 ic = pix(e.xy);
+                MARCH_HOOK(e.xy, r, true, t);
                 vec2 n = hit_normal(e.xy, e.zw, r.dir);  // outward
                 if (dot(n, r.dir) < 0.0) n = -n;
                 vec2 rd = refract(r.dir, -n, ior);
@@ -229,5 +306,6 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
         t += step;
     }
     r.end = 3;  // out of steps: pos is short of the length asked for
+    MARCH_HOOK(r.pos, r, inside, t);
     return r;
 }

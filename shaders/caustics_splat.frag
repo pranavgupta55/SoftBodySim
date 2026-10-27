@@ -1,4 +1,4 @@
-// Caustics: each deposited point adds its light (additive blending into an RGBA16F target).
+// Caustics: each deposited line fragment adds its light (additive blending into an RGBA16F target).
 in vec3 v_col;
 out vec4 f_color;
 
