@@ -79,7 +79,8 @@ def current_env(world=None):
 DEFAULT_ENV = current_env()  # applied when a preset (which has no env of its own) is loaded
 _KINDS = ((SoftBody, "soft"), (RigidBody, "rigid"), (FixedBody, "fixed"), (Body, "body"))
 _CLASSES = {"soft": SoftBody, "rigid": RigidBody, "fixed": FixedBody, "body": Body}
-BODY_EXTRAS = ("restitution", "wall_side", "palette_role", "palette_pick", "palette_material", "emissive_fill")  # optional per-body settings (numbers / strings), saved when present
+BODY_EXTRAS = ("restitution", "wall_side", "palette_role", "palette_pick", "palette_material", "emissive_fill",
+               "emissive_keep_colour")  # optional per-body settings (numbers / strings), saved when present
 SIDES = ("left", "right", "top", "bottom")
 
 

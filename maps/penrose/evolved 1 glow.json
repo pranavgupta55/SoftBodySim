@@ -92,6 +92,13 @@
 "hexagon": {
 "emissive": "fill",
 "emissive_strength": 1.0
+},
+"diamond": {
+"transparency": 0.97,
+"absorption": 0.0,
+"reflectivity": 0.04,
+"emissive": "hue",
+"emissive_strength": 0.12
 }
 }
 },

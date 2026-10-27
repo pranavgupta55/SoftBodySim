@@ -331,7 +331,8 @@ def apply_map_lighting(world, lighting):
       (so palette switches keep it); "material_over": {palette role: {Material field: value}}: its `material_over`;
       an "emissive" of "fill" there means "the body's own colour" (body.emissive_fill: palettes.sync_emissive keeps
       it in step with the palette, so the body glows in whatever colour the Palette card gives it, as brightly in
-      every palette, and throws light of that same hue);
+      every palette, and throws light of that same hue; it is lit as a grey); "hue": the same glow colour, but the
+      body keeps its own colour (a faint glow on glass or matte bodies, set by "emissive_strength");
       "palette": the palettes.PALETTES name the world starts with (default palettes.DEFAULT; leave it out to follow
       the user's palette); "background": [r, g, b] 0-255 over the palette's (only at build time: a palette switch
       gives the palette's own), or {"lightness": 0..1, "saturation": 0..1} -> world.palette_background: every
@@ -361,9 +362,10 @@ def apply_map_lighting(world, lighting):
             body.material = roles[role]
         if role in overs:
             over = dict(overs[role])
-            if over.get("emissive") == "fill":
-                del over["emissive"]
+            if over.get("emissive") in ("fill", "hue"):
                 body.emissive_fill = 1.0  # (a number: scene_io saves BODY_EXTRAS as numbers / strings)
+                if over.pop("emissive") == "hue":
+                    body.emissive_keep_colour = 1
             body.material_over = {k: (tuple(v) if isinstance(v, list) else v) for k, v in over.items()}
 
 
