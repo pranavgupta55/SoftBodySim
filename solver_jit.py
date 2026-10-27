@@ -1014,6 +1014,102 @@ def impulse_pass(V, W, X0, ea, eb, pts, eids, ts, ss, sides, order, h, push, ox,
         V[1, ib] -= W[ib] * s * jy
 
 
+def _pgs_project(cols, g, rhs, minv, v, diag, lam, iters):
+    """pgs_solve's sweeps on flat buffers (cols[3 r + j], g[6 r + 2 j + xy], v[2 c + xy]; diag, lam: k zeros),
+    indexed one int at a time so the same code runs on numpy arrays (compiled: pgs_project) and on Python lists
+    (the numpy path): the same float operations in the same order, so bit-identical results."""
+    k = len(rhs)
+    for r in range(k):
+        d = 0.0
+        for j in range(3):
+            c, q = cols[3 * r + j], 6 * r + 2 * j
+            d += minv[c] * g[q] * g[q] + minv[c] * g[q + 1] * g[q + 1]
+        diag[r] = d
+    worst = 0.0
+    for _ in range(iters):
+        worst = 0.0
+        for r in range(k):
+            if diag[r] < 1e-12:
+                continue
+            gv = 0.0
+            for j in range(3):
+                c, q = cols[3 * r + j], 6 * r + 2 * j
+                gv += g[q] * v[2 * c] + g[q + 1] * v[2 * c + 1]
+            viol = rhs[r] - gv
+            new = lam[r] + viol / diag[r]
+            if new < 0.0:
+                new = 0.0
+            if new != lam[r]:
+                dl = new - lam[r]
+                for j in range(3):
+                    c, q = cols[3 * r + j], 6 * r + 2 * j
+                    v[2 * c] += minv[c] * g[q] * dl
+                    v[2 * c + 1] += minv[c] * g[q + 1] * dl
+                lam[r] = new
+            if lam[r] > 0 or viol > 0:
+                a = abs(viol)
+                if a > worst:
+                    worst = a
+        if worst < 1e-9:
+            break
+    return worst
+
+
+pgs_project = njit(**NB)(_pgs_project)
+
+
+def pgs_solve(cols, g, rhs, minv, v, iters, compiled):
+    """World._inelastic_zones' solve for one group: projected Gauss-Seidel on the dual of min |v' - v|_M subject to
+    G v' >= rhs, editing v (m, 2) in place. Row r of G is sparse: g[r, j] (2,) on local point cols[r, j], j < 3
+    (a slot that repeats an earlier point of its row holds zeros). minv: per point inverse mass. Up to `iters`
+    sweeps, stopping when no active or violated row is off by 1e-9 or more; returns the last sweep's worst error.
+    O(k) per sweep (a dense G row times v costs O(m) per row). compiled: run the numba kernel, else the same code
+    as Python on lists (bit-identical)."""
+    k = rhs.size
+    if compiled:
+        flat = np.ascontiguousarray(v, dtype=np.float64).reshape(-1).copy()
+        worst = pgs_project(np.ascontiguousarray(cols, dtype=np.int64).reshape(-1),
+                            np.ascontiguousarray(g, dtype=np.float64).reshape(-1),
+                            np.ascontiguousarray(rhs, dtype=np.float64), np.ascontiguousarray(minv, dtype=np.float64),
+                            flat, np.zeros(k), np.zeros(k), iters)
+        v[:] = flat.reshape(v.shape)
+        return worst
+    vl = v.reshape(-1).tolist()
+    worst = _pgs_project(cols.reshape(-1).tolist(), g.reshape(-1).tolist(), rhs.tolist(), minv.tolist(), vl,
+                         [0.0] * k, [0.0] * k, iters)
+    v[:] = np.array(vl).reshape(v.shape)
+    return worst
+
+
+def _row_groups(ri, ra, rb, n_pts):
+    """World._inelastic_zones' groups: constraint rows (point ri, edge ends ra, rb) joined through shared points.
+    Returns one label per row (the union-find root of its point); equal labels = same group. Integer-only, so the
+    compiled kernel (row_groups) and this function run as Python agree exactly."""
+    parent = np.arange(n_pts)
+    for r in range(ri.size):
+        for j in (ra[r], rb[r]):
+            x = ri[r]
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            y = j
+            while parent[y] != y:
+                parent[y] = parent[parent[y]]
+                y = parent[y]
+            if x != y:
+                parent[y] = x
+    label = np.empty(ri.size, dtype=np.int64)
+    for r in range(ri.size):
+        x = ri[r]
+        while parent[x] != x:
+            x = parent[x]
+        label[r] = x
+    return label
+
+
+row_groups = njit(**NB)(_row_groups)
+
+
 # ================================================================ World._bounce (opt-in restitution)
 @njit(**NB)
 def _outline_gap(P, a0, a1, ea, eb, f0, f1):
@@ -1197,6 +1293,8 @@ def warmup():
     floor_cells(ccd_boxes(P, P, i2, i1)[0], 24.0)
     ccd_narrow(P, P, i2, i1, e, e, 0.01, 1e-6, f, f)
     impulse_pass(P.copy(), W, P, i2, i1, e, e, f, f, f, e, 0.004, 0.25, f, f)
+    pgs_solve(np.zeros((1, 3), np.int64), np.ones((1, 3, 2)), np.ones(1), W, np.zeros((4, 2)), 2, True)
+    row_groups(i2, i1, i2, 4)
     img = (P, P, np.zeros((2, 2)), np.zeros((2, 2)), np.ones(4, np.bool_), np.ones(2, np.bool_), np.zeros((1, 2)), 24.0,
            np.array([0, 0, 1, 1], np.int64), np.zeros(2, np.int64), b)
     image_merge_kernel(np.array([0, 1], np.int64), np.zeros(2, np.int64), 2, *img)
