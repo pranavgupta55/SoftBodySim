@@ -200,7 +200,8 @@ def _layout_tiling(layout, tiling=None, pentagrid_seed=None):
     "cup_gap": ...} a diamonds world is built on: the layout file's own (if `layout` is one; a penrose file without
     "cups" is "pair"), else `tiling` (a name, "diamonds" by default, or such a dict) and, for "penrose",
     `pentagrid_seed` (PENROSE_SEED) and the PENROSE_* defaults where not given ("cup_gap" only for the "pair" rule).
-    An optional "bias" (diamonds_map.clustered_order) makes a random layout's pick order favour clusters.
+    An optional "clusters" (a dict, see diamonds_map.CLUSTER_DEFAULTS) grows that share of a random layout's tiles
+    (and of a variant's added ones) as round / line archetype clusters.
     The diamonds tiling gets no "cups" key (build_diamonds_scene uses DIAMONDS_CUPS)."""
     from diamonds_map import layout_tiling
     if isinstance(layout, str):
@@ -235,7 +236,7 @@ def diamonds_spawn(layout=None, spawn=None, tiling=None):
 
 
 def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=INSET, layout=DIAMONDS_LAYOUT,
-                         remove=0, add=0, add_seed=0, spawn=None, tiling=None, pentagrid_seed=None):
+                         remove=0, add=0, add_seed=0, spawn=None, tiling=None, pentagrid_seed=None, cluster_log=None):
     """"diamonds" preset (fullscreen in main_opengl: the panel floats over it; grid off): fixed diamonds from a
     tumbling-blocks tiling (edge DIAMOND_SIDE, its top row at the top edge; never two that form a cup,
     diamonds_map.forms_cup, even across the wraps), and soft shapes (hexagons and heptagons, half each) of random
@@ -253,7 +254,7 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     rotated PENROSE_ROTATION, pentagrid offsets seeded by `pentagrid_seed`, default PENROSE_SEED) whose picked rhombi
     are the obstacles, by the cluster rule and the PENROSE_CUPS cup rule; or a dict of those (see _layout_tiling).
     A layout file's own tiling ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap")
-    overrides both. The diamonds tiling's cup rule is DIAMONDS_CUPS."""
+    overrides both. The diamonds tiling's cup rule is DIAMONDS_CUPS. cluster_log: see diamonds_map.pick_diamonds."""
     from diamonds_map import (lattice_diamonds, layout_shift, load_layout, penrose_tiles, pick_diamonds,
                               place_hexagons, shift_diamonds, steep_tiles)
     from palettes import DEFAULT, apply_palette
@@ -279,7 +280,7 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=gap, cups=cups, near=float(info.get("near", 0.0)),
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
                              add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)),
-                             bias=float(info.get("bias", 0.0)))
+                             clusters=info.get("clusters"), cluster_log=cluster_log)
     if isinstance(layout, str):  # the layout file's own offset (diamonds_map.layout_shift), if any
         diamonds = shift_diamonds(diamonds, layout_shift(layout), world_width, world_height)
     rng = np.random.default_rng(seed + 2)  # each body's palette_pick: which of its role's colors it gets

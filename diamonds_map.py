@@ -261,7 +261,7 @@ def layout_tiling(path):
     A penrose file without "cups" predates the outline rule: "pair"."""
     with open(path) as f:
         data = json.load(f)
-    keys = ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap", "near", "bias")
+    keys = ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap", "near", "clusters")
     info = {k: data[k] for k in keys if k in data} or {"tiling": "diamonds"}
     if info["tiling"] == "penrose":
         info.setdefault("cups", "pair")
@@ -296,53 +296,29 @@ def save_layout(path, diamonds, size, note="", spawn=None, keys=None, tiling=Non
         json.dump(data, f, indent=0)
 
 
-def tile_neighbours(tiles, reach=30.0):
-    """For each tile, the indices of the tiles with a corner within `reach` of one of its corners (sharing a corner
-    or nearly)."""
-    cs = [np.asarray(t[0], float) for t in tiles]
-    centers = np.array([c.mean(axis=1) for c in cs])
-    radius = max(float(np.hypot(*(c - c.mean(axis=1, keepdims=True))).max()) for c in cs)
-    adj = np.zeros((len(tiles), len(tiles)), bool)
-    for i, j in zip(*np.nonzero(np.triu(np.hypot(*(centers[:, None] - centers[None]).transpose(2, 0, 1))
-                                        <= 2 * radius + reach, 1))):
-        d = cs[i][:, :, None] - cs[j][:, None, :]
-        adj[i, j] = adj[j, i] = bool((np.hypot(d[0], d[1]) <= reach).any())
-    return adj
+# pick_diamonds' archetype clusters (its `clusters` dict; any key left out takes this default): "share" of the tiles
+# to place is grown as clusters of touching tiles (the rest are random as before), each one either "round" (a compact
+# blob: every step adds the touching tile that keeps the tile centers' radius of gyration smallest, with some noise) or
+# a "line" (a chain along a random direction at least "line_min_angle" degrees from horizontal, up to vertical, leaning
+# either way: every step adds the touching tile past either end lying closest to the axis), "round_share" of them
+# round; target sizes are drawn from "round_size" / "line_size" (inclusive). Every tile still has to pass the rules; a
+# cluster stops growing after "max_fails" vetoed or missing candidates.
+CLUSTER_DEFAULTS = {"share": 0.0, "round_share": 0.5, "round_size": [4, 8], "line_size": [4, 7],
+                    "line_min_angle": 45.0, "max_fails": 3}
 
 
-def clustered_order(tiles, seed, bias, target=None, rounds=5, first=0.4, reach=30.0):
-    """A pick order (a permutation of tile indices) that mildly favours clusters: round 1 draws `first` of `target`
-    (default: all tiles) uniformly at random; each later round draws (target - round 1) / (rounds - 1) more with
-    weights 1 + bias * (number of already-drawn neighbours, see tile_neighbours), until every tile is drawn
-    (pick_diamonds' rules may veto some, so the order runs past the target)."""
-    n = len(tiles)
-    rng = np.random.default_rng([seed, 3])
-    target = n if target is None else min(n, target)
-    adj = tile_neighbours(tiles, reach).astype(float)
-    first_n = max(1, int(round(first * target)))
-    step = max(1, int(math.ceil((target - first_n) / max(1, rounds - 1))))
-    order = rng.choice(n, size=min(first_n, n), replace=False).tolist()
-    drawn = np.zeros(n, bool)
-    drawn[order] = True
-    while len(order) < n:
-        w = (1.0 + bias * (adj @ drawn)) * ~drawn
-        k = min(step, n - len(order))
-        pick = rng.choice(n, size=k, replace=False, p=w / w.sum()).tolist()
-        order += pick
-        drawn[pick] = True
-    return order
-
-
-def _random_order(tiles, seed, bias, target):
-    """pick_diamonds' order: a plain seeded permutation, or clustered_order when `bias` is set."""
-    if not bias:
-        return np.random.default_rng(seed).permutation(len(tiles))
-    return clustered_order(tiles, seed, bias, target)
+def cluster_settings(clusters):
+    """CLUSTER_DEFAULTS updated with `clusters` (a dict, or a bare share), or None when its share is 0."""
+    if not clusters:
+        return None
+    out = dict(CLUSTER_DEFAULTS)
+    out.update(clusters if isinstance(clusters, dict) else {"share": float(clusters)})
+    return out if out["share"] > 0 else None
 
 
 def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, gap=0.0, max_width=None,
                   layout=None, layout_size=None, remove=0, add=0, add_seed=0, count=None, cups="pair", cup_log=None,
-                  near=30.0, bias=0.0):
+                  near=30.0, clusters=None, cluster_log=None):
     """A seeded random `fraction` (or `count`) of the diamonds (corners, rgb, face) lying wholly inside the world (0, 0, world_w,
     world_h), which wraps on every side (looping, no walls). A diamond that would form a cup with one already picked
     (forms_cup; corners up to `gap` apart count as touching) is skipped and the next random one tried, as is one that
@@ -361,7 +337,11 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     ones touching it would get a cup at one of its corners (outline_cup / cup_at: a reflex outline vertex whose two
     outline neighbours are both higher). The outline rule is order-independent but not monotone (a third tile can
     fill a cup), so `remove` only drops diamonds whose removal leaves no cup. `cup_log`: a list that gets
-    cup_pattern() of every cup the outline rule turned down."""
+    cup_pattern() of every cup the outline rule turned down.
+    clusters: archetype cluster settings (see CLUSTER_DEFAULTS; None or share 0: all random) for a random layout and
+    for `add`: that share of the new tiles is grown as round / line clusters of touching tiles, each decision based on
+    the tiles actually picked. `cluster_log`: a list that gets {"kind": "round" | "line", "tiles": [index into the
+    returned list...], "angle": degrees from horizontal, + leaning right (lines only)} for each archetype cluster."""
     eps = 1e-6
     stack = _stack(diamonds)  # (n, 2, corners) when they all have the same corner count: whole-array tests
     if stack is None:
@@ -390,56 +370,127 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     shift_x, shift_y = np.array([s[0] for s in shifts]), np.array([s[1] for s in shifts])
     chosen, cluster, banned = [], {}, set()  # cluster: picked index -> its cluster (a shared list of picked indices)
 
+    # the picked diamonds' centers, in pick order (rows), for the reach test of every (picked, shift) pair at once:
+    # the same float operations as testing each pair in turn, so the same pairs go on to the exact tests below,
+    # in the same order (picked diamonds in pick order, each one's shifts in order)
+    cx_picked, cy_picked = np.empty(len(inside)), np.empty(len(inside))
+
     def fill(order, target, trusted=False):  # trusted: already checked (a saved layout), just rebuild the clusters
-        # the picked diamonds' centers, in pick order (rows), for the reach test of every (picked, shift) pair at once:
-        # the same float operations as testing each pair in turn, so the same pairs go on to the exact tests below,
-        # in the same order (picked diamonds in pick order, each one's shifts in order)
-        cx_picked, cy_picked = np.empty(len(inside)), np.empty(len(inside))
-        for i, m in enumerate(chosen):
-            cx_picked[i], cy_picked[i] = centers[m]
         for k in order:
             if len(chosen) == target:
                 break
             if k in cluster or k in banned:
                 continue
-            p, linked, touching, ok = inside[k][0], [], [], True
-            n = len(chosen)
-            far = ((np.abs(cx_picked[:n, None] + shift_x - centers[k][0]) > reach)
-                   | (np.abs(cy_picked[:n, None] + shift_y - centers[k][1]) > reach))
-            for i, s in zip(*np.nonzero(~far)):
-                m, (dx, dy) = chosen[i], shifts[s]
-                q = inside[m][0] + np.array([[dx], [dy]])
-                if not trusted and not outline and forms_cup(p, q, size, gap):
-                    ok = False
-                elif _corner_gap(p, q) <= link:
-                    if dx:
-                        ok = trusted  # no cluster through the left / right seam
-                    linked.append(m)
-                    touching.append(_snap(q, p, near) if near > 0 else q)
-                if not ok:
-                    break
-            if ok and outline and not trusted:
-                cup = outline_cup(p, touching, size)
-                if cup is not None:
-                    ok = False
-                    if cup_log is not None:
-                        cup_log.append(cup_pattern(cup[1]))
+            try_add(k, trusted)
+
+    def try_add(k, trusted=False):  # pick diamond k if the rules allow it: True if picked
+        p, linked, touching, ok = inside[k][0], [], [], True
+        n = len(chosen)
+        far = ((np.abs(cx_picked[:n, None] + shift_x - centers[k][0]) > reach)
+               | (np.abs(cy_picked[:n, None] + shift_y - centers[k][1]) > reach))
+        for i, s in zip(*np.nonzero(~far)):
+            m, (dx, dy) = chosen[i], shifts[s]
+            q = inside[m][0] + np.array([[dx], [dy]])
+            if not trusted and not outline and forms_cup(p, q, size, gap):
+                ok = False
+            elif _corner_gap(p, q) <= link:
+                if dx:
+                    ok = trusted  # no cluster through the left / right seam
+                linked.append(m)
+                touching.append(_snap(q, p, near) if near > 0 else q)
             if not ok:
+                break
+        if ok and outline and not trusted:
+            cup = outline_cup(p, touching, size)
+            if cup is not None:
+                ok = False
+                if cup_log is not None:
+                    cup_log.append(cup_pattern(cup[1]))
+        if not ok:
+            return False
+        merged = {id(c): c for c in (cluster[m] for m in linked)}.values()
+        members = list(dict.fromkeys([int(k)] + [m for c in merged for m in c]))
+        if max_width is not None and not trusted:
+            xs = np.concatenate([inside[m][0][0] for m in members])
+            if xs.max() - xs.min() > max_width:
+                return False
+        for m in members:
+            cluster[m] = members
+        cx_picked[n], cy_picked[n] = centers[k]
+        chosen.append(int(k))
+        return True
+
+    settings = cluster_settings(clusters)
+    touch = 1e-3 * size  # tiles of the tiling that share an edge or a corner have corners this close
+    archetypes = []  # (kind, [picked indices], angle or None)
+
+    def touching_tiles(k):  # tiles of the tiling (inside the world) sharing an edge or a corner with tile k
+        near_k = np.flatnonzero(np.hypot(*(centers - centers[k]).T) <= 2 * size + touch)
+        out = []
+        for j in near_k.tolist():
+            if j != k:
+                d = inside[k][0][:, :, None] - inside[j][0][:, None, :]
+                if (np.hypot(d[0], d[1]) <= touch).any():
+                    out.append(j)
+        return out
+
+    def grow(rng, target, budget):  # archetype clusters until `budget` tiles are in them (or `target` picked)
+        placed, tries = 0, 0
+        while placed < budget and len(chosen) < target and tries < 50 * max(1, budget):
+            tries += 1
+            free = [k for k in range(len(inside)) if k not in cluster and k not in banned]
+            if not free:
+                break
+            k = free[int(rng.integers(len(free)))]
+            if not try_add(k):
                 continue
-            merged = {id(c): c for c in (cluster[m] for m in linked)}.values()
-            members = list(dict.fromkeys([int(k)] + [m for c in merged for m in c]))
-            if max_width is not None and not trusted:
-                xs = np.concatenate([inside[m][0][0] for m in members])
-                if xs.max() - xs.min() > max_width:
-                    continue
-            for m in members:
-                cluster[m] = members
-            cx_picked[n], cy_picked[n] = centers[k]
-            chosen.append(int(k))
+            members, tried, fails = [k], {k}, 0
+            if rng.random() < settings["round_share"]:
+                kind, angle = "round", None
+                want = int(rng.integers(settings["round_size"][0], settings["round_size"][1] + 1))
+            else:
+                kind = "line"
+                tilt = float(rng.uniform(settings["line_min_angle"], 90.0))
+                angle = tilt if rng.random() < 0.5 else -tilt  # + leaning right (down-right)
+                want = int(rng.integers(settings["line_size"][0], settings["line_size"][1] + 1))
+                axis = np.array([math.cos(math.radians(angle)), math.sin(math.radians(angle))])
+                normal = np.array([-axis[1], axis[0]])
+            want = min(want, budget - placed, target - len(chosen) + 1)
+            while len(members) < want and fails < settings["max_fails"] and len(chosen) < target:
+                cand = sorted({j for m in members for j in touching_tiles(m)
+                               if j not in tried and j not in cluster and j not in banned})
+                if kind == "line":  # only tiles past either end of the line so far
+                    along = (centers[members] - centers[k]) @ axis
+                    t = (centers[cand] - centers[k]) @ axis if cand else np.zeros(0)
+                    reach_ok = (t > along.max() + 0.25 * size) | (t < along.min() - 0.25 * size)
+                    cand = [j for j, ok in zip(cand, reach_ok.tolist()) if ok]
+                if not cand:
+                    break
+                if kind == "round":
+                    pts = centers[members]
+                    score = [float(((np.vstack([pts, centers[j]]) - np.vstack([pts, centers[j]]).mean(axis=0)) ** 2)
+                                   .sum(axis=1).mean() ** 0.5) for j in cand]
+                else:
+                    score = np.abs((centers[cand] - centers[k]) @ normal).tolist()
+                score = np.array(score) + rng.uniform(0.0, 0.35 * size, len(cand))  # some randomness
+                j = cand[int(np.argmin(score))]
+                tried.add(j)
+                if try_add(j):
+                    members.append(j)
+                else:
+                    fails += 1
+            placed += len(members)
+            archetypes.append((kind, members, angle))
+        return placed
 
     if layout is None:
         target = max(1, int(round(fraction * len(inside))))
-        fill(_random_order(inside, seed, bias, target), target)
+        if settings is not None:
+            rng_c = np.random.default_rng([seed, 3])
+            grow(rng_c, target, int(round(settings["share"] * target)))
+            fill(rng_c.permutation(len(inside)), target)
+        else:
+            fill(np.random.default_rng(seed).permutation(len(inside)), target)
     else:
         if corners is not None:  # tile_key of every diamond at once (the same means, rounded the same way)
             mx, my = corners[:, 0].mean(axis=1).tolist(), corners[:, 1].mean(axis=1).tolist()
@@ -483,8 +534,19 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
         fill(kept, len(kept), trusted=True)
         banned |= drop
     if add:  # `add` more on top, by the same rules, in a second seeded order (an offshoot of the layout)
-        fill(rng.permutation(len(inside)), len(chosen) + add)
-    return [inside[k][:2] for k in sorted(chosen)]
+        target = len(chosen) + add
+        if settings is not None:  # the same share of them as archetype clusters (stochastic rounding)
+            want = settings["share"] * add
+            grow(rng, target, int(want) + int(rng.random() < want - int(want)))
+        fill(rng.permutation(len(inside)), target)
+    out = sorted(chosen)
+    if cluster_log is not None:
+        pos = {k: i for i, k in enumerate(out)}
+        for kind, members, angle in archetypes:
+            if all(m in pos for m in members):  # (not dropped by `remove` since)
+                cluster_log.append({"kind": kind, "tiles": [pos[m] for m in members],
+                                    **({"angle": round(angle, 1)} if angle is not None else {})})
+    return [inside[k][:2] for k in out]
 
 
 def _dist_to_polygon(p, poly):
