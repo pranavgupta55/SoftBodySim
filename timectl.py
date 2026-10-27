@@ -14,7 +14,10 @@ never the ticks themselves: every speed follows the same trajectory, tick for ti
                                                     speed, `actual` below, falls short of the request)
 
 Frame stepping (N, while paused) runs one 1/60 s frame at the current scale: round(substeps x scale) ticks, at least
-one, so 1x + N steps 4 ticks and 0.25x + N a single 1/240 s tick at a time (World.step_frame).
+one, so 1x + N steps 4 ticks and 0.25x + N a single 1/240 s tick at a time (World.step_frame). Collisions are
+checked (CCD) once per span of `substeps` ticks counted from tick 0, so a frame that ends mid-span (0.25x + N, or
+1.5 ticks per frame at 160 fps) can show the substeps' unchecked proposal, e.g. a point slightly inside an edge,
+which the span's end then resolves.
 """
 from entities import EnvConfig
 
