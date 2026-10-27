@@ -25,7 +25,7 @@ it's uploaded only when it changes.
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
 GLSL 330 shaders. Hotkeys (all listed on the sidebar's Controls card): F compute card full / summary, G grid,
-V filled/points view, T motion trails, SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), ESC quit,
+V view (points / filled / filled without outlines), T motion trails, SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), ESC quit,
 1-4 debug overlays (debug_overlay.py), [ / ] or the Controls card's - / + physics speed 1%-10000% and N one physics frame while paused (timectl.py).
 
 Worlds: `session` (world_selector.WorldSession) holds the Custom world and the preset worlds; `world` and `editor`
@@ -347,6 +347,7 @@ def sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, now):
     `inputs` (keys / buttons / wheel seen so far), plus the mouse while it is over the sidebar (hover)."""
     return (inputs, mouse_px if hud.rect.collidepoint(mouse_px) else None, session.name, session.open, id(editor),
             editor.paused, editor.active, editor.stage, editor.show_compute, ViewConfig.show_grid, ViewConfig.filled,
+            ViewConfig.outlines,
             ViewConfig.trails, ViewConfig.grab_area, panel_open, int(now * SIDEBAR_SAFETY_HZ))
 
 
@@ -559,7 +560,12 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 if event.key == pygame.K_g:
                     ViewConfig.show_grid = not ViewConfig.show_grid
                 if event.key == pygame.K_v:
-                    ViewConfig.filled = not ViewConfig.filled
+                    if not ViewConfig.filled:  # points -> filled -> filled without outlines -> points
+                        ViewConfig.filled, ViewConfig.outlines = True, True
+                    elif ViewConfig.outlines:
+                        ViewConfig.outlines = False
+                    else:
+                        ViewConfig.filled, ViewConfig.outlines = False, True
                 if event.key == pygame.K_t:
                     ViewConfig.trails = not ViewConfig.trails
                 if event.key == pygame.K_b:  # B: grab the nearest point, or every point in a circle
@@ -601,6 +607,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 trails.update(world, dt / fps, stepped)
             with profiler.section("world gl"):  # grid, trails and bodies into the GPU world layer
                 gpu_world.render(world, view.get_size(), ViewConfig.filled, ViewConfig.zoom, background,
+                                 outlines=ViewConfig.outlines,
                                  grid=grid_colors(world.background) if ViewConfig.show_grid else None,
                                  trails=trails if ViewConfig.trails else None)
         else:
@@ -610,7 +617,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 trails.set_enabled(ViewConfig.trails)
                 trails.update(world, dt / fps, stepped)
                 trails.draw(view, zoom=ViewConfig.zoom)  # under the bodies
-            world.draw(view, filled=ViewConfig.filled, zoom=ViewConfig.zoom)
+            world.draw(view, filled=ViewConfig.filled, zoom=ViewConfig.zoom, outlines=ViewConfig.outlines)
         if overlays.any():
             with profiler.section("overlays"):
                 overlays.draw(view, world, ViewConfig.zoom)

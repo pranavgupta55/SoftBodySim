@@ -666,9 +666,9 @@ class World:
         if self._span_start is not None:
             self._span_reach = reach
 
-    def draw(self, surface, filled=False, zoom=1.0):
+    def draw(self, surface, filled=False, zoom=1.0, outlines=True):
         """Bodies in the order they were added (later ones on top). filled: solid polygons instead of points + springs.
-        zoom maps world units to surface pixels. A body sticking out past a periodic edge also draws its copy one
+        outlines=False drops the filled view's black borders. zoom maps world units to surface pixels. A body sticking out past a periodic edge also draws its copy one
         period over (looping.image_copies), right after itself."""
         copies = defaultdict(list)
         for k, s in looping.image_copies(self):
@@ -679,13 +679,13 @@ class World:
                     b = copy.copy(self.bodies[k])
                     b.points = self.bodies[k].points + s[:, None]
                 if filled:
-                    b.draw_filled(surface, zoom=zoom)
+                    b.draw_filled(surface, border_width=2 if outlines else 0, zoom=zoom)
                 else:
                     b.draw(surface, zoom)
         for r in self.ropes:
             r.draw(surface, zoom)
         for hk in self.hooks:  # over the ropes, so a rope ends inside its hook
-            hk.draw(surface, zoom, filled)
+            hk.draw(surface, zoom, filled, outlines)
         if self.grabbed is not None:
             pygame.draw.line(surface, (255, 255, 255), self.P[:, self.grabbed] * zoom, self.grab_target * zoom, 1)
         if self.grab_set is not None:  # an area grab: each held point to its target

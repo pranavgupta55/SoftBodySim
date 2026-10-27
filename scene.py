@@ -77,7 +77,8 @@ class ViewConfig:
     show_grid = True  # G: draw the collision spatial hash grid under the bodies
     grab_area = False  # B: the mouse grabs every point in a circle (World.grab_area) instead of the nearest one
     grab_area_radius = 40.0  # that circle's radius, world units (the mouse wheel resizes it)
-    filled = True  # V: filled polygons with a black border instead of points + springs
+    filled = True  # V: filled polygons instead of points + springs
+    outlines = True  # with filled: black borders on the polygons (V cycles points -> filled -> no outlines)
     trails = False  # T: fading motion trails behind moving bodies (trails.py)
     zoom = 0.5  # render pixels per world unit: 0.5 shows twice as much world each way
     # share of the screen width taken by the right-hand sidebar (all the cards); the world fills the rest. The sidebar

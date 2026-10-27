@@ -1251,7 +1251,7 @@ class Editor(SelectionTools):
         placing = self._placing()
         v = self.view
         grid = None if v is None else ("on" if v.show_grid else "off")
-        look = None if v is None else ("filled" if v.filled else "points")
+        look = None if v is None else (("filled" if getattr(v, "outlines", True) else "fill") if v.filled else "points")
         trails = None if v is None else ("on" if getattr(v, "trails", False) else "off")
         picking = self._row_shown() and not placing  # Enter is Done while picking objects to go around
         enter = ("done", picking and bool(self.selection)) if picking else ("finish", placing and self._complete())

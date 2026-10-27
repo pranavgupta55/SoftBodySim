@@ -177,6 +177,9 @@ class Body:
         pts = self.points * zoom
         if pts.shape[1] == 2:  # a segment: a thick line in the fill colour with a black outline
             a, b = pts[:, 0], pts[:, 1]
+            if border_width <= 0:  # no outline: just the fill line
+                pygame.draw.line(surface, self.fill_col, a, b, max(self.stick_width, 1))
+                return
             pygame.draw.line(surface, border_col, a, b, max(self.stick_width, 1) + 2 * border_width)
             for end in (a, b):
                 pygame.draw.circle(surface, border_col, end, (max(self.stick_width, 1) + 2 * border_width) / 2)
@@ -187,7 +190,8 @@ class Body:
             return
         loop = np.round(pts[:, self.edges[0]]).astype(int)  # perimeter in loop order, whole pixels
         pygame.draw.polygon(surface, self.fill_col, loop.T.tolist())
-        draw_border(surface, loop, border_col, border_width, self.winding)
+        if border_width > 0:
+            draw_border(surface, loop, border_col, border_width, self.winding)
 
 
 def draw_border(surface, loop, col=(0, 0, 0), width=2, winding=None):
@@ -283,11 +287,13 @@ class Hook:
         self.col = DEFAULT_COL if col is None else col
         self.radius = radius  # marker radius in surface pixels
 
-    def draw(self, surface, zoom=1.0, filled=False):
+    def draw(self, surface, zoom=1.0, filled=False, outlines=True):
         """A ring with a hole: black-bordered disc in the filled view, a 1px ring around a dot in the points view."""
         c = self.pos * zoom
         r = self.radius
-        if filled:
+        if filled and not outlines:  # the coloured disc alone
+            pygame.draw.circle(surface, self.col, c, r - 0.5)
+        elif filled:
             pygame.draw.circle(surface, (0, 0, 0), c, r + 1)
             pygame.draw.circle(surface, self.col, c, r - 0.5)
             pygame.draw.circle(surface, (0, 0, 0), c, 1)

@@ -129,7 +129,7 @@ class WorldPacker:
     def __init__(self):
         self.topo = None
 
-    def pack(self, world, filled, zoom):
+    def pack(self, world, filled, zoom, outlines=True):
         bodies = world.bodies
         lines, stamps, radii = [], [], []
         fills = np.zeros((0, 8), np.int32)
@@ -144,9 +144,9 @@ class WorldPacker:
             if filled:
                 fill_c = pack_rgb([b.fill_col for b in bodies])
                 if t.fill_bodies.size:
-                    fills, verts = self._fills(t, P, fill_c, body_layer, lines, bodies)
+                    fills, verts = self._fills(t, P, fill_c, body_layer, lines, bodies, outlines)
                 if t.seg_bodies.size:
-                    self._segments(t, P, fill_c, body_layer, bodies, lines, stamps, radii)
+                    self._segments(t, P, fill_c, body_layer, bodies, lines, stamps, radii, outlines)
                 dots = t.dot
             else:
                 dots = np.ones(nb, dtype=bool)  # the points view: Body.draw for every body
@@ -164,11 +164,11 @@ class WorldPacker:
                 if filled:
                     sub = t.subset(mask)
                     if sub.fill_bodies.size:
-                        f2, v2 = self._fills(sub, Ps, fill_c, body_layer, lines, bodies)
+                        f2, v2 = self._fills(sub, Ps, fill_c, body_layer, lines, bodies, outlines)
                         f2[:, 0] += len(verts)
                         fills, verts = np.concatenate([fills, f2]), np.concatenate([verts, v2])
                     if sub.seg_bodies.size:
-                        self._segments(sub, Ps, fill_c, body_layer, bodies, lines, stamps, radii)
+                        self._segments(sub, Ps, fill_c, body_layer, bodies, lines, stamps, radii, outlines)
                     d = dots & mask
                 else:
                     d = mask
@@ -183,7 +183,9 @@ class WorldPacker:
         black = pack_rgb([(0, 0, 0)])[0]  # Hook.draw's own black
         for hk in world.hooks:
             c, r, col = _px(hk.pos * zoom), hk.radius, pack_rgb([hk.col])[0]
-            if filled:  # Hook.draw: black disc, coloured disc, black hole
+            if filled and not outlines:  # Hook.draw without outlines: the coloured disc alone
+                specs = ((r - 0.5, 0, col),)
+            elif filled:  # Hook.draw: black disc, coloured disc, black hole
                 specs = ((r + 1, 0, black), (r - 0.5, 0, col), (1, 0, black))
             else:  # a 1px ring around a dot
                 specs = ((r, 1, col), (1, 0, col))
@@ -206,7 +208,7 @@ class WorldPacker:
                     radii=np.concatenate(radii) if radii else np.zeros(0))
 
     @staticmethod
-    def _fills(t, P, fill_c, body_layer, lines, bodies):
+    def _fills(t, P, fill_c, body_layer, lines, bodies, outlines=True):
         """Closed polygons: draw_filled rounds the loop to whole pixels, fills it, then draw_border (entities.py):
         the 1px outline plus BORDER_WIDTH - 1 copies shifted 1px outward along each edge's minor axis."""
         loop = np.round(P[:, t.loop_idx])  # (2, m) whole pixels, rounded like draw_filled
@@ -224,13 +226,13 @@ class WorldPacker:
         col = np.full(loop.shape[1], pack_rgb([BORDER_COL])[0])
         layer = body_layer[t.loop_body]
         ones = np.ones(loop.shape[1], np.int64)
-        for k in range(BORDER_WIDTH):
+        for k in range(BORDER_WIDTH if outlines else 0):
             lines.append(np.stack([loop[0] + k * sx, loop[1] + k * sy, nxt[0] + k * sx, nxt[1] + k * sy, ones, col,
                                    layer, 0 * ones], axis=1))
         return fills.astype(np.int32), loop.T.astype(np.int32)
 
     @staticmethod
-    def _segments(t, P, fill_c, body_layer, bodies, lines, stamps, radii):
+    def _segments(t, P, fill_c, body_layer, bodies, lines, stamps, radii, outlines=True):
         """Two-point bodies in the filled view: a thick border-coloured line with round ends, the fill line on top."""
         sb = t.seg_bodies
         a, b = _px(P[:, t.seg_first]), _px(P[:, t.seg_first + 1])
@@ -238,10 +240,11 @@ class WorldPacker:
         outer = sw + 2 * BORDER_WIDTH
         border = np.full(sb.size, pack_rgb([BORDER_COL])[0])
         layer, zero = body_layer[sb], np.zeros(sb.size, np.int64)
-        lines.append(np.stack([a[0], a[1], b[0], b[1], outer, border, layer, zero], axis=1))
-        for end in (a, b):
-            stamps.append(np.stack([end[0], end[1], border, layer, zero, zero], axis=1))
-            radii.append(outer / 2)
+        if outlines:
+            lines.append(np.stack([a[0], a[1], b[0], b[1], outer, border, layer, zero], axis=1))
+            for end in (a, b):
+                stamps.append(np.stack([end[0], end[1], border, layer, zero, zero], axis=1))
+                radii.append(outer / 2)
         lines.append(np.stack([a[0], a[1], b[0], b[1], sw, fill_c[sb], layer + 1, zero], axis=1))
 
     @staticmethod
@@ -452,7 +455,7 @@ class GLWorld:
         base["u_edge_col"].value = tuple(float(c) for c in cols_["edge_cell_col"])
         base["u_point_col"].value = tuple(float(c) for c in cols_["point_cell_col"])
 
-    def render(self, world, view_size, filled, zoom, background, grid=None, trails=None):
+    def render(self, world, view_size, filled, zoom, background, grid=None, trails=None, outlines=True):
         """Draw the world into self.tex. view_size: the world view's size in px (drawing is clipped to it, like the
         subsurface the CPU path draws into); background: RGB; grid: None (off) or draw_grid colour overrides ({} for
         its defaults); trails: a trails.Trails (drawn when it has pixels) or None."""
@@ -475,13 +478,13 @@ class GLWorld:
         base["u_trails"].value = has_trails
         self.trail_tex.use(3)
         self.base_vao.render(moderngl.TRIANGLE_STRIP, vertices=4)
-        self._bodies(world, filled, zoom)
+        self._bodies(world, filled, zoom, outlines)
         if prev is not None:
             prev.use()
 
-    def _bodies(self, world, filled, zoom):
+    def _bodies(self, world, filled, zoom, outlines=True):
         ctx = self.ctx
-        data = self.packer.pack(world, filled, zoom)
+        data = self.packer.pack(world, filled, zoom, outlines)
         fills, verts, lines, stamps = data["fills"], data["verts"], data["lines"], data["stamps"]
         self.stats = {"fills": len(fills), "lines": len(lines), "stamps": len(stamps)}
         ctx.enable(moderngl.DEPTH_TEST)
