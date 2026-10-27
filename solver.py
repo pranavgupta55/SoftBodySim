@@ -468,9 +468,13 @@ class World:
             stride = max(1, min(stride, int(EnvConfig.ccd_max_span / h + 1e-9)))
         if stride > 1:
             for k in range(0, n, stride):
+                if k and self.period is not None:  # keep wrapping between spans (looping.span_wraps)
+                    self.last_wraps += looping.span_wraps(self)
                 self._ccd_span(h, min(stride, n - k))
             return
-        for _ in range(n):
+        for k in range(n):
+            if k and self.period is not None:
+                self.last_wraps += looping.span_wraps(self)
             if self.bounce_bodies:
                 self._bounce(h)
             if self.backend is None or not self.backend.pbd_substep(h):  # False: the backend can't run this scene

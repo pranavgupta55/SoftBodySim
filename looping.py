@@ -44,7 +44,10 @@ dragged point wraps like any other on a periodic axis, and World.grab_shift / gr
 keeps pulling toward the cursor's image in the body's frame; in walled mode it never wraps (as before).
 
 World.step calls loop_step once per frame, before the substeps, so a wrap is never part of a substep's straight-line
-motion that CCD checks.
+motion that CCD checks. On a periodic axis World._substeps also wraps between the frame's CCD spans (span_wraps): at
+high time scales one frame holds many spans, and a fast body could otherwise get more than a period past the bounds,
+where the +-L image pairs no longer reach what it should hit. Each span ends intersection-free, so this is the same
+safe translation as the per-frame one.
 """
 import numpy as np
 
@@ -507,6 +510,20 @@ def loop_step(world):
     active = {s for s in SIDES if _active(world, s) and not world.periodic[AXIS_OF[s]]}
     if active:
         wraps += _walled_wraps(world, active)
+    return wraps
+
+
+def span_wraps(world):
+    """Periodic wraps between two CCD spans of one frame (World._substeps; World.period is set): the per-frame
+    _periodic_wraps translations only (pending-wall rule included); adding pending walls, switching axes in or out
+    of periodic mode and the walled-mode wraps stay once per frame in loop_step. Returns the wraps.
+
+    No position-derived cache survives a wrap: the span's contact lists (World._span_contacts, its image pairs
+    included) and reach are cleared when each span ends, and the CCD box cache is dropped here (it is keyed on the
+    identity of a D array that never comes back, so this is only belt and braces)."""
+    wraps = _periodic_wraps(world)
+    if wraps:
+        world._ccd_box_cache = None
     return wraps
 
 
