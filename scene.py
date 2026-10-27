@@ -9,6 +9,7 @@ import numpy as np
 
 from entities import RigidBody, SoftBody, FixedBody, Rope, rect_points, polygon_points
 from looping import add_world_box
+import pumpkins
 from solver import World
 
 
@@ -161,6 +162,11 @@ DIAMONDS_SPAWN = {
     "sizes": [6.4, 14.4],  # their circumradius range (uniform)
     "sides": [6, 7],  # their side counts, taken in turn: hexagons and heptagons, half each
     "density": 1.2 * 210 / (1800 * 1169),  # diamonds per square world unit of a random layout (252 on 1800x1169)
+    # Optional, for pumpkins (pumpkins.py) among the shapes (left out: none, and the rest is exactly as before):
+    # "pumpkin_share": the share of the shapes that are pumpkins, spread evenly through the spawn order (shape k is
+    # one when floor((k + 1) x share) > floor(k x share)); the others take "sides" in turn among themselves.
+    # "pumpkin_sizes": [lo, hi] their half width range (uniform; default pumpkins.SIZES). Their placement circles
+    # are that times pumpkins.REACH (the outline's farthest point from its centre, the stem's tip).
 }
 # the diamonds folder: a world per saved layout (diamonds_map.save_layout), "diamonds/<file name>"; each was picked by
 # running variants and keeping the one that left the shapes most evenly spread (its note says how)
@@ -239,6 +245,14 @@ def diamonds_spawn(layout=None, spawn=None, tiling=None):
     return out
 
 
+def spawn_kinds(spawn):
+    """The kind of each spawned shape in order, "pumpkin" or "polygon", from the spawn settings' optional
+    "pumpkin_share" (see DIAMONDS_SPAWN)."""
+    share = float(spawn.get("pumpkin_share", 0.0))
+    return ["pumpkin" if math.floor((k + 1) * share) > math.floor(k * share) else "polygon"
+            for k in range(int(spawn["shapes"]))]
+
+
 def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=INSET, layout=DIAMONDS_LAYOUT,
                          remove=0, add=0, add_seed=0, spawn=None, tiling=None, pentagrid_seed=None, cluster_log=None,
                          shape_seed=None, remove_order=None, add_order=None, check=False):
@@ -261,6 +275,8 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     A layout file's own tiling ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap")
     overrides both. The diamonds tiling's cup rule is DIAMONDS_CUPS. cluster_log, remove_order, add_order, check: see
     diamonds_map.pick_diamonds. shape_seed: the shapes' spawn seed (default `seed`): the same tiles, other shapes.
+    The spawn settings' optional "pumpkin_share" / "pumpkin_sizes" make some of the shapes pumpkins (pumpkins.py;
+    same palette role, so they take the shapes' colours; they always have eyes, pumpkin_eyes.py).
     A layout file's optional "lighting" block sets up the lit renderer (materials per role, GI, ambient, lights, the
     starting palette and background; see apply_map_lighting)."""
     from diamonds_map import (lattice_diamonds, layout_lighting, layout_shift, load_layout, penrose_tiles,
@@ -300,13 +316,23 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
         bodies.append(body)
     r_min, r_max = spawn["sizes"]
     sides = spawn["sides"]
+    kinds = spawn_kinds(spawn)
+    sizes = None
+    if "pumpkin" in kinds:  # pumpkins' placement circles: their own size range (see DIAMONDS_SPAWN)
+        lo, hi = (float(v) * pumpkins.REACH for v in spawn.get("pumpkin_sizes", pumpkins.SIZES))
+        sizes = [(lo, hi) if kind == "pumpkin" else (r_min, r_max) for kind in kinds]
+    others = 0  # shapes that aren't pumpkins so far: they take the side counts in turn
     for k, (cx, cy, r, angle) in enumerate(place_hexagons([c for c, _ in diamonds], world_width, world_height,
                                                           spawn["shapes"], seed=seed if shape_seed is None else shape_seed,
                                                           r_min=r_min, r_max=r_max,
-                                                          side=inset)):
-        n = int(sides[k % len(sides)])  # side counts taken in turn
-        body = SoftBody(polygon_points(cx, cy, r, n, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
-                        point_radius=2)
+                                                          side=inset, sizes=sizes)):
+        if kinds[k] == "pumpkin":  # upright, leaning up to 30 degrees either way
+            body = pumpkins.make(cx, cy, r / pumpkins.REACH, tilt=angle - math.pi / 6, point_radius=2)
+        else:
+            n = int(sides[others % len(sides)])  # side counts taken in turn
+            others += 1
+            body = SoftBody(polygon_points(cx, cy, r, n, angle=-math.pi / 2 + angle), stiffness=0.1, skip_sets=2,
+                            point_radius=2)
         body.palette_role, body.palette_pick = "hexagon", int(rng.integers(1 << 30))  # (role: the falling shapes)
         bodies.append(body)
     world.add_many(bodies)

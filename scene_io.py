@@ -80,7 +80,7 @@ DEFAULT_ENV = current_env()  # applied when a preset (which has no env of its ow
 _KINDS = ((SoftBody, "soft"), (RigidBody, "rigid"), (FixedBody, "fixed"), (Body, "body"))
 _CLASSES = {"soft": SoftBody, "rigid": RigidBody, "fixed": FixedBody, "body": Body}
 BODY_EXTRAS = ("restitution", "wall_side", "palette_role", "palette_pick", "palette_material", "emissive_fill",
-               "emissive_keep_colour")  # optional per-body settings (numbers / strings), saved when present
+               "emissive_keep_colour", "shape_kind")  # optional per-body settings (numbers / strings), saved when present
 SIDES = ("left", "right", "top", "bottom")
 
 
@@ -621,6 +621,9 @@ def install(world, bodies, ropes, hooks, state=None):
             world.walls = dict(value)
         elif key == "env":
             world.env = {k: (np.array(v, dtype=float) if isinstance(v, list) else v) for k, v in value.items()}
+        elif key == "palette" and isinstance(value, str):  # a renamed palette (palettes.RENAMED): its name now
+            from palettes import RENAMED
+            world.palette = RENAMED.get(value, value)
         else:
             setattr(world, key, value)
     world._rebuild()

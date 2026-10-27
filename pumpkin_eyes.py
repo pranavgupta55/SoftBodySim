@@ -1,44 +1,30 @@
-"""Easter egg: in the "pumpkin" palette a fifth of the heptagons (7-point soft bodies of the "hexagon" palette role)
-get two small black eyes.
+"""The pumpkins' eyes: every pumpkin (pumpkins.py: a body with shape_kind "pumpkin") gets two small black eyes, in
+any palette; no other shape gets any.
 
-Which ones: the heptagons ranked by a hash of their `palette_pick` (ties by index), the first round(FRACTION * n),
-so the same bodies get eyes every time the palette is picked; another palette removes them again.
-Where: each eye is a fixed mix (mean value coordinates) of its body's own points, worked out once per body from its
-shape the first time it gets eyes (rig, kept on the body as `eye_rig`): side by side SPACING x its width apart, a
-little above its centre in that pose, so they move, turn and squash with the body. Radius RADIUS x its width (whole
-px at the drawing zoom, at least 1); on small bodies they are pushed apart to keep a 1 px gap (_spread).
+Where: each eye is a fixed mix (mean value coordinates) of its body's own points, so the eyes move, turn and squash
+with the body. The mix is worked out from the pumpkin template (pumpkins.TEMPLATE, eyes at pumpkins.EYES: on the
+face, under the stem) and is the same for every pumpkin, as mean value coordinates don't change when a shape is moved,
+turned or scaled (kept on the body as `eye_rig`: (weights (2, n), half width)). Radius pumpkins.EYE_RADIUS x its
+half width at rest (pumpkins.size_of; whole px at the drawing zoom, at least 1); on small bodies they are pushed
+apart to keep a 1 px gap (_spread).
 Drawing: World.draw (pygame) draws a body's eyes right after the body; gl_world's WorldPacker adds them as circle
 stamps on the layer just above their body (lighting on: an unlit, shadowless material, so they stay black and
-neither glow nor cast shadows). Both read `of_world`, cached per world until its palette or its bodies change.
+neither glow nor cast shadows). Both read `of_world`, cached per world until its bodies change.
 """
 import weakref
 
 import numpy as np
 
-PALETTES = ("pumpkin",)  # palettes.PALETTES names that give eyes
-FRACTION = 0.2
-ROLE, SIDES = "hexagon", 7
+import pumpkins
+
 COL = (0, 0, 0)
-SPACING, HEIGHT, RADIUS = 1 / 3, 0.07, 1 / 8  # x the body's width: distance between the eyes, height over the centre, radius
 
-_M64 = (1 << 64) - 1
-_cache = weakref.WeakKeyDictionary()  # world -> (key, Eyes or None)
-
-
-def _mix(v):
-    """splitmix64 of an int: a well spread hash for ranking the bodies."""
-    x = (int(v) * 0x9E3779B97F4A7C15 + 0x632BE59BD9B4E019) & _M64
-    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _M64
-    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _M64
-    return x ^ (x >> 31)
+_cache = weakref.WeakKeyDictionary()  # world -> (key, Eyes or None, P)
 
 
 def chosen(bodies):
-    """Indices of the bodies that get eyes (sorted)."""
-    hept = [k for k, b in enumerate(bodies) if getattr(b, "palette_role", None) == ROLE
-            and np.shape(b.points)[1] == SIDES and not getattr(b, "fixed", False)]
-    hept.sort(key=lambda k: (_mix(getattr(bodies[k], "palette_pick", k)), k))
-    return sorted(hept[:int(round(FRACTION * len(hept)))])
+    """Indices of the bodies that get eyes (the pumpkins; sorted)."""
+    return [k for k, b in enumerate(bodies) if pumpkins.is_pumpkin(b) and not getattr(b, "fixed", False)]
 
 
 def _mvc(poly, x):
@@ -51,34 +37,33 @@ def _mvc(poly, x):
     return w / w.sum()
 
 
+WEIGHTS = np.stack([_mvc(pumpkins.TEMPLATE, e) for e in pumpkins.EYES.T])  # (2, n): one row per eye
+
+
 def rig(body):
-    """(weights (2, n): one row per eye, width) for a body, from its shape now; kept on the body (`eye_rig`)."""
-    pts = np.asarray(body.points, dtype=np.float64)
+    """(weights (2, n): one row per eye, half width) for a pumpkin; kept on the body (`eye_rig`)."""
     got = getattr(body, "eye_rig", None)
-    if got is not None and got[0].shape == (2, pts.shape[1]):
+    if got is not None and got[0].shape == WEIGHTS.shape:
         return got
-    c = pts.mean(axis=1)
-    width = 2 * float(np.hypot(*(pts - c[:, None])).mean())
-    eyes = c[:, None] + width * np.array([[-SPACING / 2, SPACING / 2], [-HEIGHT, -HEIGHT]])  # (screen y is down)
-    body.eye_rig = (np.stack([_mvc(pts, e) for e in eyes.T]), width)
+    body.eye_rig = (WEIGHTS, pumpkins.size_of(body))
     return body.eye_rig
 
 
 class Eyes:
-    """The eyes of one world's bodies: body (m,) body index per eye, local / gidx (m, n) its body's point indices
-    (own / World.P), w (m, n) their weights, width (m,) the body's width (world units); rows[k]: body k's eyes."""
+    """The eyes of one world's bodies: body (m,) body index per eye, gidx (m, n) its body's point indices in
+    World.P, w (m, n) their weights, size (m,) the body's half width (world units); rows[k]: body k's eyes."""
 
     def __init__(self, world, ks):
-        n = SIDES
+        n = pumpkins.N
         rigs = [rig(world.bodies[k]) for k in ks]
         self.body = np.repeat(np.asarray(ks, np.int64), 2)
         self.w = np.concatenate([r[0] for r in rigs]) if rigs else np.zeros((0, n))
-        self.width = np.repeat([r[1] for r in rigs], 2).astype(np.float64)
+        self.size = np.repeat([r[1] for r in rigs], 2).astype(np.float64)
         self.gidx = np.asarray(world.offsets, np.int64)[self.body][:, None] + np.arange(n)
         self.rows = {k: (2 * i, 2 * i + 2) for i, k in enumerate(ks)}
 
     def radii(self, zoom, sel=slice(None)):
-        return np.maximum(np.round(self.width[sel] * zoom * RADIUS), 1.0)
+        return np.maximum(np.round(self.size[sel] * zoom * pumpkins.EYE_RADIUS), 1.0)
 
 
 def _spread(c, r):
@@ -94,11 +79,11 @@ def _spread(c, r):
 
 
 def of_world(world):
-    """The world's Eyes (None: its palette gives none, or no body qualifies), rebuilt when its palette or bodies
-    change (World._rebuild rebinds P); per frame one key comparison."""
-    if getattr(world, "palette", None) not in PALETTES or not world.bodies:
+    """The world's Eyes (None: no pumpkins), rebuilt when its bodies change (World._rebuild rebinds P); per frame
+    one key comparison."""
+    if not world.bodies:
         return None
-    key = (world.palette, id(world.P), len(world.bodies))
+    key = (id(world.P), len(world.bodies))
     hit = _cache.get(world)
     if hit is not None and hit[0] == key and hit[2] is world.P:
         return hit[1]

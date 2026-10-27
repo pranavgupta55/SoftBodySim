@@ -306,7 +306,7 @@ class WorldPacker:
             radii.append(np.array([float(b.point_radius) for b in bodies])[pb])
 
 
-# ---------------- the pumpkin palette's eyes (pumpkin_eyes.py): circle stamps over their bodies
+# ---------------- the pumpkins' eyes (pumpkin_eyes.py): circle stamps over their bodies
 EYE_MATERIAL = materials.Material(lit=False, casts_shadow=False)  # lit: stays black, no glow, no shadow of its own
 
 

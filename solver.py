@@ -826,7 +826,7 @@ class World:
         copies = defaultdict(list)
         for k, s in looping.image_copies(self):
             copies[k].append(s)
-        eyes = pumpkin_eyes.of_world(self)  # the pumpkin palette's easter egg: eyes on some heptagons
+        eyes = pumpkin_eyes.of_world(self)  # the pumpkins' eyes (pumpkins.py)
         for k, b in enumerate(self.bodies):
             for s in [None] + copies.get(k, []):
                 if s is not None:  # a shallow copy with moved points draws the image (the body's arrays untouched)
