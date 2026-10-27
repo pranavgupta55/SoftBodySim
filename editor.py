@@ -1965,7 +1965,9 @@ class Editor(SelectionTools):
         elif kind == "step":  # the speed row's - / + (disabled at 1% / 10000%)
             st.draw_button(surface, area, spec[1], hovered, False, spec[2])
         elif kind == "speed":  # the physics speed readout between the - / + buttons (no clicks)
-            label = "speed" if self.time is None else f"speed {self.time.label()}"
+            label = "speed" if self.time is None else self.time.readout()
+            if self.time is not None and st.font("bold").size(label)[0] > area.width - 4:
+                label = self.time.readout(short=True)  # a narrow card: "500% (380%)"
             st.text(surface, label, area.center, ui.WHITE, "bold", align="center", valign="middle")
         elif kind == "worlds":  # selected (lit) while the world selector panel is open
             st.draw_button(surface, area, "[w]", hovered, self.world_selector.open)
