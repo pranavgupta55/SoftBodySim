@@ -194,6 +194,12 @@ class WorldPacker:
         if world.grabbed is not None and nb:
             a, b = _px(world.P[:, world.grabbed] * zoom), _px(np.asarray(world.grab_target) * zoom)
             lines.append(np.array([[a[0], a[1], b[0], b[1], 1, pack_rgb([(255, 255, 255)])[0], layer, 0]]))
+        if getattr(world, "grab_set", None) is not None and nb:  # an area grab: each held point to its target
+            idx, off, _ = world.grab_set
+            a, b = _px(world.P[:, idx] * zoom), _px((np.asarray(world.grab_target)[:, None] + off) * zoom)
+            k = len(idx)
+            lines.append(np.stack([a[0], a[1], b[0], b[1], np.ones(k), np.full(k, pack_rgb([(255, 255, 255)])[0]),
+                                   np.full(k, layer), np.zeros(k)], axis=1))
         cat = lambda xs, w: np.concatenate(xs).astype(np.int64) if xs else np.zeros((0, w), np.int64)
         lines = cat(lines, 8)
         return dict(fills=fills, verts=verts, lines=lines[lines[:, 4] >= 1].astype(np.int32), stamps=cat(stamps, 6),

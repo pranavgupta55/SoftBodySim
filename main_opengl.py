@@ -68,6 +68,8 @@ SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
 FPS = 120  # frame cap; physics keeps its 1/240 s substeps at any rate (World.step's frames)
 SCALE_DOWN = 2  # real screen px per render surface px
 GHOST_ALPHA = 100  # opacity of the translucent ghost layer (screenT)
+GRAB_AREA_MIN, GRAB_AREA_MAX = 10.0, 400.0  # the area grab's circle radius range (world units)
+GRAB_AREA_WHEEL = 1.15  # each wheel notch scales the circle by this
 OVERLAY_LEGEND_PX = 6  # the debug overlay legend's top-left corner, UI px in from the top-left of the screen
 MEASURE_GPU = True  # ctx.finish() before the flip so the compute card can show GPU time
 INPUT_EVENTS = {pygame.KEYDOWN, pygame.KEYUP, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL}
@@ -345,7 +347,7 @@ def sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, now):
     `inputs` (keys / buttons / wheel seen so far), plus the mouse while it is over the sidebar (hover)."""
     return (inputs, mouse_px if hud.rect.collidepoint(mouse_px) else None, session.name, session.open, id(editor),
             editor.paused, editor.active, editor.stage, editor.show_compute, ViewConfig.show_grid, ViewConfig.filled,
-            ViewConfig.trails, panel_open, int(now * SIDEBAR_SAFETY_HZ))
+            ViewConfig.trails, ViewConfig.grab_area, panel_open, int(now * SIDEBAR_SAFETY_HZ))
 
 
 def grid_colors(background):
@@ -547,7 +549,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 continue
             if event.type == pygame.MOUSEBUTTONDOWN:
                 click = True
-                world.grab((wx, wy))
+                world.grab((wx, wy), ViewConfig.grab_area_radius if ViewConfig.grab_area else None)
             if event.type == pygame.MOUSEBUTTONUP:
                 click = False
                 world.release()
@@ -560,6 +562,11 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     ViewConfig.filled = not ViewConfig.filled
                 if event.key == pygame.K_t:
                     ViewConfig.trails = not ViewConfig.trails
+                if event.key == pygame.K_b:  # B: grab the nearest point, or every point in a circle
+                    ViewConfig.grab_area = not ViewConfig.grab_area
+            if event.type == pygame.MOUSEWHEEL and ViewConfig.grab_area:  # the wheel resizes the grab circle
+                r = ViewConfig.grab_area_radius * GRAB_AREA_WHEEL ** event.y
+                ViewConfig.grab_area_radius = min(GRAB_AREA_MAX, max(GRAB_AREA_MIN, r))
                 if pygame.K_1 <= event.key <= pygame.K_4:
                     overlays.toggle(event.key - pygame.K_1)
                 if event.key == pygame.K_LEFTBRACKET:
@@ -604,6 +611,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         if overlays.any():
             with profiler.section("overlays"):
                 overlays.draw(view, world, ViewConfig.zoom)
+        if ViewConfig.grab_area and not editor.active:  # the area grab's circle around the cursor
+            pygame.draw.circle(screen2, (255, 255, 255), (mx, my), max(2, int(ViewConfig.grab_area_radius
+                                                                                * ViewConfig.zoom)), 1)
         editor.draw_world(screen2, screenT, (mx, my))
         if overlays.any():  # the legend: top left of the world area
             overlays.draw_legend(screenUI, world, (OVERLAY_LEGEND_PX, OVERLAY_LEGEND_PX))

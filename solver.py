@@ -108,6 +108,9 @@ class World:
         self.hooks = []  # entities.Hook: fixed points for ropes; drawn only, never stepped or collided
         self.grabbed = None  # global index of the point being dragged
         self.grab_target = np.zeros(2)
+        # area grab (grab with a radius): (point indices (k,), offsets (2, k), radius); point j is pulled toward
+        # grab_target + its offset (in its own frame), so the held points keep their layout around the cursor
+        self.grab_set = None
         self.zone_count = 0  # how many CCD passes needed the rigid impact zone fallback (for debugging)
         self.projection_count = 0  # how many CCD passes the inelastic projection fallback fixed (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
@@ -154,7 +157,7 @@ class World:
             self.bodies.append(body)
         else:
             self.bodies.insert(index, body)
-            self.grabbed = None
+            self.grabbed = self.grab_set = None
         self._rebuild()
 
     def set_looping(self, side, on):
@@ -202,7 +205,7 @@ class World:
                 if id(b) in gone_b:
                     b.points, b.prev, b.vels, b.inv_mass = b.points.copy(), b.prev.copy(), b.vels.copy(), b.inv_mass.copy()
             self.bodies = [b for b in self.bodies if id(b) not in gone_b]
-            self.grabbed = None
+            self.grabbed = self.grab_set = None
             self._rebuild()
         else:
             self._recheck_backend()
@@ -220,7 +223,7 @@ class World:
         """Set the draw order: `bodies` is self.bodies in a new order (containers go before what they hold). Repacks."""
         assert sorted(map(id, bodies)) == sorted(map(id, self.bodies))
         self.bodies = list(bodies)
-        self.grabbed = None
+        self.grabbed = self.grab_set = None
         self._rebuild()
 
     def _rebuild(self):
@@ -365,10 +368,13 @@ class World:
             r.solve_constraints()
 
     # ---------------- Mouse dragging
-    def grab(self, pos):
+    def grab(self, pos, radius=None):
         """Pick up the nearest movable point within grab_radius of pos (if any). Across a periodic axis a point's
         images count too (a body straddling the seam can be grabbed on either visible copy): grab_shift then holds
-        the image offset, and grab_target is the cursor moved into the point's frame."""
+        the image offset, and grab_target is the cursor moved into the point's frame.
+        radius: an area grab instead, every movable point within `radius` of pos (grab_area)."""
+        if radius is not None:
+            return self.grab_area(pos, radius)
         dist = np.hypot(*(self.P - np.reshape(pos, (2, 1))))
         dist[self.W <= 0] = np.inf  # fixed points can't be dragged
         i = int(np.argmin(dist))
@@ -384,17 +390,44 @@ class World:
             self.grab_shift = shift
             self.grab_target = np.array(pos, dtype=float) - shift if shift.any() else np.array(pos, dtype=float)
 
+    def grab_area(self, pos, radius):
+        """Pick up every movable point within `radius` of pos, of any bodies (on either copy across a periodic seam):
+        grab_set. Each is pulled toward the cursor plus its offset from the cursor at the moment of the grab, so the
+        held region moves with the cursor like one piece while springs and contacts act on it."""
+        c = np.reshape(np.asarray(pos, dtype=float), (2, 1))
+        dist = np.hypot(*(self.P - c))
+        for s in looping.image_shifts(self.period):  # a point counts if any of its visible copies is in the circle
+            dist = np.minimum(dist, np.hypot(*(self.P + s[:, None] - c)))
+        # target = cursor + offset starts at the point itself and moves with the cursor (in the point's own frame,
+        # so a copy across the seam is held where it is)
+        off = self.P - c
+        idx = np.flatnonzero((dist <= radius) & (self.W > 0))
+        if idx.size:
+            self.grabbed = None
+            self.grab_shift = np.zeros(2)
+            self.grab_target = np.array(pos, dtype=float)
+            self.grab_set = (idx, off[:, idx].copy(), float(radius))
+
     def drag_to(self, pos):
         shift = self.grab_shift
         self.grab_target = np.array(pos, dtype=float) - shift if shift.any() else np.array(pos, dtype=float)
 
     def release(self):
-        self.grabbed = None
+        self.grabbed = self.grab_set = None
         self.grab_shift = np.zeros(2)
 
     def _apply_grab(self, h):
         """Nudge the held point toward the cursor once per substep of length h, so contacts (solved after) can
         out-vote the hand. The pull is set per second, so dragging feels the same at any substep count."""
+        if self.grab_set is not None:  # an area grab: every held point toward its own target, each capped
+            idx, off, _ = self.grab_set
+            gap = self.grab_target[:, None] + off - self.P[:, idx]
+            step = gap * -math.expm1(-EnvConfig.grab_stiffness * h)
+            length = np.hypot(*step)
+            max_step = EnvConfig.grab_max_speed * h
+            step *= np.minimum(1.0, max_step / np.maximum(length, 1e-12))
+            self.P[:, idx] += step
+            return
         if self.grabbed is None:
             return
         gap = self.grab_target - self.P[:, self.grabbed]
@@ -641,6 +674,10 @@ class World:
             hk.draw(surface, zoom, filled)
         if self.grabbed is not None:
             pygame.draw.line(surface, (255, 255, 255), self.P[:, self.grabbed] * zoom, self.grab_target * zoom, 1)
+        if self.grab_set is not None:  # an area grab: each held point to its target
+            idx, off, _ = self.grab_set
+            for a, b in zip(self.P[:, idx].T, (self.grab_target[:, None] + off).T):
+                pygame.draw.line(surface, (255, 255, 255), a * zoom, b * zoom, 1)
 
     def draw_grid(self, surface, line_col=(52, 58, 76), edge_cell_col=(37, 42, 55), point_cell_col=(45, 51, 68), zoom=1.0):
         """Debug view of the broad phase grid: cell (i, j) covers [i, i + 1) * cell_size, same as the solver's floor().
@@ -894,6 +931,12 @@ class World:
             reach = EnvConfig.grab_max_speed * t
             dist = float(np.hypot(*pull))
             end[:, g] = self.P[:, g] + self.V[:, g] * t + (pull if dist <= reach else pull * (reach / dist))
+        if self.grab_set is not None:  # an area grab: the same reach for each held point
+            idx, off, _ = self.grab_set
+            pull = self.grab_target[:, None] + off - self.P[:, idx]
+            reach = EnvConfig.grab_max_speed * t
+            dist = np.hypot(*pull)
+            end[:, idx] = self.P[:, idx] + self.V[:, idx] * t + pull * np.minimum(1.0, reach / np.maximum(dist, 1e-12))
         return np.minimum(self.P, end) - r, np.maximum(self.P, end) + r
 
     def _span_candidates(self):

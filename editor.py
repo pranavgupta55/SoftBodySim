@@ -1259,7 +1259,10 @@ class Editor(SelectionTools):
                          ("[ ]", "speed", None if self.time is None else self.time.label(), True),
                          ("N", "step", None, self.can_frame_step()),
                          ("arrows", "gravity", direction_name(compass=True), True)] + self._world_hotkeys()
-                        + ([] if self._editing() else [("drag", "grab bodies", None, not self.paused)])
+                        + ([] if self._editing() else [("drag", "grab bodies", None, not self.paused),
+                                                       ("B", "grab", None if v is None else
+                                                        ("circle" if getattr(v, "grab_area", False) else "point"),
+                                                        True)])
                         + [("ESC", "back" if self.active or self._esc_cancels() else "quit", None, True)]),
                 ("View", [("G", "grid", grid, True),
                           ("V", "view", look, True),

@@ -181,18 +181,29 @@ def add_world_box(world, width, height, inset, col=(100, 100, 100), ext=None):
 
 
 def _edit_bodies(world, mutate):
-    """Run mutate() on world.bodies, repack, and keep a held grab on the same point."""
+    """Run mutate() on world.bodies, repack, and keep a held grab (or area grab) on the same points."""
     ref = None
     if world.grabbed is not None and world.bodies:
         k = int(world.point_body[world.grabbed])
         ref = (world.bodies[k], world.grabbed - int(world.offsets[k]))
+    held = None  # an area grab's points as (body, local index, offset)
+    if getattr(world, "grab_set", None) is not None and world.bodies:
+        idx, off, radius = world.grab_set
+        ks = world.point_body[idx]
+        held = ([(world.bodies[int(k)], int(i) - int(world.offsets[int(k)]), off[:, j]) for j, (i, k) in
+                 enumerate(zip(idx, ks))], radius)
     mutate()
     if world.bodies:
         world._rebuild()
-    world.grabbed = None
+    world.grabbed = world.grab_set = None
     if ref is not None and any(b is ref[0] for b in world.bodies):
         k = next(i for i, b in enumerate(world.bodies) if b is ref[0])
         world.grabbed = int(world.offsets[k]) + ref[1]
+    if held is not None:
+        where = {id(b): k for k, b in enumerate(world.bodies)}
+        kept = [(int(world.offsets[where[id(b)]]) + i, o) for b, i, o in held[0] if id(b) in where]
+        if kept:
+            world.grab_set = (np.array([i for i, _ in kept]), np.array([o for _, o in kept]).T, held[1])
 
 
 def _wall_line(wall):
@@ -472,6 +483,8 @@ def _periodic_wraps(world):
     else:  # no ropes: every body is its own group (only those to move matter)
         groups, anchored = {int(k): [int(k)] for k in np.flatnonzero(out)}, set()
     grabbed_body = None if world.grabbed is None else int(world.point_body[world.grabbed])
+    held = getattr(world, "grab_set", None)  # an area grab: its points' bodies
+    held_bodies = None if held is None else world.point_body[held[0]]
     wraps = []
     for root, members in groups.items():
         if root in anchored or not any(out[k] for k in members):
@@ -491,6 +504,10 @@ def _periodic_wraps(world):
         if grabbed_body in members:  # the hand's target moves into the body's new frame with it
             world.grab_target = np.asarray(world.grab_target, dtype=float) + d
             world.grab_shift = world.grab_shift - d
+        if held_bodies is not None:  # so do the targets of an area grab's points in these bodies
+            moved = np.isin(held_bodies, members)
+            if moved.any():
+                held[1][:, moved] += d[:, None]
         wraps.extend((world.bodies[k], (float(d[0]), float(d[1]))) for k in members)
     return wraps
 
@@ -540,6 +557,8 @@ def _walled_wraps(world, active):
         return []
     groups, anchored = rope_groups(world)
     grabbed_body = None if world.grabbed is None else int(world.point_body[world.grabbed])
+    held = getattr(world, "grab_set", None)  # bodies with points in an area grab don't wrap either
+    held_bodies = set() if held is None else set(world.point_body[held[0]].tolist())
     gap = clearance()
     wraps = []
     # groups that found no free spot recently: id(first body) -> frames left before they search again
@@ -549,7 +568,8 @@ def _walled_wraps(world, active):
         if waiting[key] <= 0:
             del waiting[key]
     for root, members in groups.items():
-        if root in anchored or grabbed_body in members or not all(outside[k] for k in members):
+        if (root in anchored or grabbed_body in members or held_bodies.intersection(members)
+                or not all(outside[k] for k in members)):
             continue
         key = id(world.bodies[members[0]])
         if key in waiting:

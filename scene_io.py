@@ -490,7 +490,7 @@ def install(world, bodies, ropes, hooks, state=None):
     optional world settings from build(); each is applied only if this World has that attribute (older builds and
     newer files mix gracefully)."""
     world.bodies, world.ropes, world.hooks = list(bodies), list(ropes), list(hooks)
-    world.grabbed = None
+    world.grabbed = world.grab_set = None
     # settings the state doesn't mention go back to a new World's defaults (nothing of the old scene leaks through)
     if isinstance(getattr(world, "looping", None), dict):
         world.looping = {k: False for k in world.looping}
