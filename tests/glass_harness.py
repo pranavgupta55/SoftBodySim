@@ -9,7 +9,7 @@ texture), 2x crops of the glass, mirror and fluid areas, the fluid filter on / o
 per stage at 900x584. tests/glass_check.py imports the builders for its assertions.
 
 Stand-ins that swap for the real pieces at integration:
-- material table: materials.pack (F) when it exists, else harness_pack (the layout of glass_mat_provisional.glsl)
+- material table: materials.pack (F's real layout)
 - G-buffer layout per research/lighting_contract.md (normal.rg = outward bevel normal, b = edge distance px / 255)
 - scene_lit: albedo x (ambient + one point light with bevel shading), a stand-in for L's compose
 - sdf: exact polygon signed distances near each shape, a bounding-circle lower bound elsewhere (S's sdf texture)
@@ -40,19 +40,8 @@ LENS = Material(kind=materials.GLASS, ior=1.5, transparency=0.9, reflectivity=0.
 LIGHT_POS, LIGHT_RADIUS, AMBIENT = (600.0, 90.0), 700.0, 0.55
 
 
-def harness_pack(m):
-    """8x4 floats in glass_mat_provisional.glsl's layout."""
-    return np.array([
-        [*m.tint, m.tint_strength], [*m.emissive, m.emissive_strength],
-        [m.specular, m.roughness, m.bands, m.bevel_px], [m.profile, m.kind, m.ior, m.reflectivity],
-        [m.transparency, m.absorption, m.pattern, m.pattern_scale],
-        [m.pattern_strength, float(m.casts_shadow), float(m.lit), 0.0], [0, 0, 0, 0], [0, 0, 0, 0]], np.float32)
-
-
 def pack(m):
-    if gl_glass.material_include() == "material.glsl" and hasattr(materials, "pack"):
-        return np.asarray(materials.pack(m), np.float32).reshape(8, 4)
-    return harness_pack(m)
+    return np.asarray(materials.pack(m), np.float32).reshape(materials.TEXELS, 4)
 
 
 @dataclass
@@ -197,9 +186,10 @@ class Harness:
                      "mat": tex(data["mat"].astype(np.uint16), 1, "u2")}
         if behind:
             self.gbuf["behind"] = tex(rgba8(data["floor"]), 4)
-        table = np.stack([pack(m) if m is not None else np.zeros((8, 4), np.float32)
+        table = np.stack([pack(m) if m is not None else np.zeros((materials.TEXELS, 4), np.float32)
                           for m in data["mats"]])  # (n, 8, 4)
-        self.material_tex = ctx.texture((8, len(data["mats"])), 4, table.astype(np.float32).tobytes(), dtype="f4")
+        self.material_tex = ctx.texture((materials.TEXELS, len(data["mats"])), 4, table.astype(np.float32).tobytes(),
+                                        dtype="f4")
         self.material_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.scene_bytes = rgba8(data["scene"])
         self.scene_lit = tex(self.scene_bytes, 4)

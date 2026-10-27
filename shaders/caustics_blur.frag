@@ -1,14 +1,20 @@
-// Caustics: one 7x7 binomial blur pass over the deposited points (wrapping on periodic axes) -> shared["caustics"].
+// Caustics: one axis of a separable Gaussian blur (sigma CAUSTIC_BLUR_PX, wrapping on periodic axes) of the
+// deposited points; run along x then y -> shared["caustics"].
 out vec4 f_color;
 
 uniform sampler2D u_src;
+uniform ivec2 u_dir;
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    const float w[7] = float[7](1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0);
-    vec3 sum = vec3(0.0);
-    for (int y = -3; y <= 3; y++)
-        for (int x = -3; x <= 3; x++)
-            sum += w[x + 3] * w[y + 3] * texelFetch(u_src, pixi(p + ivec2(x, y)), 0).rgb;
-    f_color = vec4(sum / 4096.0, 1.0);
+    int rad = int(ceil(2.5 * CAUSTIC_BLUR_PX));
+    float k = -0.5 / (CAUSTIC_BLUR_PX * CAUSTIC_BLUR_PX);
+    vec3 sum = texelFetch(u_src, p, 0).rgb;
+    float wsum = 1.0;
+    for (int i = 1; i <= rad; i++) {
+        float w = exp(k * float(i * i));
+        sum += w * (texelFetch(u_src, pixi(p + i * u_dir), 0).rgb + texelFetch(u_src, pixi(p - i * u_dir), 0).rgb);
+        wsum += 2.0 * w;
+    }
+    f_color = vec4(sum / wsum, 1.0);
 }

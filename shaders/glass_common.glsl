@@ -76,6 +76,18 @@ vec2 edge_normal(ivec2 c, vec2 fallback) {
     return fallback;
 }
 
+// The outward normal of the boundary a ray crossed between `inner` (the body pixel) and `air` (the point just outside
+// it): with the SDF its gradient taken on the air side (smooth, and right on outlines, which carry a flat G-buffer
+// normal); else edge_normal of the body pixel.
+vec2 hit_normal(vec2 inner, vec2 air, vec2 fallback) {
+#ifdef USE_SDF
+    vec2 sg = vec2(sdf_at(u_sdf, air + vec2(2.0, 0.0), u_period) - sdf_at(u_sdf, air - vec2(2.0, 0.0), u_period),
+                   sdf_at(u_sdf, air + vec2(0.0, 2.0), u_period) - sdf_at(u_sdf, air - vec2(0.0, 2.0), u_period));
+    if (dot(sg, sg) > 1e-4) return normalize(sg);
+#endif
+    return edge_normal(pix(inner), fallback);
+}
+
 // ---------------------------------------------------------------- in-plane ray march
 // Light / view rays travelling in the plane: air (background, id 0) -> sdf steps; glass / fluid -> Snell in, march
 // inside with Beer-Lambert absorption toward the body's colour, Snell out or total internal reflection; mirror ->
@@ -85,6 +97,7 @@ struct Ray {
     vec2 dir;
     vec3 thr;    // throughput
     int events;  // reflections / refractions so far
+    int refr;    // of which refractions into or out of glass / fluid
     int end;     // 0: ran its whole length (or left the view) in air, 1: hit an opaque body at pos, 2: stopped
                  // inside a medium or out of bounces (pos is the last point), 3: out of steps
 };
@@ -123,7 +136,7 @@ vec4 refine(vec2 a, vec2 b, int sa) {
 }
 
 Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
-    Ray r = Ray(o, normalize(dir), vec3(1.0), 0, 0);
+    Ray r = Ray(o, normalize(dir), vec3(1.0), 0, 0, 0);
     float t = 0.0;
     // leave the body the ray starts from (a view ray starting on a mirror / glass pixel)
     if (self_id != 0u) {
@@ -155,7 +168,7 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
                 ivec2 hc = pix(e.zw);
                 kind_of(mat_id(hc));
                 Mat m = g_mat;
-                vec2 n = edge_normal(hc, -r.dir);
+                vec2 n = hit_normal(e.zw, e.xy, -r.dir);
                 if (dot(n, r.dir) > 0.0) n = -n;
                 r.events++;
                 if (k == KIND_MIRROR) {
@@ -169,6 +182,7 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
                         r.pos = e.xy + r.dir;
                     } else {
                         r.dir = normalize(rd);
+                        r.refr++;
                         inside = true;
                         ior = max(m.ior, 1.0);
                         absorption = m.absorption;
@@ -189,7 +203,7 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
             } else {  // left the medium between prev and pos
                 vec4 e = refine(prev, r.pos, 1);
                 ivec2 ic = pix(e.xy);
-                vec2 n = edge_normal(ic, r.dir);  // outward
+                vec2 n = hit_normal(e.xy, e.zw, r.dir);  // outward
                 if (dot(n, r.dir) < 0.0) n = -n;
                 vec2 rd = refract(r.dir, -n, ior);
                 if (dot(rd, rd) < 1e-6) {  // total internal reflection
@@ -199,6 +213,7 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
                     r.pos = e.xy + r.dir;
                 } else {
                     r.events++;
+                    r.refr++;
                     r.dir = normalize(rd);
                     inside = false;
                     r.pos = e.zw + r.dir;
@@ -208,6 +223,7 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
                 continue;
             }
         }
+        step = min(step, max_t - t);  // land exactly at max_t (else the end points bunch up on step boundaries)
         prev = r.pos;
         r.pos += r.dir * step;
         t += step;

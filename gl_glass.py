@@ -29,7 +29,7 @@ bodies merge into one liquid surface (gaps bridged, corners rounded); the field'
 value its thickness, feeding the same resolve.
 
 Caustics (CausticsEffect): each light shoots CAUSTIC_RAYS rays through the march; points sampled along the rays
-after they were refracted / reflected are splatted additively into shared["caustics"] (RGBA16F), one blur pass.
+after they were refracted / reflected are splatted additively into shared["caustics"] (RGBA16F), then a separable blur.
 """
 import os
 
@@ -69,11 +69,13 @@ FLUID_NORMAL_GAIN = 8.0  # smoothed liquid gradient (per px) -> normal.xy
 FLUID_THICK_PX = 16.0  # thickness where the smoothed liquid is 1
 FLUID_SEARCH = 12  # px a bridge pixel looks around (8 directions) for a fluid body, for its material
 # ---- caustics
-CAUSTICS = False  # CausticsEffect runs only when this (or its .enabled) is True
+CAUSTICS = False  # CausticsEffect runs only when this (its .enabled) or the world's `caustics` attribute is True
 CAUSTIC_RAYS = 2048  # per light
 CAUSTIC_SAMPLES = 48  # points per ray
+CAUSTIC_BLUR_PX = 3.0  # sigma of the separable blur over the deposited points
 CAUSTIC_MAX_T = 600.0  # px of ray path
 CAUSTIC_GAIN = 1.0
+CAUSTIC_MIRRORS = False  # also deposit light only mirrors bent (a flat mirror wall = a second, streaky light source)
 CAUSTIC_STEPS = 192  # march steps per caustic sample (rays cross the whole view)
 PUSHPULL_MIN = 8  # push-pull stops halving at this size (px): fewer, cheaper passes; holes this coarse are rare
 KINDS_EVERY = 10  # runs between rescans of the world's material kinds (skips the passes a world doesn't need)
@@ -88,19 +90,21 @@ void main() {
 def _glsl(v):
     if isinstance(v, (tuple, list)):
         return f"vec{len(v)}({', '.join(_glsl(x) for x in v)})"
-    if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, np.integer)):
         return str(int(v))
     return repr(float(v))
 
 
 def _defines(**over):
-    d = dict(KIND_OPAQUE=materials.OPAQUE, KIND_GLASS=materials.GLASS, KIND_MIRROR=materials.MIRROR,
-             KIND_FLUID=materials.FLUID, MARCH_STEPS=MARCH_STEPS, MARCH_BOUNCES=MARCH_BOUNCES,
+    d = dict(MARCH_STEPS=MARCH_STEPS, MARCH_BOUNCES=MARCH_BOUNCES,
              MARCH_MAX_T=float(MARCH_MAX_T), STEP_MIN_PX=STEP_MIN_PX, STEP_MAX_PX=STEP_MAX_PX,
              STEP_NOSDF_PX=STEP_NOSDF_PX, STEP_MEDIUM_PX=STEP_MEDIUM_PX, RATIO_EPS=RATIO_EPS,
              REFRACT_DEPTH_PX=REFRACT_DEPTH_PX, MIN_REFRACT_PX=MIN_REFRACT_PX, THICK_PER_EDGE=THICK_PER_EDGE,
              MIRROR_DEPTH_PX=MIRROR_DEPTH_PX, MIRROR_SOFT_PX=MIRROR_SOFT_PX, VIEW3=(VIEW_TILT[0], VIEW_TILT[1], -1.0),
-             GLINT_DIR=GLINT_DIR, GLINT_STRENGTH=GLINT_STRENGTH, FLUID_NORMAL_GAIN=FLUID_NORMAL_GAIN, FLUID_THICK_PX=FLUID_THICK_PX,
+             GLINT_DIR=GLINT_DIR, GLINT_STRENGTH=GLINT_STRENGTH, FLUID_NORMAL_GAIN=FLUID_NORMAL_GAIN,
+             FLUID_THICK_PX=FLUID_THICK_PX,
              FLUID_SEARCH=FLUID_SEARCH)
     d.update(over)
     return "".join(f"#define {k} {_glsl(v)}\n" for k, v in d.items())
@@ -111,24 +115,15 @@ def _read(name):
         return f.read()
 
 
-def material_include():
-    """F's shaders/material.glsl (mat_fetch) once it exists, else the provisional stand-in."""
-    real = os.path.exists(os.path.join(SHADER_DIR, "material.glsl"))
-    return "material.glsl" if real else "glass_mat_provisional.glsl"
-
-
-def sdf_include():
-    """S's shaders/sdf_shadow.glsl (sdf_at) once it exists, else the stand-in."""
-    return "sdf_shadow.glsl" if os.path.exists(os.path.join(SHADER_DIR, "sdf_shadow.glsl")) else "glass_sdf_stub.glsl"
-
-
 def program(ctx, frag, vert=None, sdf=False, **defines):
-    """Compile a G program: #version, the constants (`defines` override them), [USE_SDF + sdf_at], mat_fetch,
-    glass_common.glsl, then the shader (a fullscreen triangle vertex shader unless `vert`)."""
+    """Compile a G program: #version, the constants (`defines` override them), [USE_SDF + S's sdf_shadow.glsl],
+    F's material.glsl (Mat, mat_fetch, KIND_*), glass_common.glsl, then the shader (a fullscreen triangle vertex
+    shader unless `vert`). Own loader rather than FrameInfo.load: it needs the #defines and builds programs in make()
+    before any frame exists."""
     head = "#version 330 core\n" + _defines(**defines)
     if sdf:
-        head += "#define USE_SDF\n" + _read(sdf_include()) + "\n"
-    head += _read(material_include()) + "\n" + _read("glass_common.glsl") + "\n"
+        head += "#define USE_SDF\n" + _read("sdf_shadow.glsl") + "\n"
+    head += _read("material.glsl") + "\n" + _read("glass_common.glsl") + "\n"
     return ctx.program(vertex_shader=head + _read(vert) if vert else _FS_VERT, fragment_shader=head + _read(frag))
 
 
@@ -407,7 +402,8 @@ class GlassEffect:
 
 class CausticsEffect:
     """Order 250 (optional): light focused by glass / bent by mirrors -> shared["caustics"] (RGBA16F), which L's
-    compose adds to the diffuse light. Runs only when `enabled` (CAUSTICS) and the world has glass or mirrors."""
+    compose adds to the diffuse light. Runs only when `enabled` (CAUSTICS) or world.caustics, and the world has glass
+    or mirrors."""
     order = 250
 
     def __init__(self, ctx, size):
@@ -425,17 +421,17 @@ class CausticsEffect:
         if key not in self.progs:
             if name == "rays":
                 p = program(self.ctx, "caustics_splat.frag", vert="caustics_rays.vert", sdf=sdf,
-                            MARCH_STEPS=CAUSTIC_STEPS)
+                            MARCH_STEPS=CAUSTIC_STEPS, CAUSTIC_MIRRORS=CAUSTIC_MIRRORS)
             else:
-                p = program(self.ctx, "caustics_blur.frag", sdf=sdf)
+                p = program(self.ctx, "caustics_blur.frag", sdf=sdf, CAUSTIC_BLUR_PX=CAUSTIC_BLUR_PX)
             self.progs[key] = p
             self.vaos[key] = self.ctx.vertex_array(p, [])
         return self.progs[key], self.vaos[key]
 
     def run(self, gw, frame):
-        if not self.enabled:
-            return
         world = getattr(frame, "world", None)
+        if not (self.enabled or getattr(world, "caustics", False)):
+            return
         kinds = self.kinds.of(world)
         if not kinds & {materials.GLASS, materials.MIRROR, materials.FLUID}:
             return
@@ -471,10 +467,12 @@ class CausticsEffect:
         timer.lap("rays")
         prog, vao = self._prog("blur", False)
         _common(prog, frame)
-        raw.use(5)
-        _set(prog, u_src=5)
-        self.pool.fbo(res).use()
-        vao.render(moderngl.TRIANGLES, vertices=3)
+        tmp = self.pool.tex("tmp", self.size, 4, "f2")
+        for src, dst, axis in ((raw, tmp, (1, 0)), (tmp, res, (0, 1))):
+            src.use(5)
+            _set(prog, u_src=5, u_dir=axis)
+            self.pool.fbo(dst).use()
+            vao.render(moderngl.TRIANGLES, vertices=3)
         timer.lap("blur")
         frame.shared["caustics"] = res
         self.timings = timer.done()
