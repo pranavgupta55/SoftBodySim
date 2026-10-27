@@ -177,9 +177,10 @@ PENROSE_SEED = 1  # the pentagrid offsets' seed of a new layout (saved layouts k
 PENROSE_ROTATION = 18.0  # degrees: no horizontal edges
 PENROSE_MIN_SLOPE = 0.0  # pick only tiles whose edges all slope at least this (diamonds_map.steep_tiles; 0: all)
 PENROSE_CUP_GAP = 60.0  # CUP_GAP for the penrose tiling (the "pair" rule only: layouts saved before "outline")
-# Since 2026-10-26 new penrose layouts use the "outline" cup rule (see DIAMONDS_CUPS): only touching tiles count, so
-# 50% more tiles fit (695 on 1800x1169; at gap 60 only ~578 did). Files without "cups" keep "pair"
-PENROSE_CUPS = "outline"
+# cup rule of new penrose layouts (see DIAMONDS_CUPS): "pair" (the gap rule, PENROSE_CUP_GAP) or "outline" (only
+# touching tiles, plus PENROSE_NEAR). Outline fits all 695 tiles of the density on 1800x1169 (pair at gap 60: ~536)
+# but jammed 106-168 of 168 shapes in tests (2026-10-27), pair 12-17. Files without "cups" load as "pair"
+PENROSE_CUPS = "pair"
 PENROSE_NEAR = 30.0  # outline rule: tile corners closer than this (~ a large shape) count as touching
 # a fat rhombus per golden ratio of thin ones: the mean tile area
 _PHI = (1 + math.sqrt(5)) / 2
