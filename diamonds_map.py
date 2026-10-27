@@ -155,6 +155,54 @@ def forms_cup(p, q, side, gap=0.0):
     return False
 
 
+def cup_at(v, tiles, side):
+    """The "outline" cup rule at point v: the tiles ((2, n) each) with a corner at v cover wedges of directions around
+    it; the union's outline runs along the wedges' unshared edges, so each free wedge between two solid ones is a
+    notch in the outline at v (several notches when tiles meet only at v: the outline passes v once per notch). v is
+    a cup when a notch is under 180 degrees (a reflex outline vertex) and both of its edges lead up from v (both
+    outline neighbours are higher, screen y down): a U / V that opens upward and catches what falls in. A single
+    convex tile's bottom tip is never one (its free wedge is over 180 degrees). Returns None or the cup's
+    ((start, end) radians, counterclockwise with y up, of the wedge on the notch's clockwise side, and of the one on
+    its counterclockwise side, the notch (start, width), and the indices into `tiles` of those two)."""
+    eps = 1e-6 * side
+    arcs = []
+    for j, q in enumerate(tiles):
+        d = np.hypot(q[0] - v[0], q[1] - v[1])
+        k = int(d.argmin())
+        if d[k] <= eps:
+            arcs.append(_corner_arc(q, k) + (j,))
+    if len(arcs) < 2:
+        return None
+    arcs.sort()
+    for a, b in zip(arcs, arcs[1:] + arcs[:1]):
+        lo = a[1]
+        width = (b[0] - lo) % (2 * math.pi)  # a shared edge: ~0 (or ~2 pi from rounding): never a cup
+        if width > 1e-9 and 0 < lo < math.pi and 0 < lo + width < math.pi:
+            return (a[0], a[1]), (b[0], b[1]), (lo, width), a[2], b[2]
+    return None
+
+
+def outline_cup(p, others, side):
+    """Would adding tile p (2, n) to the picked tiles `others` (those touching it, already shifted across the wraps)
+    make a cup (cup_at) at one of p's corners? Only p's corners can change: the outline anywhere else stays the same.
+    Returns None or (p's corner index, cup_at's result)."""
+    tiles = [p] + list(others)
+    for i in range(p.shape[1]):
+        c = cup_at(p[:, i], tiles, side)
+        if c is not None:
+            return i, c
+    return None
+
+
+def cup_pattern(cup):
+    """A cup_at result as a hashable local pattern: the two wedges walling the notch, (start, end) in whole degrees
+    (counterclockwise from +x, y up), which give each tile's corner angle (fat 72 / 108, thin 36 / 144) and its
+    orientation."""
+    (a, b, _, _, _) = cup
+    deg = lambda w: tuple(int(round(math.degrees(x))) % 360 for x in w)  # noqa: E731
+    return deg(a), deg(b)
+
+
 def _corner_gap(p, q):
     """The smallest distance between a corner of p and a corner of q ((2, n) each)."""
     return float(np.hypot(*(p[:, :, None] - q[:, None, :])).min())
@@ -195,12 +243,16 @@ def layout_shift(path):
 
 def layout_tiling(path):
     """A saved layout's tiling: {"tiling": "diamonds"} (the default, for files without one) or {"tiling": "penrose",
-    "pentagrid_seed": int, "edge": float, "rotation": float, "min_slope": float, "cup_gap": float} (penrose_tiles'
-    seed, edge length and rotation, steep_tiles' minimum slope and the cup rule's gap, so it rebuilds identically)."""
+    "pentagrid_seed": int, "edge": float, "rotation": float, "min_slope": float, "cups": "pair" | "outline", "cup_gap": float} (penrose_tiles' seed, edge length and rotation,
+    steep_tiles' minimum slope, pick_diamonds' cup rule and its gap (pair rule only), so it rebuilds identically).
+    A penrose file without "cups" predates the outline rule: "pair"."""
     with open(path) as f:
         data = json.load(f)
-    keys = ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cup_gap")
-    return {k: data[k] for k in keys if k in data} or {"tiling": "diamonds"}
+    keys = ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap")
+    info = {k: data[k] for k in keys if k in data} or {"tiling": "diamonds"}
+    if info["tiling"] == "penrose":
+        info.setdefault("cups", "pair")
+    return info
 
 
 def shift_diamonds(diamonds, shift, world_w, world_h):
@@ -230,7 +282,7 @@ def save_layout(path, diamonds, size, note="", spawn=None, keys=None, tiling=Non
 
 
 def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, gap=0.0, max_width=None,
-                  layout=None, layout_size=None, remove=0, add=0, add_seed=0, count=None):
+                  layout=None, layout_size=None, remove=0, add=0, add_seed=0, count=None, cups="pair", cup_log=None):
     """A seeded random `fraction` (or `count`) of the diamonds (corners, rgb, face) lying wholly inside the world (0, 0, world_w,
     world_h), which wraps on every side (looping, no walls). A diamond that would form a cup with one already picked
     (forms_cup; corners up to `gap` apart count as touching) is skipped and the next random one tried, as is one that
@@ -243,7 +295,13 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     than `layout_size` (the world it was made for), the area past it is topped up with random diamonds by the rules,
     to the same `fraction` of its tiles.
     Then a variant of that layout: `remove` of its diamonds dropped at random and `add` new ones picked by the same
-    rules (never one just removed), both seeded by (seed, add_seed). Returns [(corners, rgb)] in tiling order."""
+    rules (never one just removed), both seeded by (seed, add_seed). Returns [(corners, rgb)] in tiling order.
+    cups: "pair" (the above: forms_cup on each pair, with `gap`) or "outline": only tiles that touch (share a corner;
+    `gap` is unused) link into clusters, and a diamond is skipped when the outline of the union of it and the picked
+    ones touching it would get a cup at one of its corners (outline_cup / cup_at: a reflex outline vertex whose two
+    outline neighbours are both higher). The outline rule is order-independent but not monotone (a third tile can
+    fill a cup), so `remove` only drops diamonds whose removal leaves no cup. `cup_log`: a list that gets
+    cup_pattern() of every cup the outline rule turned down."""
     eps = 1e-6
     stack = _stack(diamonds)  # (n, 2, corners) when they all have the same corner count: whole-array tests
     if stack is None:
@@ -259,6 +317,10 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
         return []
     size = float(np.hypot(*(inside[0][0][:, 1] - inside[0][0][:, 0]))) if size is None else size
     fraction = fraction if count is None else count / len(inside)
+    outline = cups == "outline"
+    if cups not in ("pair", "outline"):
+        raise ValueError(f"cups: {cups!r}")
+    gap = 0.0 if outline else gap  # the outline rule links only tiles that touch
     link = max(gap, 1e-6 * size)
     reach = 2 * size + gap  # centers farther apart than this can't touch, cup or link
     # each diamond's center = its corners' mean, the same reduction as d[0].mean(axis=1), for all of them at once
@@ -279,21 +341,28 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                 break
             if k in cluster or k in banned:
                 continue
-            p, near, ok = inside[k][0], [], True
+            p, near, touching, ok = inside[k][0], [], [], True
             n = len(chosen)
             far = ((np.abs(cx_picked[:n, None] + shift_x - centers[k][0]) > reach)
                    | (np.abs(cy_picked[:n, None] + shift_y - centers[k][1]) > reach))
             for i, s in zip(*np.nonzero(~far)):
                 m, (dx, dy) = chosen[i], shifts[s]
                 q = inside[m][0] + np.array([[dx], [dy]])
-                if not trusted and forms_cup(p, q, size, gap):
+                if not trusted and not outline and forms_cup(p, q, size, gap):
                     ok = False
                 elif _corner_gap(p, q) <= link:
                     if dx:
                         ok = trusted  # no cluster through the left / right seam
                     near.append(m)
+                    touching.append(q)
                 if not ok:
                     break
+            if ok and outline and not trusted:
+                cup = outline_cup(p, touching, size)
+                if cup is not None:
+                    ok = False
+                    if cup_log is not None:
+                        cup_log.append(cup_pattern(cup[1]))
             if not ok:
                 continue
             merged = {id(c): c for c in (cluster[m] for m in near)}.values()
@@ -325,7 +394,26 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                 fill([extra[i] for i in rng0.permutation(len(extra))],
                      len(chosen) + max(0, int(round(fraction * len(extra)))))
     rng = np.random.default_rng([seed, add_seed])
-    if remove:  # drop some, then re-pick the rest (a subset of a valid layout is valid)
+    if remove and outline:  # drop some whose removal leaves no cup (a third tile can fill one), re-pick the rest
+        drop, kept_set = set(), set(chosen)
+        for k in rng.permutation(chosen).tolist():
+            if len(drop) == min(remove, len(chosen)):
+                break
+            kept_set.discard(k)
+            p = inside[k][0]
+            rest = [inside[m][0] + np.array([[dx], [dy]]) for m in kept_set for dx, dy in shifts
+                    if abs(centers[m][0] + dx - centers[k][0]) <= reach
+                    and abs(centers[m][1] + dy - centers[k][1]) <= reach]
+            if any(cup_at(p[:, i], rest, size) is not None for i in range(p.shape[1])):
+                kept_set.add(k)  # k fills a cup: keep it
+            else:
+                drop.add(k)
+        kept = [k for k in chosen if k not in drop]
+        chosen.clear()
+        cluster.clear()
+        fill(kept, len(kept), trusted=True)
+        banned |= drop
+    elif remove:  # drop some, then re-pick the rest (a subset of a valid layout is valid)
         drop = set(rng.choice(chosen, size=min(remove, len(chosen)), replace=False).tolist())
         kept = [k for k in chosen if k not in drop]
         chosen.clear()
