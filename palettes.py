@@ -41,6 +41,11 @@ PALETTES = {
     "lanterns": {"background": _hex("5a5866")[0], "wall": _hex("5a5866"),
                  "diamond": _hex("9a96a8", "8a8fa3", "a39a92"),
                  "hexagon": _hex("feae34", "f77622", "fee761", "e43b44", "2ce8f5", "0099db", "63c74d", "b55088")},
+    # a pumpkin by candlelight (paperheartdesign.com's Halloween palette): near-black room, dark wine walls, maroon
+    # tiles (and a shade between them), pumpkin orange and brick red shapes (and a shade between those). A fifth of
+    # its heptagons get eyes (pumpkin_eyes.py).
+    "pumpkin": {"background": _hex("170409")[0], "wall": _hex("3b1016"),
+                "diamond": _hex("67131a", "4f1218"), "hexagon": _hex("e27d56", "b3382f", "c95a41")},
 }
 DEFAULT = "forest"
 

@@ -40,6 +40,7 @@ from entities import FILL_EXPAND, Body, EnvConfig
 from gl_effects import FrameInfo, make_effects
 import looping
 import materials
+import pumpkin_eyes
 from solver import World
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
@@ -151,7 +152,7 @@ class WorldPacker:
     def __init__(self):
         self.topo = None
 
-    def pack(self, world, filled, zoom, outlines=True, body_mat=None, base_mat=0):
+    def pack(self, world, filled, zoom, outlines=True, body_mat=None, base_mat=0, eye_mat=0):
         bodies = world.bodies
         lines, stamps, radii = [], [], []
         fills = np.zeros((0, 10), np.int32)
@@ -177,6 +178,7 @@ class WorldPacker:
                 dots = np.ones(nb, dtype=bool)  # the points view: Body.draw for every body
             if dots.any():
                 self._points(t, P, dots, body_layer, bodies, lines, stamps, radii, mat)
+            _eye_stamps(world, P, zoom, body_layer, stamps, radii, eye_mat)
             # bodies sticking out past a periodic edge also draw one period over (World.draw does the same), on
             # their own layers, so a body straddling the seam shows on both sides
             groups = {}
@@ -200,6 +202,7 @@ class WorldPacker:
                     d = mask
                 if d.any():
                     self._points(t, Ps, d, body_layer, bodies, lines, stamps, radii, mat)
+                _eye_stamps(world, Ps, zoom, body_layer, stamps, radii, eye_mat, mask)
         layer = 2 * nb
         for r in world.ropes:
             if r.width >= 1:
@@ -301,6 +304,24 @@ class WorldPacker:
             zero = np.zeros(sel.size, np.int64)
             stamps.append(np.stack([c[0], c[1], point_c[pb], body_layer[pb], zero, mat[pb]], axis=1))
             radii.append(np.array([float(b.point_radius) for b in bodies])[pb])
+
+
+# ---------------- the pumpkin palette's eyes (pumpkin_eyes.py): circle stamps over their bodies
+EYE_MATERIAL = materials.Material(lit=False, casts_shadow=False)  # lit: stays black, no glow, no shadow of its own
+
+
+def _eye_stamps(world, P, zoom, body_layer, stamps, radii, eye_mat, mask=None):
+    """Black discs for the eyes of the bodies (in `mask`, if given) from P = World.P x zoom (or a periodic copy),
+    each on its body's layer + 1 (over its fill and border, under the next body); eye_mat: EYE_MATERIAL's id (lit)."""
+    got = pumpkin_eyes.centres(world, P, zoom, mask)
+    if got is None or not got[1].size:
+        return
+    c, rad, k = got
+    c = _px(c)
+    zero = np.zeros(rad.size, np.int64)
+    stamps.append(np.stack([c[0], c[1], np.full(rad.size, pack_rgb([pumpkin_eyes.COL])[0]), body_layer[k] + 1, zero,
+                            zero + eye_mat], axis=1))
+    radii.append(rad)
 
 
 class CircleAtlas:
@@ -481,7 +502,7 @@ class GLWorld:
         self.gbuf, self.gbuf_fbo, self.effects, self.frame = None, None, None, None
         self.material_tex = ctx.texture((materials.TEXELS, 1), 4, dtype="f4")
         self.material_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.n_materials, self.body_mat = 1, np.zeros(0, np.int64)
+        self.n_materials, self.body_mat, self.eye_mat = 1, np.zeros(0, np.int64), 0
         self._mat_sig, self._mat_bytes = None, None
         self._rest, self._rest_seq = weakref.WeakKeyDictionary(), 0
         self._rest_topo, self._rest_all = None, np.zeros((0, 2), np.float32)
@@ -622,6 +643,9 @@ class GLWorld:
                 i = ids[m] = len(table)
                 table.append(m)
             body_mat[k] = i
+        self.eye_mat = ids.setdefault(EYE_MATERIAL, len(table))  # the pumpkin eyes' material (_eye_stamps)
+        if self.eye_mat == len(table):
+            table.append(EYE_MATERIAL)
         self.body_mat, self.n_materials = body_mat, len(table)
         packed = np.zeros((len(table), materials.TEXELS, 4), np.float32)
         packed[0] = materials.pack(materials.resolve())  # row 0: the background (lit, default material)
@@ -696,7 +720,7 @@ class GLWorld:
         effects (lighting on; with it off they are drawn here, in the one line pass, exactly as before)."""
         ctx = self.ctx
         if lit:
-            data = self.packer.pack(world, filled, zoom, outlines, self.body_mat, 1)
+            data = self.packer.pack(world, filled, zoom, outlines, self.body_mat, 1, self.eye_mat)
         else:
             data = self.packer.pack(world, filled, zoom, outlines)
         rest = self._rest_coords(world)
