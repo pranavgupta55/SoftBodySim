@@ -33,6 +33,25 @@ lighting on : base + bodies -> G-buffer (MRT, shares GLWorld.depth)
 | `normal` | RGBA8 | 1 | rg = normal.xy * 0.5 + 0.5 (z implied, +y down), b = distance to the body's nearest edge in px / 255 (clamped), a = flags / 255: bit0 occluder, bit1 casts shadow, bit2 lit, bit3 border (a filled body's black outline: no emission, not see-through / mirror except fluid) |
 | `mat` | R16UI ("u2", 1 comp) | 2 | material id (0 = background / none) |
 
+| `behind` | RGBA8 | – | only on frames with a GLASS / FLUID body on screen (absent otherwise): the albedo as it stood after pass A, which draws everything except the see-through bodies (background, grid, trails and every opaque body), i.e. what lies under glass / fluid |
+| `behind_nrm` | RGBA8 | – | same frames: the normal texel (layout as `normal`, flags included) of pass A |
+| `behind_mat` | R16UI | – | same frames: the material id of pass A |
+
+Two-pass draw (F, gl_world._bodies): with see-through bodies on screen, pass A draws all but GLASS / FLUID primitives,
+the three textures above are copied from the G-buffer, then pass B draws only the see-through primitives depth-tested
+against pass A (draw order kept: an opaque body later in the list stays on top of the glass). Without such bodies the
+draw is one pass and the keys are not in `gbuf`.
+
+Outlines: a filled body's black border (lines and the round caps of 2-point bodies, a hook's black parts) writes
+occluder / casts-shadow per material plus bit3 border, and no lit bit: it keeps its plain black.
+
+Points view (FrameInfo.filled False): dots and sticks use the material's points-view twin (kind OPAQUE, casts_shadow
+False, bevel 0, other fields kept; its own id) and write only the lit bit; then the filled view's shapes are drawn
+invisibly, writing only normal.a = occluder | casts-shadow (per material) | lit. So the SDF, shadows and GI see the
+same silhouettes as in the filled view, while albedo, normal.rgb and mat are the dots / sticks (background, mat 0,
+between them). GLASS / FLUID silhouettes are left out of that fill (they would be plain opaque occluders without
+their material id), so see-through bodies cast no shadow and don't block GI in the points view.
+
 Background, grid, trails write normal (0.5, 0.5, 0, 4 / 255) (flat, lit, not an occluder), mat 0; past the clip
 (outside the world view) flags 0, so no effect lights it and compose keeps the plain background there. Outline
 lines / points / stamps of a body write that body's material id with lit flag per material; outlines (`lit=False`

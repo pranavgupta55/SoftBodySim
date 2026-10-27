@@ -32,7 +32,8 @@ top-level "state" with the world's looping sides, its tagged walls (by body inde
 wall is out of the body list), pending walls, bounds and terminal velocity.
 
 Lit renderer data (research/lighting_contract.md; optional, absent in older files): a body's "material" (a
-materials.PRESETS name) and "material_over" ({Material field: value}), and in "state": "lights" (lights.Light.to_dict
+materials.PRESETS name), "material_over" ({Material field: value}), "pattern_seed" (int; absent: numbered in list order on first sight)
+and "pattern_rest" ([[x...], [y...]], soft bodies: the shape their surface pattern is pinned to), and in "state": "lights" (lights.Light.to_dict
 each, moved with the scene), "ambient" ([r, g, b] linear), the switches "lighting" (the world starts lit), "caustics"
 and "gi" (gl_glass caustics / gl_sdf radiance-cascade GI on for this world), and "gi_gain" (its GI brightness); the
 last four are written by scene_data / preset_data only, so an undo step never switches them.
@@ -148,7 +149,36 @@ def _body_dict(b, arr, col, wall=False):
         elif isinstance(v, str):
             d[name] = v
     _put_material(d, b)
+    _put_pattern(d, b, arr)
     return d
+
+
+def _put_pattern(d, b, arr):
+    """The lit renderer's surface-pattern frame of a body (gl_world._body_rest): "pattern_seed" (int, its pattern
+    offset) and, for bodies without their own rest shape (soft bodies), "pattern_rest" (the shape the pattern is
+    pinned to), so a reloaded body shows the same patch of pattern."""
+    seed = getattr(b, "pattern_seed", None)
+    if isinstance(seed, (int, np.integer)) and not isinstance(seed, bool):
+        d["pattern_seed"] = int(seed)
+    rest = getattr(b, "pattern_rest", None)
+    if rest is not None and np.shape(rest) == np.shape(b.points):
+        d["pattern_rest"] = arr(rest)
+
+
+def _get_pattern(b, d, k):
+    """pattern_seed and pattern_rest when the file has them (malformed ones are ignored). Bodies without a seed get
+    one on their first lit frame (gl_world.pattern_seeds), numbered in list order after the seeds in use: an older
+    file's bodies get their index, as before (install resets the world's counter)."""
+    seed = d.get("pattern_seed")
+    if isinstance(seed, (int, float)) and not isinstance(seed, bool) and math.isfinite(seed):
+        b.pattern_seed = int(seed)
+    if "pattern_rest" in d:
+        try:
+            rest = _float_array(d["pattern_rest"], 2, f"body {k} pattern_rest")
+        except (SceneError, TypeError, ValueError):
+            return
+        if rest.shape == b.points.shape:
+            b.pattern_rest = rest
 
 
 def _plain(v):
@@ -355,6 +385,7 @@ def _build_body(d, k, off, moved):
         if name in d:
             setattr(b, name, d[name] if isinstance(d[name], str) else float(d[name]))
     _get_material(b, d)
+    _get_pattern(b, d, k)
     return b
 
 
@@ -599,6 +630,8 @@ def install(world, bodies, ropes, hooks, state=None):
         world.ambient = None
     if hasattr(world, "last_wraps"):
         world.last_wraps = []
+    if hasattr(world, "pattern_seq"):  # surface-pattern seeds restart past the loaded bodies' own (gl_world)
+        world.pattern_seq = 0
     if hasattr(world, "_tick_acc"):  # no part-tick of the old scene's time carries over
         world._tick_acc = 0.0
     if hasattr(world, "period"):  # periodic axes are re-derived from the looping state on the next step (looping.py)

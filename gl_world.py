@@ -23,10 +23,22 @@ three outputs, and with lighting off the extra two go nowhere, so the unlit byte
 plugins of gl_effects.py, then draws the grab lines on top. Fill normals come from the distance to the nearest edge
 and the material's height profile; procedural patterns use per-vertex rest-frame coordinates interpolated with mean
 value coordinates (world_fill.frag). tests/lit_parity_check.py checks the unlit bytes against the pre-lighting code.
+Lit passes (_bodies):
+- see-through bodies: when a GLASS / FLUID material is on screen, pass A draws everything else, the G-buffer is
+  copied to gbuf["behind"] (RGBA8 albedo), gbuf["behind_nrm"] (RGBA8, the normal layout, flags included) and
+  gbuf["behind_mat"] (R16UI ids), then pass B draws the see-through primitives, depth-tested, so opaque bodies later
+  in the draw order stay on top. These keys exist only on such frames (absent otherwise: no extra pass or textures).
+- outlines: a filled body's black border (lines kind 2, stamps + STAMP_BORDER) is an occluder with FLAG_BORDER and
+  without FLAG_LIT (it stays black: no light, specular or glow).
+- points view: dots and sticks use each material's points-view twin (kind OPAQUE, no shadow, bevel 0: no optics, no
+  stripes) and are no occluders; the filled view's shapes are then drawn invisibly (only normal.a written), so the
+  silhouettes cast the same shadows as in the filled view (GLASS / FLUID silhouettes excepted: no shadow there).
+Surface patterns are pinned to each body's persistent pattern_seed (and soft bodies' pattern_rest), saved by scene_io.
 
 Anything not handled here falls back to pygame: World.draw / draw_grid / Trails.draw keep working on any surface
 (the --basic pipeline and the editor tests use them).
 """
+import dataclasses
 import inspect
 import os
 import weakref
@@ -52,6 +64,9 @@ _FILLED = inspect.signature(Body.draw_filled).parameters
 BORDER_COL, BORDER_WIDTH = tuple(_FILLED["border_col"].default), _FILLED["border_width"].default
 GRID_DEFAULTS = {k: tuple(v.default) for k, v in inspect.signature(World.draw_grid).parameters.items()
                  if k.endswith("_col")}
+STAMP_BORDER = 1 << 24  # added to a stamp's material: a black border part (world_stamp.frag: FLAG_BORDER, unlit)
+SEE_THROUGH = (materials.GLASS, materials.FLUID)  # kinds drawn in the lit pass B, over gbuf["behind"]
+BEHIND_KEYS = ("behind", "behind_nrm", "behind_mat")  # GLWorld.gbuf keys of the pass A copy
 
 
 def _load(ctx, vert, frag, includes=("world_common.glsl",)):
@@ -143,7 +158,8 @@ class WorldPacker:
     pack() returns dict(fills=(k, 10) int32 [start, count, colour, layer, minx, miny, maxx, maxy, material, winding],
     verts=(m, 2) int32 fill vertices with vert_pt=(m,) their World point indices, lines=(k, 10) int32
     [x1, y1, x2, y2, width, colour, layer, transparency 0..255 (0 opaque), material, kind],
-    stamps=(k, 6) int64 [cx, cy, colour, layer, width, material] with radii=(k,) float64).
+    stamps=(k, 6) int64 [cx, cy, colour, layer, width, material (+ STAMP_BORDER on black border parts)] with
+    radii=(k,) float64).
     material: the id from body_mat (per body; base_mat for ropes and hooks, -1 for the grab lines: overlays drawn
     after the lit effects); kind: 0, +1 / -1 (the body's winding) for the rim lines of the no-outline view, 2 for a
     filled body's black border (no emission). Both only matter with lighting on (gl_world draws the same pixels
@@ -213,13 +229,13 @@ class WorldPacker:
         for hk in world.hooks:
             c, r, col = _px(hk.pos * zoom), hk.radius, pack_rgb([hk.col])[0]
             if filled and not outlines:  # Hook.draw without outlines: the coloured disc alone
-                specs = ((r - 0.5, 0, col),)
+                specs = ((r - 0.5, 0, col, 0),)
             elif filled:  # Hook.draw: black disc, coloured disc, black hole
-                specs = ((r + 1, 0, black), (r - 0.5, 0, col), (1, 0, black))
+                specs = ((r + 1, 0, black, STAMP_BORDER), (r - 0.5, 0, col, 0), (1, 0, black, STAMP_BORDER))
             else:  # a 1px ring around a dot
-                specs = ((r, 1, col), (1, 0, col))
-            for k, (rad, width, cc) in enumerate(specs):
-                stamps.append(np.array([[c[0], c[1], cc, layer + k, width, base_mat]]))
+                specs = ((r, 1, col, 0), (1, 0, col, 0))
+            for k, (rad, width, cc, flag) in enumerate(specs):
+                stamps.append(np.array([[c[0], c[1], cc, layer + k, width, base_mat + flag]]))
                 radii.append(np.array([float(rad)]))
             layer += 3
         if world.grabbed is not None and nb:
@@ -278,8 +294,8 @@ class WorldPacker:
         layer, zero, m = body_layer[sb], np.zeros(sb.size, np.int64), mat[sb]
         if outlines:
             lines.append(np.stack([a[0], a[1], b[0], b[1], outer, border, layer, zero, m, zero + 2], axis=1))
-            for end in (a, b):
-                stamps.append(np.stack([end[0], end[1], border, layer, zero, m], axis=1))
+            for end in (a, b):  # round caps: border parts
+                stamps.append(np.stack([end[0], end[1], border, layer, zero, m + STAMP_BORDER], axis=1))
                 radii.append(outer / 2)
         fw = sw if outlines else sw + 2 * FILL_EXPAND
         lines.append(np.stack([a[0], a[1], b[0], b[1], fw, fill_c[sb], layer + 1, zero, m, zero], axis=1))
@@ -428,19 +444,53 @@ def grid_axis(n_px, n_cells, cell_px):
 
 
 
-def _body_rest(body, seq):
+def _body_rest(body, seed):
     """(2, n) rest-frame coordinates (world units) of a body's points for its surface pattern: a fixed body's own
-    points (world space, so neighbouring static tiles' patterns line up), a rigid body's `rest`, else its shape now
-    (first seen: right after it is added) about its centre. Moving bodies get a per-body offset (golden-ratio
-    sequence) so equal shapes don't show the same patch of pattern."""
+    points (world space, so neighbouring static tiles' patterns line up), a rigid body's `rest`, else its
+    `pattern_rest`, else its shape now (first seen: right after it is added) about its centre, kept as the body's
+    `pattern_rest` (scene_io saves it). Moving bodies get an offset from their persistent `pattern_seed`
+    (golden-ratio sequence) so equal shapes don't show the same patch of pattern, and a reloaded body shows the same
+    patch as before."""
     pts = np.asarray(body.points, dtype=np.float64)
     if body.fixed:
         return pts.copy()
     rest = getattr(body, "rest", None)
     if rest is None or np.shape(rest) != pts.shape:
-        rest = pts - pts.mean(axis=1, keepdims=True) if pts.size else pts
-    off = np.array([(seq * 0.6180339887) % 1.0, (seq * 0.7548776662) % 1.0]) * 1000.0
+        rest = getattr(body, "pattern_rest", None)
+    if rest is None or np.shape(rest) != pts.shape:
+        rest = pts - pts.mean(axis=1, keepdims=True) if pts.size else pts.copy()
+        try:
+            body.pattern_rest = rest
+        except AttributeError:
+            pass
+    off = np.array([(seed * 0.6180339887) % 1.0, (seed * 0.7548776662) % 1.0]) * 1000.0
     return np.asarray(rest, dtype=np.float64) + off[:, None]
+
+
+def _seed_of(b):
+    s = getattr(b, "pattern_seed", None)
+    return int(s) if isinstance(s, (int, np.integer)) and not isinstance(s, bool) else None
+
+
+def pattern_seeds(world):
+    """Give every body of the world without a `pattern_seed` the next one of a world-level counter
+    (world.pattern_seq, kept past every seed in use), in list order: a fresh world numbers its bodies 0, 1, ... as
+    they are first seen. Returns the seeds in body order."""
+    seeds = [_seed_of(b) for b in world.bodies]
+    if None in seeds:
+        nxt = max([getattr(world, "pattern_seq", 0) or 0] + [s + 1 for s in seeds if s is not None])
+        for k, b in enumerate(world.bodies):
+            if seeds[k] is None:
+                try:
+                    b.pattern_seed = nxt
+                except AttributeError:
+                    pass
+                seeds[k], nxt = nxt, nxt + 1
+        try:
+            world.pattern_seq = nxt
+        except AttributeError:
+            pass
+    return seeds
 
 
 class GLWorld:
@@ -451,8 +501,9 @@ class GLWorld:
     grab lines go on top. Materials: each body's resolved materials.Material gets an id (identical ones share it,
     0 = none, 1 = the default, also used by ropes and hooks), packed into `material_tex` (materials.pack), rebuilt
     only when some body's material / material_over changes. Rest-frame coordinates for the surface patterns are
-    kept per body (_body_rest, recorded the first time a body is drawn) and uploaded in `uvs_tex`, parallel to the
-    fill vertices."""
+    kept per body (_body_rest, recorded the first time a body is drawn, offset by its persistent pattern_seed) and
+    uploaded in `uvs_tex`, parallel to the fill vertices.
+    Lit G-buffer passes: see the module docstring (behind layer under glass, outline flags, points view)."""
 
     def __init__(self, ctx, size):
         self.ctx, self.size = ctx, tuple(size)
@@ -503,8 +554,11 @@ class GLWorld:
         self.material_tex = ctx.texture((materials.TEXELS, 1), 4, dtype="f4")
         self.material_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.n_materials, self.body_mat, self.eye_mat = 1, np.zeros(0, np.int64), 0
+        self.body_mat_points = np.zeros(0, np.int64)  # body_mat's points-view twins (_materials)
+        self.mat_kinds = np.array([-1, materials.OPAQUE], np.int64)  # Material.kind per id
+        self.behind, self.behind_fbo = None, None  # pass A's copy (gbuf["behind"...]), made on the first glass frame
         self._mat_sig, self._mat_bytes = None, None
-        self._rest, self._rest_seq = weakref.WeakKeyDictionary(), 0
+        self._rest = weakref.WeakKeyDictionary()  # body -> (pattern_seed, rest coordinates)
         self._rest_topo, self._rest_all = None, np.zeros((0, 2), np.float32)
         self._uv_key = None  # (rest array, vert_pt) last uploaded to uvs_tex
         self._fs_vaos = {}
@@ -525,8 +579,15 @@ class GLWorld:
         for e in self.effects or ():
             e.release()
         self.effects = None
-        for t in (self.gbuf or {}).values():
+        for t in (self.behind or {}).values():
             t.release()
+        if self.behind_fbo is not None:
+            self.behind_fbo.release()
+        self.behind, self.behind_fbo = None, None
+        for key in ("albedo", "normal", "mat"):
+            t = (self.gbuf or {}).get(key)
+            if t is not None:
+                t.release()
         if self.gbuf_fbo is not None:
             self.gbuf_fbo.release()
         self.gbuf, self.gbuf_fbo = None, None
@@ -587,8 +648,13 @@ class GLWorld:
         prev = ctx.fbo if ctx.fbo is not None else ctx.screen
         lit = bool(lighting or getattr(world, "lighting", False))
         clip = (int(min(view_size[0], self.size[0])), int(min(view_size[1], self.size[1])))
-        self._set_clip(clip, lit, zoom)
         ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
+        if clip[0] <= 0 or clip[1] <= 0:  # nothing of the world shows: the background past the clip, no effects
+            self.fbo.use()
+            self.fbo.clear(*(float(c) / 255.0 for c in tuple(background)[:3]), 1.0, depth=1.0)
+            self._restore(prev)
+            return
+        self._set_clip(clip, lit, zoom)
         has_trails = self._trails(trails, clip, zoom)
         self.fbo.use()
         self.fbo.clear(depth=1.0)
@@ -611,6 +677,14 @@ class GLWorld:
         if lit:
             self._effects(world, clip, zoom, filled)
             self._overlays(overlays)
+        self._restore(prev)
+
+    def _restore(self, prev):
+        """Re-bind the framebuffer that was current before render (the screen if it has been released since, as
+        gl_glass._restore does)."""
+        ctx = self.ctx
+        if prev is None or isinstance(getattr(prev, "mglo", None), moderngl.InvalidObject):
+            prev = ctx.screen
         if prev is not None:
             prev.use()
 
@@ -635,17 +709,21 @@ class GLWorld:
         self._mat_sig = [(m, dict(o) if o else None) for m, o in sig]  # copies: in-place edits show up too
         table = [None, materials.resolve()]
         ids = {table[1]: 1}
-        body_mat = np.empty(len(bodies), np.int64)
-        for k, b in enumerate(bodies):
-            m = materials.of_body(b)
+
+        def id_of(m):
             i = ids.get(m)
             if i is None:
                 i = ids[m] = len(table)
                 table.append(m)
-            body_mat[k] = i
-        self.eye_mat = ids.setdefault(EYE_MATERIAL, len(table))  # the pumpkin eyes' material (_eye_stamps)
-        if self.eye_mat == len(table):
-            table.append(EYE_MATERIAL)
+            return i
+
+        body_mat = np.array([id_of(materials.of_body(b)) for b in bodies], np.int64)
+        # the points view's twins: the same colour, tint and glow on plain flat dots and sticks (no optics)
+        twin = {i: id_of(dataclasses.replace(table[i], kind=materials.OPAQUE, casts_shadow=False, bevel_px=0.0))
+                for i in sorted(set(body_mat.tolist()))}
+        self.body_mat_points = np.array([twin[i] for i in body_mat.tolist()], np.int64)
+        self.eye_mat = id_of(EYE_MATERIAL)  # the pumpkin eyes' material (_eye_stamps)
+        self.mat_kinds = np.array([-1] + [m.kind for m in table[1:]], np.int64)
         self.body_mat, self.n_materials = body_mat, len(table)
         packed = np.zeros((len(table), materials.TEXELS, 4), np.float32)
         packed[0] = materials.pack(materials.resolve())  # row 0: the background (lit, default material)
@@ -669,12 +747,12 @@ class GLWorld:
         if topo is self._rest_topo:
             return self._rest_all
         parts = []
-        for b in world.bodies:
-            r = self._rest.get(b)
-            if r is None or r.shape[1] != b.points.shape[1]:
-                r = self._rest[b] = _body_rest(b, self._rest_seq)
-                self._rest_seq += 1
-            parts.append(r)
+        seeds = pattern_seeds(world)
+        for b, seed in zip(world.bodies, seeds):
+            hit = self._rest.get(b)
+            if hit is None or hit[0] != seed or hit[1].shape[1] != b.points.shape[1]:
+                hit = self._rest[b] = (seed, _body_rest(b, seed))
+            parts.append(hit[1])
         self._rest_all = (np.concatenate(parts, axis=1).T.astype(np.float32) if parts
                           else np.zeros((0, 2), np.float32))
         self._rest_topo = topo
@@ -717,65 +795,172 @@ class GLWorld:
 
     def _bodies(self, world, filled, zoom, outlines=True, lit=False):
         """Fills, lines and circles into the bound framebuffer; returns the overlay lines left for after the
-        effects (lighting on; with it off they are drawn here, in the one line pass, exactly as before)."""
-        ctx = self.ctx
+        effects (lighting on; with it off they are drawn here, in the one line pass, exactly as before).
+
+        Lighting on, with GLASS / FLUID bodies on screen: two passes. A draws everything but them, then the G-buffer
+        is copied to gbuf["behind"] / ["behind_nrm"] / ["behind_mat"] (_copy_behind: what lies under a see-through
+        body, opaque bodies included); B draws only the see-through primitives, depth-tested against A, so opaque
+        bodies later in the draw order stay on top. Without such bodies: one pass and no "behind" keys.
+        Points view (lit): the bodies' points-view twin materials (no optics, sticks and dots cast no shadow), then
+        the filled view's shapes drawn invisibly, writing only their occluder flags (_occluder_fill)."""
         if lit:
-            data = self.packer.pack(world, filled, zoom, outlines, self.body_mat, 1, self.eye_mat)
+            mats = self.body_mat if filled else self.body_mat_points
+            data = self.packer.pack(world, filled, zoom, outlines, mats, 1, self.eye_mat)
         else:
             data = self.packer.pack(world, filled, zoom, outlines)
         rest = self._rest_coords(world)
-        fills, verts, lines, stamps = data["fills"], data["verts"], data["lines"], data["stamps"]
+        fills, lines, stamps = data["fills"], data["lines"], data["stamps"]
         self.stats = {"fills": len(fills), "lines": len(lines), "stamps": len(stamps)}
-        self.material_tex.use(2)
         overlays = lines[:0]
-        ctx.enable(moderngl.DEPTH_TEST)
-        ctx.depth_func = "<="
-        if len(fills):
-            rows = -(-len(verts) // VERT_ROW)
-            if self.verts_tex is None or self.verts_tex.size[1] < rows:
-                cap = max(rows, 2 * self.verts_tex.size[1]) if self.verts_tex is not None else rows
-                if self.verts_tex is not None:
-                    self.verts_tex.release()
-                self.uvs_tex.release()
-                self.verts_tex = ctx.texture((VERT_ROW, cap), 2, dtype="i4")
-                self.verts_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-                self.uvs_tex = ctx.texture((VERT_ROW, cap), 2, dtype="f4")
-                self.uvs_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-                self._uv_key = None
-            buf = np.zeros((rows * VERT_ROW, 2), np.int32)
-            buf[:len(verts)] = verts
-            self.verts_tex.write(buf.tobytes(), viewport=(0, 0, VERT_ROW, rows))
-            vp = data["vert_pt"]
-            key = self._uv_key
-            if lit and not (key is not None and key[0] is rest and np.array_equal(key[1], vp)):
-                # rest coordinates change only with the topology or the periodic copies drawn
-                uv = np.zeros((rows * VERT_ROW, 2), np.float32)
-                uv[:len(verts)] = rest[vp]
-                self.uvs_tex.write(uv.tobytes(), viewport=(0, 0, VERT_ROW, rows))
-                self._uv_key = (rest, vp.copy())
-            self.verts_tex.use(0)
-            self.uvs_tex.use(1)
-            n = self.fills.write(fills)
-            self.fills.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
         if lit and len(lines):  # G-buffer: opaque lines only (no blending into normals / ids); overlays later
             over = lines[:, 8] < 0
             overlays, lines = lines[over], lines[~over]
-        if len(lines):
-            n = self.lines.write(lines)
-            if not lit:
+        n_fills = self._upload_fills(data, rest if lit else None)
+        n_lines = self.lines.write(lines) if len(lines) else 0
+        inst = self._stamps(stamps, data["radii"]) if len(stamps) else np.zeros((0, 11), np.int64)
+        n_stamps = self.stamps.write(inst) if len(inst) else 0
+        two = lit and self._see_through(fills, lines, inst)
+        self._set_pass(lit, filled, seethrough=1 if two else 0)
+        self._draw_bodies(n_fills, n_lines, n_stamps, blend=not lit)
+        if two:
+            self._copy_behind()
+            self._set_pass(lit, filled, seethrough=2)
+            self._draw_bodies(n_fills, n_lines, n_stamps)
+            self._set_pass(lit, filled)
+        elif self.gbuf is not None:
+            for key in BEHIND_KEYS:
+                self.gbuf.pop(key, None)
+        if lit and not filled:
+            self._occluder_fill(world, zoom, outlines)
+        return overlays
+
+    def _upload_fills(self, data, rest=None):
+        """The fill vertices (and with `rest`, lighting on, their rest-frame coordinates) into verts_tex / uvs_tex and
+        the fill instances into their stream; returns the instance count."""
+        ctx = self.ctx
+        fills, verts = data["fills"], data["verts"]
+        if not len(fills):
+            return 0
+        rows = -(-len(verts) // VERT_ROW)
+        if self.verts_tex is None or self.verts_tex.size[1] < rows:
+            cap = max(rows, 2 * self.verts_tex.size[1]) if self.verts_tex is not None else rows
+            if self.verts_tex is not None:
+                self.verts_tex.release()
+            self.uvs_tex.release()
+            self.verts_tex = ctx.texture((VERT_ROW, cap), 2, dtype="i4")
+            self.verts_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self.uvs_tex = ctx.texture((VERT_ROW, cap), 2, dtype="f4")
+            self.uvs_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self._uv_key = None
+        buf = np.zeros((rows * VERT_ROW, 2), np.int32)
+        buf[:len(verts)] = verts
+        self.verts_tex.write(buf.tobytes(), viewport=(0, 0, VERT_ROW, rows))
+        vp = data["vert_pt"]
+        key = self._uv_key
+        if rest is not None and not (key is not None and key[0] is rest and np.array_equal(key[1], vp)):
+            # rest coordinates change only with the topology or the periodic copies drawn
+            uv = np.zeros((rows * VERT_ROW, 2), np.float32)
+            uv[:len(verts)] = rest[vp]
+            self.uvs_tex.write(uv.tobytes(), viewport=(0, 0, VERT_ROW, rows))
+            self._uv_key = (rest, vp.copy())
+        return self.fills.write(fills)
+
+    def _draw_bodies(self, n_fills, n_lines, n_stamps, blend=False):
+        """The three instanced draws (fills, lines, circles) from the streams as last written, into the bound
+        framebuffer, depth-tested by layer. blend: the unlit pass's translucent grab lines."""
+        ctx = self.ctx
+        self.material_tex.use(2)
+        ctx.enable(moderngl.DEPTH_TEST)
+        ctx.depth_func = "<="
+        if n_fills:
+            self.verts_tex.use(0)
+            self.uvs_tex.use(1)
+            self.fills.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n_fills)
+        if n_lines:
+            if blend:
                 ctx.enable(moderngl.BLEND)  # translucent grab lines; opaque ones (alpha 1) draw as before
                 ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ZERO, moderngl.ONE
-            self.lines.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
+            self.lines.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n_lines)
             ctx.disable(moderngl.BLEND)
-        if len(stamps):
-            inst = self._stamps(stamps, data["radii"])
-            if len(inst):
-                self.atlas.upload()
-                self.atlas.tex.use(0)
-                n = self.stamps.write(inst)
-                self.stamps.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
+        if n_stamps:
+            self.atlas.upload()
+            self.atlas.tex.use(0)
+            self.stamps.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n_stamps)
         ctx.disable(moderngl.DEPTH_TEST)
-        return overlays
+
+    def _set_pass(self, lit, filled, seethrough=0, flags_only=False):
+        """The lit pass uniforms of the world programs (world_fill.frag): u_seethrough (0 all, 1 all but GLASS /
+        FLUID, 2 only those), u_flags_only and u_points (the points view's sticks and dots cast no shadow)."""
+        for name in ("fill", "line", "stamp"):
+            prog = self.progs[name]
+            prog["u_seethrough"].value = seethrough if lit else 0
+            prog["u_flags_only"].value = bool(flags_only)
+            if "u_points" in prog:
+                prog["u_points"].value = bool(lit and not filled and not flags_only)
+
+    def _see_through(self, fills, lines, stamps):
+        """Whether any primitive to draw has a GLASS / FLUID material (lighting on)."""
+        kinds = self.mat_kinds
+        cols = (fills[:, 8] if len(fills) else None, lines[:, 8] if len(lines) else None,
+                stamps[:, 10] & (STAMP_BORDER - 1) if len(stamps) else None)
+        for ids in cols:
+            if ids is None:
+                continue
+            ids = np.asarray(ids, np.int64)
+            ids = np.unique(ids[(ids > 0) & (ids < len(kinds))])
+            if ids.size and np.isin(kinds[ids], SEE_THROUGH).any():
+                return True
+        return False
+
+    def _copy_behind(self):
+        """gbuf (after pass A) -> gbuf["behind"] (RGBA8 albedo), ["behind_nrm"] (RGBA8, the normal layout) and
+        ["behind_mat"] (R16UI), made on the first frame that needs them; the G-buffer framebuffer is bound again."""
+        ctx = self.ctx
+        if self.behind is None:
+            self.behind = {"behind": ctx.texture(self.size, 4), "behind_nrm": ctx.texture(self.size, 4),
+                           "behind_mat": ctx.texture(self.size, 1, dtype="u2")}
+            for t in self.behind.values():
+                t.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self.behind_fbo = ctx.framebuffer([self.behind[k] for k in BEHIND_KEYS])
+            if "behind" not in self.progs:
+                prog = self.progs["behind"] = _load(ctx, None, "world_behind.frag", ())
+                prog["u_albedo"].value, prog["u_normal"].value, prog["u_mat"].value = 0, 1, 2
+        ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
+        self.behind_fbo.use()
+        self.gbuf["albedo"].use(0)
+        self.gbuf["normal"].use(1)
+        self.gbuf["mat"].use(2)
+        self.fullscreen(self.progs["behind"])
+        self.gbuf.update(self.behind)
+        self.gbuf_fbo.use()
+
+    def _occluder_fill(self, world, zoom, outlines):
+        """The points view (lighting on): the filled view's shapes (fills, borders, segments, ropes, hooks) drawn
+        with only normal.a written (the other outputs masked, no depth writes), setting their occluder /
+        casts-shadow flags (plus FLAG_LIT) under the dots and sticks, so shadows, the SDF and GI see the same
+        silhouettes as in the filled view. Albedo, normals and material ids stay the points view's. GLASS / FLUID
+        bodies are left out: their silhouette would be a plain opaque occluder here (no material id to make it
+        translucent), so a clear glass tile would block light and glow that it lets through in the filled view."""
+        data = self.packer.pack(world, True, zoom, outlines, self.body_mat, 1)
+        lines = data["lines"]
+        lines = lines[lines[:, 8] >= 0]
+        n_fills = self._upload_fills(data)
+        n_lines = self.lines.write(lines) if len(lines) else 0
+        inst = self._stamps(data["stamps"], data["radii"]) if len(data["stamps"]) else np.zeros((0, 11), np.int64)
+        n_stamps = self.stamps.write(inst) if len(inst) else 0
+        if not (n_fills or n_lines or n_stamps):
+            return
+        fbo = self.gbuf_fbo
+        off = (False,) * 4
+        fbo.color_mask = [off, (False, False, False, True), off]
+        fbo.depth_mask = False
+        fbo.use()
+        self._set_pass(True, False, seethrough=1, flags_only=True)
+        self._draw_bodies(n_fills, n_lines, n_stamps)
+        fbo.color_mask = [(True,) * 4] * 3
+        fbo.depth_mask = True
+        fbo.use()
+        self._set_pass(True, False)
 
     def _stamps(self, stamps, radii):
         """(k, 11) [cx, cy, offx, offy, atlas x, atlas y, w, h, colour, layer, material] for the circles pygame
