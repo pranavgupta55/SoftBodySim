@@ -161,6 +161,15 @@ DIAMONDS_LAYOUT = os.path.join(DIAMONDS_DIR, "evolved 1.json")  # the default on
 # the "penrose" worlds: the same scene over a Penrose P3 rhombus tiling (diamonds_map.penrose_tiles) instead
 PENROSE_SIDE = 24.0  # edge length of its fat (72 degree) and thin (36 degree) rhombi
 PENROSE_SEED = 1  # the pentagrid offsets' seed of a new layout (saved layouts keep their own)
+# Penrose edges run in 5 directions 36 degrees apart, so some always slope 18 degrees or less, under the friction
+# angle (atan 0.5 = 26.6 degrees). Measured on random layouts (30 s, 2 seeds; shapes under 5 px/s of 168, random
+# diamonds: 4-8): rotation 0 (flat tile tops) 63-68; 18 (slopes 18 / 54 / 90) 23-40; with only tiles whose edges
+# slope 30+ degrees (steep_tiles, at rotation 0) 49-65 (near-vertical tiles make narrow funnels). Most stuck shapes
+# jam in funnels between tiles whose corners are 40-80 apart, so the cup rule's gap is wider here: at 60, rotation
+# 18 gives 12-17 (and the density is still reached; at 80 it isn't, ~390 of 464 tiles)
+PENROSE_ROTATION = 18.0  # degrees: no horizontal edges
+PENROSE_MIN_SLOPE = 0.0  # pick only tiles whose edges all slope at least this (diamonds_map.steep_tiles; 0: all)
+PENROSE_CUP_GAP = 60.0  # CUP_GAP for the penrose tiling
 # a fat rhombus per golden ratio of thin ones: the mean tile area
 _PHI = (1 + math.sqrt(5)) / 2
 PENROSE_MEAN_AREA = PENROSE_SIDE ** 2 * (_PHI * math.sin(math.radians(72)) + math.sin(math.radians(36))) / (_PHI + 1)
@@ -174,16 +183,22 @@ PENROSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "
 
 
 def _layout_tiling(layout, tiling=None, pentagrid_seed=None):
-    """{"tiling": ..., "pentagrid_seed": ..., "edge": ...} a diamonds world is built on: the layout file's own (if
-    `layout` is one), else `tiling` ("diamonds" by default) and, for "penrose", `pentagrid_seed` (PENROSE_SEED)."""
+    """{"tiling": ..., "pentagrid_seed": ..., "edge": ..., "rotation": ...} a diamonds world is built on: the layout
+    file's own (if `layout` is one), else `tiling` (a name, "diamonds" by default, or such a dict) and, for "penrose",
+    `pentagrid_seed` (PENROSE_SEED), PENROSE_SIDE and PENROSE_ROTATION where not given."""
     from diamonds_map import layout_tiling
     if isinstance(layout, str):
         info = layout_tiling(layout)
+    elif isinstance(tiling, dict):
+        info = dict(tiling)
     else:
         info = {"tiling": tiling or "diamonds"}
     if info["tiling"] == "penrose":
         info.setdefault("pentagrid_seed", PENROSE_SEED if pentagrid_seed is None else pentagrid_seed)
         info.setdefault("edge", PENROSE_SIDE)
+        info.setdefault("rotation", PENROSE_ROTATION)
+        info.setdefault("min_slope", PENROSE_MIN_SLOPE)
+        info.setdefault("cup_gap", PENROSE_CUP_GAP)
     return info
 
 
@@ -215,14 +230,15 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     None: a seeded random layout of the spawn settings' diamond density. remove / add / add_seed: a variant of it with that many diamonds
     dropped and added (diamonds_map.pick_diamonds).
     tiling: "diamonds" (default) or "penrose": a Penrose P3 tiling (diamonds_map.penrose_tiles, edge PENROSE_SIDE,
-    pentagrid offsets seeded by `pentagrid_seed`, default PENROSE_SEED) whose picked rhombi are the obstacles, by the
-    same cup / cluster rules. A layout file's own tiling ("tiling", "pentagrid_seed", "edge") overrides both."""
+    rotated PENROSE_ROTATION, pentagrid offsets seeded by `pentagrid_seed`, default PENROSE_SEED) whose picked rhombi
+    are the obstacles, by the same cup / cluster rules; or a dict of those (see _layout_tiling). A layout file's own
+    tiling ("tiling", "pentagrid_seed", "edge", "rotation") overrides both."""
     from diamonds_map import (lattice_diamonds, layout_shift, load_layout, penrose_tiles, pick_diamonds,
-                              place_hexagons, shift_diamonds)
+                              place_hexagons, shift_diamonds, steep_tiles)
     from palettes import DEFAULT, apply_palette
 
     info = _layout_tiling(layout, tiling, pentagrid_seed)
-    spawn = diamonds_spawn(layout, spawn, info["tiling"])
+    spawn = diamonds_spawn(layout, spawn, info)
 
     world = World()
     add_world_box(world, world_width, world_height, inset)
@@ -231,12 +247,13 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     world.show_grid = False  # the G grid overlay starts off here (main_opengl keeps G per world)
     if info["tiling"] == "penrose":
         side = float(info["edge"])
-        tiles = penrose_tiles(world_width, world_height, side, seed=int(info["pentagrid_seed"]))
+        tiles = steep_tiles(penrose_tiles(world_width, world_height, side, seed=int(info["pentagrid_seed"]),
+                                          rotation=float(info["rotation"])), float(info["min_slope"]))
     else:
         side = DIAMOND_SIDE
         tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed, y0=DIAMOND_SIDE)
     keys, size = load_layout(layout) if isinstance(layout, str) else layout if layout is not None else (None, None)
-    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=CUP_GAP,
+    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=float(info.get("cup_gap", CUP_GAP)),
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
                              add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)))
     if isinstance(layout, str):  # the layout file's own offset (diamonds_map.layout_shift), if any

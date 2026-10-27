@@ -104,8 +104,7 @@ def run(job):
     vary = add_seed is not None
     tiling = _SETUP["tiling"]
     w = scene.build_diamonds_scene(W, H, layout=(keys, (W, H)), remove=remove if vary else 0, add=add if vary else 0,
-                                   add_seed=add_seed or 0, spawn=_SETUP["spawn"], tiling=tiling["tiling"],
-                                   pentagrid_seed=tiling.get("pentagrid_seed"))
+                                   add_seed=add_seed or 0, spawn=_SETUP["spawn"], tiling=tiling)
     dia = [b.points for b in w.bodies if getattr(b, "palette_role", "") == "diamond"]
     c = np.array([p.mean(axis=1) for p in dia])
     counts = np.histogram2d(c[:, 0], c[:, 1], (4, 4), ((0, W), (0, H)))[0].ravel()
@@ -158,8 +157,7 @@ def base_layout(args, size):
         tiling = scene._layout_tiling(None, args.tiling, args.pentagrid_seed)
         spawn = scene.diamonds_spawn(spawn={"density": args.density} if args.density else None,
                                      tiling=tiling["tiling"])
-        w = scene.build_diamonds_scene(*size, seed=args.seed, layout=None, spawn=spawn, tiling=tiling["tiling"],
-                                       pentagrid_seed=tiling.get("pentagrid_seed"))
+        w = scene.build_diamonds_scene(*size, seed=args.seed, layout=None, spawn=spawn, tiling=tiling)
         keys = [tuple(tile_key(b.points)) for b in w.bodies if getattr(b, "palette_role", "") == "diamond"]
         return keys, spawn, tiling, f"random base (seed {args.seed}, {len(keys)} tiles)"
     path = os.path.join(tiling_dir(args.tiling), args.base + ".json")

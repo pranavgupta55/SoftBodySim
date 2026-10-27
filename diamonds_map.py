@@ -60,10 +60,13 @@ def pentagrid_offsets(seed):
     return g
 
 
-def penrose_tiles(world_w, world_h, side, seed=1, palette=None, margin=None):
+def penrose_tiles(world_w, world_h, side, seed=1, palette=None, margin=None, rotation=18.0):
     """Every rhombus of a Penrose P3 tiling with edge `side` that reaches into the world grown by `margin` (default
     2 sides) on every side: [(corners (2, 4), rgb, kind)], kind "fat" (72 / 108 degree corners) or "thin" (36 / 144),
     sorted by center (rows of y, then x), each a random palette color as lattice_diamonds gives them.
+    Edges run in 5 directions 36 degrees apart (mod 180), the first at `rotation` degrees: the default 18 leaves no
+    edge horizontal (slopes 18, 54, 90); at 0, 4 of the 10 rhombus orientations have flat tops (see scene.py's
+    PENROSE_ROTATION notes). Any rotation has edges sloping 18 degrees or less.
     de Bruijn's pentagrid: grid lines x.e_j + gamma_j = k (e_j five unit vectors 72 degrees apart, gamma_j from
     pentagrid_offsets(seed), summing to 0); each crossing of a family-r line with a family-s line is one rhombus,
     whose corners are side * sum_j K_j e_j for the integer K_j = ceil(x.e_j + gamma_j) of the four grid cells around
@@ -71,7 +74,8 @@ def penrose_tiles(world_w, world_h, side, seed=1, palette=None, margin=None):
     if palette is None:
         palette = [c for c in load_tiling()["palette"] if sum(c) > 230]
     margin = 2 * side if margin is None else margin
-    e = np.array([[math.cos(2 * math.pi * j / 5), math.sin(2 * math.pi * j / 5)] for j in range(5)])  # (5, 2)
+    a0 = math.radians(rotation)
+    e = np.array([[math.cos(a0 + 2 * math.pi * j / 5), math.sin(a0 + 2 * math.pi * j / 5)] for j in range(5)])  # (5, 2)
     gamma = pentagrid_offsets(seed)
     # a grid point p lands near side * (2.5 p + sum_j gamma_j e_j) (sum_j (p.e_j) e_j = 2.5 p): the grid region that
     # covers the grown world, padded by 2 grid units
@@ -103,6 +107,19 @@ def penrose_tiles(world_w, world_h, side, seed=1, palette=None, margin=None):
     rng = np.random.default_rng(seed)
     picks = rng.integers(len(palette), size=len(keep)).tolist()
     return [(corners[i], list(palette[c]), str(kinds[i])) for i, c in zip(keep, picks)]
+
+
+def edge_slope(corners):
+    """The shallowest slope (degrees from horizontal, 0..90) of a polygon's (2, n) edges."""
+    d = np.roll(corners, -1, axis=1) - corners
+    return float(np.degrees(np.arctan2(np.abs(d[1]), np.abs(d[0]))).min())
+
+
+def steep_tiles(tiles, min_slope):
+    """The tiles [(corners, ...)] none of whose edges slope less than `min_slope` degrees: every face a falling shape
+    can land on is steep enough to slide off (a rhombus has each edge's parallel twin facing up or down, so a shallow
+    edge is always a shallow top somewhere)."""
+    return [t for t in tiles if edge_slope(t[0]) >= min_slope - 1e-9]
 
 
 def _corner_arc(poly, k):
@@ -178,10 +195,12 @@ def layout_shift(path):
 
 def layout_tiling(path):
     """A saved layout's tiling: {"tiling": "diamonds"} (the default, for files without one) or {"tiling": "penrose",
-    "pentagrid_seed": int, "edge": float} (penrose_tiles' seed and edge length, so it rebuilds identically)."""
+    "pentagrid_seed": int, "edge": float, "rotation": float, "min_slope": float, "cup_gap": float} (penrose_tiles'
+    seed, edge length and rotation, steep_tiles' minimum slope and the cup rule's gap, so it rebuilds identically)."""
     with open(path) as f:
         data = json.load(f)
-    return {k: data[k] for k in ("tiling", "pentagrid_seed", "edge") if k in data} or {"tiling": "diamonds"}
+    keys = ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cup_gap")
+    return {k: data[k] for k in keys if k in data} or {"tiling": "diamonds"}
 
 
 def shift_diamonds(diamonds, shift, world_w, world_h):
