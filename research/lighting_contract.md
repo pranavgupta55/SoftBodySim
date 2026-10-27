@@ -30,11 +30,13 @@ lighting on : base + bodies -> G-buffer (MRT, shares GLWorld.depth)
 | key | format | location | contents |
 |---|---|---|---|
 | `albedo` | RGBA8 | 0 | the colour the unlit renderer would draw (same pixels as lighting off), a = 1 |
-| `normal` | RGBA8 | 1 | rg = normal.xy * 0.5 + 0.5 (z implied, +y down), b = distance to the body's nearest edge in px / 255 (clamped), a = flags / 255: bit0 occluder, bit1 casts shadow, bit2 lit |
+| `normal` | RGBA8 | 1 | rg = normal.xy * 0.5 + 0.5 (z implied, +y down), b = distance to the body's nearest edge in px / 255 (clamped), a = flags / 255: bit0 occluder, bit1 casts shadow, bit2 lit, bit3 border (a filled body's black outline: no emission, not see-through / mirror except fluid) |
 | `mat` | R16UI ("u2", 1 comp) | 2 | material id (0 = background / none) |
 
-Background, grid, trails write normal (0.5, 0.5, 0, 0), mat 0. Outline lines / points / stamps of a body write that
-body's material id with lit flag per material; outlines (`lit=False` usage) may use a flat normal.
+Background, grid, trails write normal (0.5, 0.5, 0, 4 / 255) (flat, lit, not an occluder), mat 0; past the clip
+(outside the world view) flags 0, so no effect lights it and compose keeps the plain background there. Outline
+lines / points / stamps of a body write that body's material id with lit flag per material; outlines (`lit=False`
+usage) may use a flat normal.
 
 ## Material table (F)
 `GLWorld.material_tex`: RGBA32F, width 8 texels per material, one row per material id (id 0 = unused/default).

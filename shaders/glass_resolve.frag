@@ -100,6 +100,9 @@ void main() {
     int kind = kind_of(id);
     Mat m = g_mat;
     vec4 nb = texelFetch(u_normal, p, 0);
+    // a glass / mirror body's black border (filled view, FLAG_BORDER) keeps its composed colour, as unlit: the optics
+    // stop at the body's fill (fluid borders melt into the liquid like the rest of it)
+    if ((uint(nb.a * 255.0 + 0.5) & 8u) != 0u && kind != KIND_FLUID) discard;
     vec2 n = nb.rg * 2.0 - 1.0;
     float d = nb.b * 255.0;
     vec3 own = texelFetch(u_scene, p, 0).rgb;

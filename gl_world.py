@@ -144,8 +144,9 @@ class WorldPacker:
     [x1, y1, x2, y2, width, colour, layer, transparency 0..255 (0 opaque), material, kind],
     stamps=(k, 6) int64 [cx, cy, colour, layer, width, material] with radii=(k,) float64).
     material: the id from body_mat (per body; base_mat for ropes and hooks, -1 for the grab lines: overlays drawn
-    after the lit effects); kind: 0, or +1 / -1 (the body's winding) for the rim lines of the no-outline view. Both
-    only matter with lighting on (gl_world draws the same pixels without them)."""
+    after the lit effects); kind: 0, +1 / -1 (the body's winding) for the rim lines of the no-outline view, 2 for a
+    filled body's black border (no emission). Both only matter with lighting on (gl_world draws the same pixels
+    without them)."""
 
     def __init__(self):
         self.topo = None
@@ -254,7 +255,7 @@ class WorldPacker:
         col = np.full(loop.shape[1], pack_rgb([BORDER_COL])[0])
         layer = body_layer[t.loop_body]
         ones = np.ones(loop.shape[1], np.int64)
-        lm, kind = mat[t.loop_body], 0 * ones  # border lines: flat normals
+        lm, kind = mat[t.loop_body], 2 * ones  # border lines: flat normals, no emission
         if not outlines:  # no border: the shape grown FILL_EXPAND px outward in its own fill colour
             col = fill_c[t.loop_body]
             kind = winding  # rim lines: normals tilted outward
@@ -273,7 +274,7 @@ class WorldPacker:
         border = np.full(sb.size, pack_rgb([BORDER_COL])[0])
         layer, zero, m = body_layer[sb], np.zeros(sb.size, np.int64), mat[sb]
         if outlines:
-            lines.append(np.stack([a[0], a[1], b[0], b[1], outer, border, layer, zero, m, zero], axis=1))
+            lines.append(np.stack([a[0], a[1], b[0], b[1], outer, border, layer, zero, m, zero + 2], axis=1))
             for end in (a, b):
                 stamps.append(np.stack([end[0], end[1], border, layer, zero, m], axis=1))
                 radii.append(outer / 2)
@@ -587,7 +588,7 @@ class GLWorld:
         self.base_vao.render(moderngl.TRIANGLE_STRIP, vertices=4)
         overlays = self._bodies(world, filled, zoom, outlines, lit)
         if lit:
-            self._effects(world, clip, zoom)
+            self._effects(world, clip, zoom, filled)
             self._overlays(overlays)
         if prev is not None:
             prev.use()
@@ -655,7 +656,7 @@ class GLWorld:
         self._rest_topo = topo
         return self._rest_all
 
-    def _effects(self, world, clip, zoom):
+    def _effects(self, world, clip, zoom, filled=True):
         """The lit effects in order (gl_effects); none: the albedo as is."""
         ctx = self.ctx
         if self.effects is None:
@@ -670,7 +671,7 @@ class GLWorld:
         if period is not None:
             period = (float(period[0]) * zoom, float(period[1]) * zoom)
         self.frame = FrameInfo(self.size, clip, float(zoom), period, world, self.gbuf, self.material_tex,
-                               self.n_materials, {}, gw=self, ctx=ctx, fbo=self.fbo)
+                               self.n_materials, {}, gw=self, ctx=ctx, fbo=self.fbo, filled=bool(filled))
         for e in self.effects:
             e.run(self, self.frame)
         ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
