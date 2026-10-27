@@ -183,9 +183,10 @@ PENROSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "
 
 
 def _layout_tiling(layout, tiling=None, pentagrid_seed=None):
-    """{"tiling": ..., "pentagrid_seed": ..., "edge": ..., "rotation": ...} a diamonds world is built on: the layout
-    file's own (if `layout` is one), else `tiling` (a name, "diamonds" by default, or such a dict) and, for "penrose",
-    `pentagrid_seed` (PENROSE_SEED), PENROSE_SIDE and PENROSE_ROTATION where not given."""
+    """{"tiling": ..., "pentagrid_seed": ..., "edge": ..., "rotation": ..., "min_slope": ..., "cup_gap": ...} a
+    diamonds world is built on: the layout file's own (if `layout` is one), else `tiling` (a name, "diamonds" by
+    default, or such a dict) and, for "penrose", `pentagrid_seed` (PENROSE_SEED) and the PENROSE_* defaults where
+    not given."""
     from diamonds_map import layout_tiling
     if isinstance(layout, str):
         info = layout_tiling(layout)
@@ -231,8 +232,9 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     dropped and added (diamonds_map.pick_diamonds).
     tiling: "diamonds" (default) or "penrose": a Penrose P3 tiling (diamonds_map.penrose_tiles, edge PENROSE_SIDE,
     rotated PENROSE_ROTATION, pentagrid offsets seeded by `pentagrid_seed`, default PENROSE_SEED) whose picked rhombi
-    are the obstacles, by the same cup / cluster rules; or a dict of those (see _layout_tiling). A layout file's own
-    tiling ("tiling", "pentagrid_seed", "edge", "rotation") overrides both."""
+    are the obstacles, by the same cup / cluster rules (cup gap PENROSE_CUP_GAP); or a dict of those (see
+    _layout_tiling). A layout file's own tiling ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope",
+    "cup_gap") overrides both."""
     from diamonds_map import (lattice_diamonds, layout_shift, load_layout, penrose_tiles, pick_diamonds,
                               place_hexagons, shift_diamonds, steep_tiles)
     from palettes import DEFAULT, apply_palette
@@ -253,7 +255,8 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
         side = DIAMOND_SIDE
         tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed, y0=DIAMOND_SIDE)
     keys, size = load_layout(layout) if isinstance(layout, str) else layout if layout is not None else (None, None)
-    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=float(info.get("cup_gap", CUP_GAP)),
+    gap = float(info.get("cup_gap", CUP_GAP))
+    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=gap,
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
                              add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)))
     if isinstance(layout, str):  # the layout file's own offset (diamonds_map.layout_shift), if any

@@ -17,7 +17,8 @@ variants. Every run is the physics only (no display, no drawing) for `seconds` o
 with --weights w1,w2,w3 (default 0.7,0.2,0.1).
 
 Then the last round's top `finalists` and the base run `final_seconds` each, and the best is written to
-maps/<tiling>/NAME.json (with the spawn settings it was evolved under, and for penrose the pentagrid seed and edge),
+maps/<tiling>/NAME.json (with the spawn settings it was evolved under, and for penrose the tiling's settings: pentagrid
+seed, edge, rotation, min slope, cup gap, see scene._layout_tiling),
 so it shows up as "<tiling>/NAME" in the Worlds panel. Progress goes to stdout (one line per round) and every run to
 LOG_DIR/runs.jsonl.
 
