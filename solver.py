@@ -9,6 +9,7 @@ import pygame
 
 from entities import Body, EnvConfig, RigidBody, SoftBody
 import looping
+import pumpkin_eyes
 import solver_jit
 
 _NO_SECTION = nullcontext()  # stands in for profiler sections when no profiler is attached
@@ -825,6 +826,7 @@ class World:
         copies = defaultdict(list)
         for k, s in looping.image_copies(self):
             copies[k].append(s)
+        eyes = pumpkin_eyes.of_world(self)  # the pumpkin palette's easter egg: eyes on some heptagons
         for k, b in enumerate(self.bodies):
             for s in [None] + copies.get(k, []):
                 if s is not None:  # a shallow copy with moved points draws the image (the body's arrays untouched)
@@ -834,6 +836,8 @@ class World:
                     b.draw_filled(surface, border_width=2 if outlines else 0, zoom=zoom)
                 else:
                     b.draw(surface, zoom)
+                if eyes is not None:
+                    pumpkin_eyes.draw(surface, eyes, k, b.points, zoom)
         for r in self.ropes:
             r.draw(surface, zoom)
         for hk in self.hooks:  # over the ropes, so a rope ends inside its hook
