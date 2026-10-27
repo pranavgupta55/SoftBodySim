@@ -83,6 +83,13 @@ class EnvConfig:
     # s; longest substep: when max_substeps would make them longer, more substeps run instead (frames get slower).
     # None: no limit.
     max_substep_dt = 1 / 40
+    # True: when max_substep_dt would need more substeps than physics_budget allows, run the budget's substeps (at
+    # least the scale-1 count) at max_substep_dt and simulate less than the time scale asks (World.last_sim_dt <
+    # last_requested_dt), so the frame rate holds instead of spiralling down to max_dt. False: max_substep_dt adds
+    # substeps past the budget. Measured on diamonds/evolved 1 (E-cores, 1800x1169 window): at 1000% / 5000% True
+    # runs 48 / 50 fps delivering 2.4x / 2.5x, False 9 / 2.5 fps delivering 3.0x / 3.7x; worst stretch the same
+    # (every substep is at most max_substep_dt either way). Off by default: it trades delivered speed for frame rate.
+    budget_limits_speed = False
 
 
 # Small steps (research 01 and 10 F8): more substeps, fewer solver passes. Energy, free fall, chain stretch and

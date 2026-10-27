@@ -142,7 +142,8 @@ class World:
         self._span_contacts = None  # (candidates, point box lo, point box hi), shared by the span's substeps
         self._span_reach = None  # _solve_contacts' reach, carried across the span's substeps
         self.contact_builds = 0  # contact candidate broad phases run (for debugging)
-        self.last_sim_dt = 0.0  # seconds the last step() simulated (dt * scale after the max_dt clamp)
+        self.last_sim_dt = 0.0  # seconds the last step() simulated (dt * scale after the max_dt clamp and budget)
+        self.last_requested_dt = 0.0  # seconds the last step() was asked for (dt * scale, before any clamp)
         self._h = XPBD_REF_H  # the current substep's length (XPBD springs), set by _pbd_substep
         self._substep_cost = None  # running mean of seconds per substep (EnvConfig.physics_budget)
         self.clock = time.perf_counter  # what _substep_cost is measured with (a benchmark may swap in thread time)
@@ -437,6 +438,7 @@ class World:
             self.last_wraps = []
             if self.period is not None:
                 looping.clear_periodic(self)
+        self.last_requested_dt = dt * scale  # what the caller asked for (before the max_dt clamp)
         if scale == 1.0 and frames == 1.0:
             dt, n = min(dt, EnvConfig.max_dt), EnvConfig.substeps
         else:
@@ -446,11 +448,19 @@ class World:
         base = max(1, round(EnvConfig.substeps * frames))
         if EnvConfig.max_substeps is not None:
             n = min(n, max(base, round(EnvConfig.max_substeps * frames)))
+        budget = None  # most substeps physics_budget allows this step
         if EnvConfig.physics_budget is not None and self._substep_cost:
-            n = min(n, max(base, int(EnvConfig.physics_budget * frames / self._substep_cost)))
+            budget = max(base, int(EnvConfig.physics_budget * frames / self._substep_cost))
+            n = min(n, budget)
         if EnvConfig.max_substep_dt is not None:  # but never longer than max_substep_dt
-            n = max(n, math.ceil(dt / EnvConfig.max_substep_dt - 1e-9))
-        self.last_sim_dt = dt  # seconds this step simulates (after the max_dt clamp and the time scale)
+            need = math.ceil(dt / EnvConfig.max_substep_dt - 1e-9)
+            if EnvConfig.budget_limits_speed and budget is not None and need > budget:
+                # out of budget: run the budget's substeps at max_substep_dt and simulate less than asked
+                n = max(n, budget)
+                dt = n * EnvConfig.max_substep_dt
+            else:
+                n = max(n, need)
+        self.last_sim_dt = dt  # seconds this step simulates (after the max_dt clamp, time scale and budget)
         t0 = self.clock()
         self._substeps(n, dt / n)
         # running mean of the time a substep takes, for physics_budget (the first one includes no compile stalls:
