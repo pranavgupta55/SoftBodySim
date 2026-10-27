@@ -51,7 +51,9 @@ XPBD_CALIBRATION = 1.0
 GRAB_AREA_MIN_WEIGHT = 0.05  # an area grab skips points whose Gaussian pull weight is below this
 GRAB_AREA_SIGMA = 0.75  # the area grab's Gaussian sigma, x the circle's radius; the curve is shifted and
 # rescaled so the pull is 1 at the cursor and falls to exactly 0 on the circle (nothing outside it is held)
-GRAB_AREA_FORCE = 0.1  # its pull (stiffness and speed cap) relative to the single-point grab's
+# area grab: each frame a point at the cursor is pushed by this share of the mouse's motion (x its weight); the push
+# becomes velocity, so it builds up while the mouse keeps moving. A still mouse pushes nothing
+GRAB_AREA_FORCE = 0.15
 
 
 def spring_compliance(stiffness, count):
@@ -117,6 +119,8 @@ class World:
         # grab_target + its offset, i.e. the cursor's copy nearest it (offset = minus its image shift)
         self.grab_set = None
         self.grab_radius = None  # the area grab's radius while it is held, else None
+        self._grab_move = np.zeros(2)  # mouse motion since the last step (area grab), spread over its substeps
+        self._grab_step_move = np.zeros(2)  # the current step's share of it
         self.zone_count = 0  # how many CCD passes needed the rigid impact zone fallback (for debugging)
         self.projection_count = 0  # how many CCD passes the inelastic projection fallback fixed (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
@@ -406,6 +410,7 @@ class World:
         self.grab_shift = np.zeros(2)
         self.grab_target = np.array(pos, dtype=float)
         self.grab_radius = float(radius)
+        self._grab_move = np.zeros(2)
         self._area_pick()
 
     def _area_pick(self):
@@ -431,8 +436,10 @@ class World:
     def drag_to(self, pos, radius=None):
         """Move the hand to pos (an area grab: also re-picks the points under it, with `radius` if given)."""
         shift = self.grab_shift
+        old = self.grab_target
         self.grab_target = np.array(pos, dtype=float) - shift if shift.any() else np.array(pos, dtype=float)
         if self.grab_radius is not None:
+            self._grab_move = self._grab_move + (self.grab_target - old)
             if radius is not None:
                 self.grab_radius = float(radius)
             self._area_pick()
@@ -452,18 +459,15 @@ class World:
     def release(self):
         self.grabbed = self.grab_set = self.grab_radius = None
         self.grab_shift = np.zeros(2)
+        self._grab_move = np.zeros(2)
 
     def _apply_grab(self, h):
         """Nudge the held point toward the cursor once per substep of length h, so contacts (solved after) can
         out-vote the hand. The pull is set per second, so dragging feels the same at any substep count."""
-        if self.grab_set is not None:  # an area grab: every held point toward its own target, each capped
-            idx, off, _, w = self.grab_set  # each pull (and its speed cap) scaled by the point's Gaussian weight
-            gap = self.grab_target[:, None] + off - self.P[:, idx]
-            step = gap * -np.expm1(-EnvConfig.grab_stiffness * GRAB_AREA_FORCE * w * h)
-            length = np.hypot(*step)
-            max_step = EnvConfig.grab_max_speed * GRAB_AREA_FORCE * w * h
-            step *= np.minimum(1.0, max_step / np.maximum(length, 1e-12))
-            self.P[:, idx] += step
+        if self.grab_set is not None:  # an area grab: each held point moves with the mouse (none while it's still),
+            idx, _, _, w = self.grab_set  # its share of the step's mouse motion x GRAB_AREA_FORCE x its weight
+            frac = h / max(self.last_sim_dt, 1e-12)
+            self.P[:, idx] += self._grab_step_move[:, None] * (frac * GRAB_AREA_FORCE * w)
             return
         if self.grabbed is None:
             return
@@ -530,6 +534,7 @@ class World:
             else:
                 n = max(n, need)
         self.last_sim_dt = dt  # seconds this step simulates (after the max_dt clamp, time scale and budget)
+        self._grab_step_move, self._grab_move = self._grab_move, np.zeros(2)  # area grab: spread over the substeps
         t0 = self.clock()
         self._substeps(n, dt / n)
         # running mean of the time a substep takes, for physics_budget (the first one includes no compile stalls:
@@ -995,11 +1000,9 @@ class World:
             dist = float(np.hypot(*pull))
             end[:, g] = self.P[:, g] + self.V[:, g] * t + (pull if dist <= reach else pull * (reach / dist))
         if self.grab_set is not None:  # an area grab: the same reach for each held point
-            idx, off, _, w = self.grab_set
-            pull = self.grab_target[:, None] + off - self.P[:, idx]
-            reach = EnvConfig.grab_max_speed * GRAB_AREA_FORCE * w * t
-            dist = np.hypot(*pull)
-            end[:, idx] = self.P[:, idx] + self.V[:, idx] * t + pull * np.minimum(1.0, reach / np.maximum(dist, 1e-12))
+            idx, _, _, w = self.grab_set  # the mouse motion still to come this step
+            push = self._grab_step_move[:, None] * (t / max(self.last_sim_dt, 1e-12) * GRAB_AREA_FORCE * w)
+            end[:, idx] += push
         return np.minimum(self.P, end) - r, np.maximum(self.P, end) + r
 
     def _span_candidates(self):
