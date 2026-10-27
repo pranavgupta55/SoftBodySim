@@ -8,17 +8,17 @@ at two resolutions:
 - `HUD`: the cards in the right-hand sidebar (Controls, Compute, Gravity, ...), drawn at native screen resolution on
   the sidebar layer (hud_layer.py). Every metric is a base (UI-style) length times HUD.scale, rounded to whole px.
   The sidebar picks that scale for the screen (HudLayer.fit): as large as its width allows (it's SIDEBAR_FRAC of
-  the screen, but at least wide enough for HUD_MIN_SCALE) while all its cards still fit its height.
+  the screen, but at least wide enough for HUD_MIN_SCALE). It never shrinks the text to fit the cards: cards
+  collapse to their title rows and the sidebar scrolls instead.
 """
 import pygame
 
 from fontDict import fonts
 
 # Sidebar card scale bounds (native px per base px). Cards are drawn 1 native px per pixel; 1 is the smallest scale
-# that's comfortably legible (11 px text), so the sidebar is at least wide enough for that. Below it (only if the cards
-# can't fit the screen's height otherwise) the scale may drop to HUD_FLOOR_SCALE.
+# that's comfortably legible (11 px text), so the sidebar is at least wide enough for that and never goes below it
+# (cards that don't fit scroll, hud_layer.py).
 HUD_MIN_SCALE = 1.0
-HUD_FLOOR_SCALE = 0.75
 HUD_MAX_SCALE = 2.0
 CARD_WIDTH_BASE = 150  # a sidebar card's width at scale 1 (base px), without the margins
 
@@ -81,6 +81,35 @@ class Style:
         setattr(r, key, pos)
         surface.blit(img, r)
         return r
+
+    # ---------------- Card headers (the sidebar's open / close rows, hud_layer.py)
+    def header_height(self):
+        """A collapsed card's height: just its title row."""
+        return 2 * self.CARD_PAD + self.px(13)
+
+    def header_hit_height(self):
+        """The clickable header band at the top of an open card (above its first widget row)."""
+        return self.CARD_PAD + self.px(14)
+
+    def draw_arrow(self, surface, center, open_, color=WHITE):
+        """A disclosure triangle (pixel style, no antialiasing): pointing down when open, right when closed."""
+        cx, cy = center
+        a, b = self.px(4), self.px(2)  # half its long side, half its short side
+        if open_:
+            pts = [(cx - a, cy - b), (cx + a, cy - b), (cx, cy - b + a)]
+        else:
+            pts = [(cx - b, cy - a), (cx - b, cy + a), (cx - b + a, cy)]
+        pygame.draw.polygon(surface, color, pts)
+
+    def card_title(self, surface, rect, title, open_=True, color=WHITE):
+        """A card's title row at the top of `rect`: the disclosure arrow, then the bold title. Returns the title's
+        text rect."""
+        pad, px = self.CARD_PAD, self.px
+        font = self.font("bold", self.TITLE_SIZE)
+        y = rect.y + pad - px(1)
+        mid = y + round(font.get_ascent() * 0.62)  # the capitals' middle
+        self.draw_arrow(surface, (rect.x + pad + px(4), mid), open_, color)
+        return self.text(surface, title, (rect.x + pad + px(12), y), color, "bold", self.TITLE_SIZE)
 
     def draw_button(self, surface, rect, label=None, hovered=False, selected=False, disabled=False, size=None):
         """A framed button: Endesga fill, black border, a light inner outline on hover, centered bold label."""

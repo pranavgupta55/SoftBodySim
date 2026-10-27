@@ -28,6 +28,7 @@ GLSL 330 shaders. Hotkeys (all listed on the sidebar's Controls card): F compute
 V view (points / filled / filled without outlines), T motion trails, L lighting (the lit renderer; its Lights and
 Material cards, lighting_ui.py), SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), B point / circle grab, O circle radius (4 presets; the wheel too), ESC quit,
 1-4 debug overlays (debug_overlay.py), [ / ] or the Controls card's - / + physics speed 1%-10000% and N one physics frame while paused (timectl.py).
+Sidebar: click a card's title row to open / close it; the wheel over the sidebar scrolls it (hud_layer.py).
 
 Worlds: `session` (world_selector.WorldSession) holds the Custom world and the preset worlds; `world` and `editor`
 are always its active world and that world's editor (rebound whenever the selector switches or resets a world, and
@@ -348,12 +349,13 @@ SIDEBAR_SAFETY_HZ = 2  # the sidebar is redrawn at least this often, whatever it
 def sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, now, look=()):
     """HudLayer.draw's key for this frame: what the cards show that can change without an input event changing
     `inputs` (keys / buttons / wheel seen so far), plus the mouse while it is over the sidebar (hover). look: the
-    lighting cards' versions (a slider or gizmo drag changes them without input events)."""
+    lighting cards' versions (a slider or gizmo drag changes them without input events); the sidebar's open cards and
+    scroll offset (the scroll keeps moving after the wheel's events, HudLayer.step)."""
     return (inputs, mouse_px if hud.rect.collidepoint(mouse_px) else None, session.name, session.open, id(editor),
             editor.paused, editor.active, editor.stage, editor.show_compute, ViewConfig.show_grid, ViewConfig.filled,
             ViewConfig.outlines, ViewConfig.lighting,
             ViewConfig.trails, ViewConfig.grab_area, ViewConfig.grab_area_radius, panel_open, int(now * SIDEBAR_SAFETY_HZ),
-            tuple(look))
+            tuple(look), hud.state_key())
 
 
 def grid_colors(background):
@@ -560,6 +562,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     toggle_panel()
                     sidebar_shown = panel_open
                     continue
+            if sidebar_shown and editor.scenes.state is None and hud.handle_event(event, pygame.mouse.get_pos()):
+                continue  # the sidebar's card headers (open / close), its scrolling, clicks between its cards
             if not sidebar_shown and event.type != pygame.KEYDOWN and event.type != pygame.KEYUP:
                 if session.open and event.type == pygame.MOUSEBUTTONDOWN:  # the Worlds panel (W) still takes clicks
                     if hud.rect.collidepoint(event.pos) and not session.on_panel(event.pos):

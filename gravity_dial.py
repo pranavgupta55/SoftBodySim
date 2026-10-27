@@ -88,6 +88,11 @@ class GravityDial:
         px = HUD.px
         return HUD.CARD_PAD + px(TITLE_H) + 2 * px(DIAL_R) + HUD.CARD_PAD
 
+    card_title = "Gravity"
+
+    def header_status(self):
+        return direction_name()
+
     def place(self, rect):
         self.rect = pygame.Rect(rect)
         self.centre = np.array([rect.centerx, rect.y + HUD.CARD_PAD + HUD.px(TITLE_H) + HUD.px(DIAL_R)], dtype=float)
@@ -189,7 +194,7 @@ class GravityDial:
         local = self.rect.move(-origin[0], -origin[1])
         HUD.draw_frame(surface, local)
         pad, px = HUD.CARD_PAD, HUD.px
-        HUD.text(surface, "Gravity", (local.x + pad, local.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
+        HUD.card_title(surface, local, "Gravity")
         HUD.text(surface, direction_name(), (local.right - pad, local.y + pad), ui.ACCENT, "bold", align="right")
         off = np.array(origin, dtype=float)
         zero = not np.any(EnvConfig.gravity)
