@@ -447,7 +447,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     grid_world = None  # the world whose G grid state ViewConfig.show_grid holds
 
     def toggle_panel():
-        """H / the Palette card's button, in a fullscreen world: show / hide the sidebar as a panel floating over
+        """H / the sidebar's footer button, in a fullscreen world: show / hide the sidebar as a panel floating over
         the right side of the world (the world keeps its size and shape)."""
         nonlocal panel_open
         if getattr(session.world, "fullscreen", False):
@@ -465,7 +465,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     # the sidebar's cards, top to bottom (hud_layer.py describes a card provider; append new cards here)
     # (the Controls card is the active world's editor: the session swaps it in this list when it switches worlds)
     hud.cards = [editor, session, perf_hud, gravity_dial]
-    palette_card = PaletteCard(lambda: session.world, toggle_panel)  # last, while the active world has palettes
+    palette_card = PaletteCard(lambda: session.world)  # last, while the active world has palettes
+    # pinned under the cards, always there (it only acts in a fullscreen world, where the sidebar is H's panel)
+    hud.footer = ("hide panel [h]", toggle_panel, lambda: getattr(session.world, "fullscreen", False))
 
     def toggle_lighting():
         """L / the Lights card's button: the lit renderer for the active world (world.lighting; ViewConfig.lighting

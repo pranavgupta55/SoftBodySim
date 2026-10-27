@@ -154,18 +154,18 @@ def palette_colors(name):
 
 
 class PaletteCard:
-    """The sidebar's Palette card for the active world (`get_world()`): a button per palette, then a hide-panel
-    button that calls `on_hide()`."""
+    """The sidebar's Palette card for the active world (`get_world()`): a button per palette. (The hide-panel button is
+    the sidebar's pinned footer, hud_layer.HudLayer.footer.)"""
     card_title = "Palette"
 
-    def __init__(self, get_world, on_hide=None):
-        self.get_world, self.on_hide = get_world, on_hide
+    def __init__(self, get_world):
+        self.get_world = get_world
         self.rect = pygame.Rect(0, 0, 0, 0)
 
     @staticmethod
     def card_height(compact=False):
         px, pad = HUD.px, HUD.CARD_PAD
-        n = len(PALETTES) + 1  # + the hide-panel button
+        n = len(PALETTES)
         return pad + px(CARD_TITLE_H) + n * px(CARD_BTN_H) + (n - 1) * px(BTN_GAP) + pad - px(1)
 
     def place(self, rect):
@@ -176,11 +176,11 @@ class PaletteCard:
         return getattr(self.get_world(), "palette", None) or ""
 
     def _buttons(self):
-        """[(palette name, rect)], then (None, the hide-panel button's rect), in native screen px."""
+        """[(palette name, rect)] in native screen px."""
         px, pad = HUD.px, HUD.CARD_PAD
         y, bh, gap = self.rect.y + pad + px(CARD_TITLE_H), px(CARD_BTN_H), px(BTN_GAP)
         return [(name, pygame.Rect(self.rect.x + pad, y + k * (bh + gap), self.rect.w - 2 * pad, bh))
-                for k, name in enumerate(list(PALETTES) + [None])]
+                for k, name in enumerate(PALETTES)]
 
     def handle_event(self, event):
         """Left clicks on the card: pick that palette. True if the click was on the card."""
@@ -189,11 +189,7 @@ class PaletteCard:
         if event.button == 1:
             for name, rect in self._buttons():
                 if rect.collidepoint(event.pos):
-                    if name is None:
-                        if self.on_hide is not None:
-                            self.on_hide()
-                    else:
-                        apply_palette(self.get_world(), name)
+                    apply_palette(self.get_world(), name)
         return True
 
     def draw_card(self, surface, origin, mouse_px, compact=False):
@@ -205,9 +201,6 @@ class PaletteCard:
         current = getattr(self.get_world(), "palette", None)
         for name, rect in self._buttons():
             local, on = rect.move(-ox, -oy), name == current
-            if name is None:
-                HUD.draw_button(surface, local, "hide panel [h]", rect.collidepoint(mouse_px))
-                continue
             HUD.draw_button(surface, local, None, rect.collidepoint(mouse_px), on)
             HUD.text(surface, name, (local.x + px(5), local.centery), ui.WHITE if on else ui.TEXT_DIM, "bold",
                      valign="middle")

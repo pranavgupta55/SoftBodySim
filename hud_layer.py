@@ -69,6 +69,7 @@ SPRING_W = 22.0  # 1/s: the critically damped spring pulling an overscroll back 
 REST_SPEED = 4.0  # px / s: slower than this (and within 0.5 px of an end when past it) is at rest
 SUBSTEP = 1 / 240  # s: the motion is integrated in steps no longer than this
 SCROLLBAR_W = 3  # base px
+FOOTER_BTN_H = 20  # base px: the footer button (editor.CARD_BTN_H)
 
 
 def card_title(card):
@@ -99,6 +100,8 @@ class HudLayer:
         self._ticks = {}  # id(card) -> its refresh tick when last drawn (cards with refresh_hz)
         self._mouse = (0, 0)
         self._overlay_box = None
+        # a button pinned under the cards, never scrolled or collapsed: (label, action(), enabled() -> bool) or None
+        self.footer = None
         s = ui_scale
         self._top = pygame.Surface((-(-self.rect.w // s), -(-self.rect.h // s)), pygame.SRCALPHA)  # UI-res overlay
 
@@ -127,7 +130,7 @@ class HudLayer:
         if r is None:
             return
         m = ui.HUD.CARD_MARGIN
-        need = min(r.bottom + m - self.rect.bottom, r.y - m - self.rect.y)
+        need = min(r.bottom + m - (self.rect.y + self.view_h()), r.y - m - self.rect.y)
         if need > 0:
             self.velocity = (need + REST_SPEED * SCROLL_TAU) / SCROLL_TAU
 
@@ -144,8 +147,26 @@ class HudLayer:
         scale = self.rect.w / (ui.CARD_WIDTH_BASE + 8)
         ui.HUD.set_scale(min(max(scale, ui.HUD_MIN_SCALE), ui.HUD_MAX_SCALE))
 
+    def footer_h(self):
+        """Height the footer takes from the bottom of the sidebar (0 without one)."""
+        if self.footer is None:
+            return 0
+        return ui.HUD.px(FOOTER_BTN_H) + 2 * ui.HUD.CARD_MARGIN
+
+    def view_h(self):
+        """Height of the scrolling card area (the sidebar above the footer)."""
+        return self.rect.h - self.footer_h()
+
+    def footer_rect(self):
+        """The footer button (native screen px), or None."""
+        if self.footer is None:
+            return None
+        m = ui.HUD.CARD_MARGIN
+        return pygame.Rect(self.rect.x + m, self.rect.bottom - m - ui.HUD.px(FOOTER_BTN_H), self.rect.w - 2 * m,
+                           ui.HUD.px(FOOTER_BTN_H))
+
     def max_scroll(self):
-        return max(self.content_h - self.rect.h, 0)
+        return max(self.content_h - self.view_h(), 0)
 
     def layout(self):
         """Place every card (native screen px), top to bottom, scrolled; returns [(card, rect, open)]."""
@@ -178,7 +199,7 @@ class HudLayer:
         return self.velocity != 0.0 or self.scroll != min(max(self.scroll, 0.0), self.max_scroll())
 
     def _cap(self):
-        return OVERSCROLL_FRAC * self.rect.h
+        return OVERSCROLL_FRAC * self.view_h()
 
     def wheel(self, notches):
         """Wheel / trackpad input (notches up > 0): adds velocity; past an end, against a growing resistance."""
@@ -230,7 +251,7 @@ class HudLayer:
         hi = self.max_scroll()
         if hi <= 0:
             return None
-        h, px = self.rect.h, ui.HUD.px
+        h, px = self.view_h(), ui.HUD.px
         m = ui.HUD.CARD_MARGIN
         track = h - 2 * m
         th = max(round(track * h / self.content_h), px(20))
@@ -245,13 +266,13 @@ class HudLayer:
         """Where a click grabs the scrollbar: its margin plus a little of the cards' right border."""
         m = ui.HUD.CARD_MARGIN
         z = m + ui.HUD.px(3)
-        return pygame.Rect(self.rect.right - z, self.rect.y, z, self.rect.h)
+        return pygame.Rect(self.rect.right - z, self.rect.y, z, self.view_h())
 
     def _drag_to(self, y):
         thumb, hi, m = self._thumb(), self.max_scroll(), ui.HUD.CARD_MARGIN
         if thumb is None:
             return
-        room = self.rect.h - 2 * m - thumb.h
+        room = self.view_h() - 2 * m - thumb.h
         frac = (y - self._drag - self.rect.y - m) / room if room > 0 else 0.0
         self.scroll, self.velocity = min(max(frac, 0.0), 1.0) * hi, 0.0
 
@@ -276,6 +297,11 @@ class HudLayer:
         if event.type != pygame.MOUSEBUTTONDOWN or not self.rect.collidepoint(event.pos):
             return False
         if event.button in (4, 5):  # (pygame's old-style wheel buttons, alongside MOUSEWHEEL)
+            return True
+        if event.pos[1] >= self.rect.y + self.view_h():  # the footer strip: its button, nothing under it
+            foot = self.footer_rect()
+            if event.button == 1 and foot is not None and foot.collidepoint(event.pos) and self.footer[2]():
+                self.footer[1]()
             return True
         thumb = self._thumb()
         if thumb is not None and event.button == 1 and self._bar_zone().collidepoint(event.pos):
@@ -317,6 +343,8 @@ class HudLayer:
                 self.surface.fill(ui.SIDEBAR_BG, local)
                 self._draw_card(card, r, is_open, mouse_px)
                 self._mark(local.top, local.bottom)
+                if local.bottom > self.view_h():
+                    self._draw_footer()
 
     def _draw_card(self, card, r, is_open, mouse_px):
         if is_open:
@@ -341,16 +369,30 @@ class HudLayer:
         s.fill(ui.SIDEBAR_BG)
         s.fill(ui.BLACK, (0, 0, ui.HUD.BORDER, self.rect.h))
         for card, r, is_open in self.placed:
-            if r.bottom > self.rect.y and r.top < self.rect.bottom:  # (cards scrolled out of view aren't drawn)
+            if r.bottom > self.rect.y and r.top < self.rect.y + self.view_h():  # (scrolled out of view: not drawn)
                 self._draw_card(card, r, is_open, self._mouse)
             hz = getattr(card, "refresh_hz", None)
             if hz:
                 self._ticks[id(card)] = int(now * hz)
+        self._draw_footer()
         thumb = self._thumb()
         if thumb is not None:
             s.fill(ui.BUTTON_SELECTED if self._drag is not None or self._bar_zone().collidepoint(self._mouse)
                    else ui.BUTTON, thumb.move(-self.rect.x, -self.rect.y))
         self.dirty = (0, self.rect.h)
+
+    def _draw_footer(self):
+        """The footer strip over whatever scrolled under it: the sidebar background and the pinned button."""
+        foot = self.footer_rect()
+        if foot is None:
+            return
+        top = self.view_h()
+        self.surface.fill(ui.SIDEBAR_BG, (ui.HUD.BORDER, top, self.rect.w - ui.HUD.BORDER, self.rect.h - top))
+        label, _, enabled = self.footer
+        on = bool(enabled())
+        ui.HUD.draw_button(self.surface, foot.move(-self.rect.x, -self.rect.y), label,
+                           on and foot.collidepoint(self._mouse), disabled=not on)
+        self._mark(top, self.rect.h)
 
     def _mark(self, top, bottom):
         top, bottom = max(top, 0), min(bottom, self.rect.h)
