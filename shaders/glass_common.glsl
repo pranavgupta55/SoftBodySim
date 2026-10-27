@@ -122,6 +122,10 @@ vec2 rim_normal(ivec2 c) {
 }
 #endif
 
+// caustics_normals.frag writes vec2(RIM_THIN_MARK, 0) on glass / fluid less than 2 px thick (a sliver, a zero-area
+// body drawn as its outline): it has no usable boundary normal, so a ray crossing it goes straight on (hit_normal
+// returns the caller's fallback, the ray's own direction, which refracts to itself) instead of fanning into streaks.
+#define RIM_THIN_MARK 4.0
 #ifdef USE_RIM_TEX
 uniform sampler2D u_rim;  // rim_normal per pixel (caustics_normals.frag), 0 where there is none
 #endif
@@ -138,11 +142,13 @@ vec2 hit_normal(vec2 inner, vec2 air, vec2 fallback) {
     for (int k = 0; k < 4; k++) {
         ivec2 o = ivec2(k & 1, k >> 1);
         vec2 n = texelFetch(u_rim, pixi(ivec2(fl) + o), 0).rg;
+        if (n.x > 0.5 * RIM_THIN_MARK) return fallback;  // degenerate glass: no refraction
         float w = (o.x == 1 ? fr.x : 1.0 - fr.x) * (o.y == 1 ? fr.y : 1.0 - fr.y);
         if (dot(n, n) > 0.25) rn += w * n;
     }
     if (dot(rn, rn) > 1e-6) return normalize(rn);
     rn = texelFetch(u_rim, pix(inner), 0).rg;
+    if (rn.x > 0.5 * RIM_THIN_MARK) return fallback;
     if (dot(rn, rn) > 0.25) return normalize(rn);
 #endif
 #ifdef USE_SDF
@@ -160,13 +166,26 @@ vec2 hit_normal(vec2 inner, vec2 air, vec2 fallback) {
 #ifdef CAUSTIC_PIECES  // caustics_rays.geom defines caustic_piece
 void caustic_piece(vec2 at, vec3 thr, int events, int refr, bool inside, float t);
 #define MARCH_HOOK(at, r, inside, t) caustic_piece(at, r.thr, r.events, r.refr, inside, t)
+// Caustic rays get a bigger interaction budget than view rays: a stack of k lenses takes 2k refractions (in and out),
+// and a ray that runs out stops there, leaving everything below the stack dark. The view / resolve programs keep
+// MARCH_BOUNCES (their output is unchanged).
+#define MARCH_BUDGET 12
+// A light inside a glass / fluid body (caustics_rays.geom sets this to the body's id before march()): the march
+// starts inside that medium, so the ray's first event is the exit refraction out of it.
+uint g_start_medium = 0u;
+// Extra march steps for this ray on top of MARCH_STEPS (caustics_rays.geom: a periodic sun's warm-up lap).
+int g_extra_steps = 0;
+#define MARCH_LOOP_STEPS (MARCH_STEPS + g_extra_steps)
+#else
+#define MARCH_BUDGET MARCH_BOUNCES
+#define MARCH_LOOP_STEPS MARCH_STEPS
 #endif
 #ifndef MARCH_HOOK
 #define MARCH_HOOK(at, r, inside, t)
 #endif
 // Light / view rays travelling in the plane: air (background, id 0) -> sdf steps; glass / fluid -> Snell in, march
 // inside with Beer-Lambert absorption toward the body's colour, Snell out or total internal reflection; mirror ->
-// reflect (tinted); opaque body -> stop. MARCH_BOUNCES interactions at most.
+// reflect (tinted); opaque body -> stop. MARCH_BUDGET interactions at most.
 struct Ray {
     vec2 pos;    // where it stopped (unwrapped px)
     vec2 dir;
@@ -225,12 +244,26 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
     bool inside = false;
     float ior = 1.0, absorption = 0.0;
     vec3 body_col = vec3(1.0);
+#ifdef CAUSTIC_PIECES
+    if (g_start_medium != 0u && see_through(kind_of(g_start_medium))) {
+        inside = true;
+        ior = max(g_mat.ior, 1.0);
+        absorption = g_mat.absorption;
+        body_col = texelFetch(u_albedo, pix(r.pos), 0).rgb;
+        r.thr *= g_mat.transparency;
+    }
+#endif
     vec2 prev = r.pos;
-    for (int i = 0; i < MARCH_STEPS; i++) {
+    for (int i = 0; i < MARCH_LOOP_STEPS; i++) {
         if (t >= max_t || off_view(r.pos)) { r.end = inside ? 2 : 0; MARCH_HOOK(r.pos, r, inside, t); return r; }
         ivec2 c = pix(r.pos);
         uint id = mat_id(c);
         int k = kind_of(id);
+#ifdef CAUSTIC_PIECES
+        // an opaque body that casts no shadow (flag bit1 off: the world's walls) doesn't stop light in the light
+        // pass, so it doesn't stop caustic light either (else the walls round the view block every directional ray)
+        if (k == KIND_OPAQUE && (int(texelFetch(u_normal, c, 0).a * 255.0 + 0.5) & 2) == 0) k = -1;
+#endif
         float step;
         if (!inside) {
             if (k == KIND_OPAQUE) {
@@ -239,7 +272,7 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
             }
             if (k >= 0) {  // mirror, glass or fluid: an interaction
                 vec4 e = refine(prev, r.pos, 0);
-                if (r.events >= MARCH_BOUNCES) { r.end = 2; MARCH_HOOK(e.xy, r, false, t); return r; }
+                if (r.events >= MARCH_BUDGET) { r.end = 2; MARCH_HOOK(e.xy, r, false, t); return r; }
                 MARCH_HOOK(e.xy, r, false, t);
                 ivec2 hc = pix(e.zw);
                 kind_of(mat_id(hc));
@@ -284,11 +317,14 @@ Ray march(vec2 o, vec2 dir, float max_t, uint self_id) {
                 if (dot(n, r.dir) < 0.0) n = -n;
                 vec2 rd = refract(r.dir, -n, ior);
                 if (dot(rd, rd) < 1e-6) {  // total internal reflection
-                    if (r.events >= MARCH_BOUNCES) { r.pos = e.xy; r.end = 2; return r; }
+                    if (r.events >= MARCH_BUDGET) { r.pos = e.xy; r.end = 2; return r; }
                     r.events++;
                     r.dir = reflect(r.dir, -n);
                     r.pos = e.xy + r.dir;
                 } else {
+#ifdef CAUSTIC_PIECES  // out of budget: stop inside, like the entry branch (view rays keep their old exit rule)
+                    if (r.events >= MARCH_BUDGET) { r.pos = e.xy; r.end = 2; return r; }
+#endif
                     r.events++;
                     r.refr++;
                     r.dir = normalize(rd);

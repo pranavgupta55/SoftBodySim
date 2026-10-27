@@ -9,7 +9,8 @@
 // Weight: a pixel crossed by a line gets one fragment per pixel step along the line's major axis, i.e.
 // max(|u.x|, |u.y|) fragments per px of path, hence the 1 / max(|u.x|, |u.y|). Rays t * dTheta apart (spacing * t;
 // directional: spacing) then give, before any lens, the light's own unshadowed irradiance colour x falloff(t) per
-// pixel, as the light pass would; converging rays pile up into caustics.
+// pixel, as the light pass would; converging rays pile up into caustics. Directional rays start where they enter
+// the view (clip_directional), so their whole path length is spent on screen.
 layout(points) in;
 layout(line_strip, max_vertices = CAUSTIC_MAX_VERTS) out;
 
@@ -30,9 +31,13 @@ float g_spacing;  // px between neighbouring rays (per px of path for point / sp
 vec2 g_start;     // where the current straight piece began
 float g_t0;       // path length there
 int g_verts = 0;  // vertices emitted so far
+float g_t_skip = 0.0;  // path length before which nothing is deposited (a periodic sun's warm-up lap)
+float g_fade_t;        // the deposit fades out over the last quarter of this path length
 
 vec3 weight(float t, vec3 thr) {
     float fall = u_kind == 2 ? 1.0 : pow(max(1.0 - t / u_radius_px, 0.0), u_falloff);
+    // the path cap: fade the deposit out over its last quarter, not a hard cut across the beam
+    fall *= 1.0 - smoothstep(0.75 * g_fade_t, g_fade_t, t);
     return u_light_col * thr * fall * (u_kind == 2 ? g_spacing : g_spacing * max(t, 1.0));
 }
 
@@ -70,7 +75,13 @@ void caustic_piece(vec2 at, vec3 thr, int events, int refr, bool inside, float t
     float ta = g_t0;
     g_start = at;
     g_t0 = t;
-    if (inside || (CAUSTIC_MIRRORS ? events : refr) == 0) return;
+    if (inside || (CAUSTIC_MIRRORS ? events : refr) == 0 || t <= g_t_skip) return;
+    if (ta < g_t_skip) {  // the piece starts in the warm-up: keep the part after it
+        a = mix(a, at, (g_t_skip - ta) / (t - ta));
+        ta = g_t_skip;
+    }
+    ta -= g_t_skip;
+    t -= g_t_skip;
     vec2 d = at - a;
     float len = length(d);
     if (len < 0.25) return;
@@ -100,24 +111,98 @@ void caustic_piece(vec2 at, vec3 thr, int events, int refr, bool inside, float t
     }
 }
 
+bool finite2(vec2 v) {
+    return !any(isnan(v)) && !any(isinf(v));
+}
+
+// A directional ray: the line o0 + dir * s (s in [0, diag], o0 0.5 * diag before the view centre, across the strip
+// the light covers), clipped to the view box. Returns false if this ray doesn't light the view; else its entry
+// point and how far it runs before it leaves the view. Entry is through the box's non-periodic edges facing the
+// light, and a ray is kept only if its entry point is inside the period on the periodic axes (one copy of each
+// wrapped ray, so nothing is lit twice). With no non-periodic edge to enter by (a fully periodic map, or a ray
+// running along the non-periodic walls), rays enter at the view edge of the periodic axis the light runs most
+// along, and `run` is one lap: the path length until the ray is back at that edge (each pixel is crossed once).
+// `lapped` says which case it is.
+bool clip_directional(vec2 o0, vec2 dir, float diag, out vec2 entry, out float run, out bool lapped) {
+    vec2 box = vec2(u_clip);
+    for (int k = 0; k < 2; k++) if (u_period[k] > 0.0) box[k] = u_period[k];
+    float t_in = 0.0, t_out = diag;
+    bool bounded = false;  // entered through a non-periodic edge
+    int major = abs(dir.x) >= abs(dir.y) ? 0 : 1;
+    for (int k = 0; k < 2; k++) {
+        bool periodic = u_period[k] > 0.0;
+        if (abs(dir[k]) < 1e-6) {
+            if (!periodic && (o0[k] < 0.0 || o0[k] > box[k])) return false;
+            continue;
+        }
+        float a = (0.0 - o0[k]) / dir[k], b = (box[k] - o0[k]) / dir[k];
+        if (!periodic) {
+            t_in = max(t_in, min(a, b));
+            t_out = min(t_out, max(a, b));
+            bounded = true;
+        }
+    }
+    if (!bounded) {
+        float a = (0.0 - o0[major]) / dir[major], b = (box[major] - o0[major]) / dir[major];
+        t_in = max(t_in, min(a, b));
+    }
+    if (bounded && t_out <= t_in + 0.5) return false;
+    entry = o0 + dir * t_in;
+    for (int k = 0; k < 2; k++) {
+        if (u_period[k] > 0.0 && (bounded || k != major) && (entry[k] < 0.0 || entry[k] >= box[k])) return false;
+    }
+    lapped = !bounded;
+    run = bounded ? t_out - t_in : box[major] / abs(dir[major]);
+    return true;
+}
+
 void main() {
+    // garbage lights (Python sanitises them too): draw nothing rather than NaN lines
+    if (!finite2(u_light_pos) || !finite2(u_light_dir) || isnan(u_falloff) || isinf(u_falloff)) return;
+    vec2 ldir = dot(u_light_dir, u_light_dir) > 1e-12 ? normalize(u_light_dir) : vec2(0.0, 1.0);
     int ray = gl_PrimitiveIDIn;
     float u = (float(ray) + 0.5) / float(u_rays);
     float diag = length(vec2(u_clip));
+    float max_t = u_max_t;
+    g_fade_t = u_max_t;
     vec2 o, dir;
     if (u_kind == 2) {
-        dir = normalize(u_light_dir);
+        dir = ldir;
         vec2 perp = vec2(-dir.y, dir.x);
-        o = 0.5 * vec2(u_clip) - dir * 0.5 * diag + perp * (u - 0.5) * diag;
         g_spacing = diag / float(u_rays);
+        vec2 entry;
+        float run;
+        bool lapped;
+        if (!clip_directional(0.5 * vec2(u_clip) - dir * 0.5 * diag + perp * (u - 0.5) * diag, dir, diag, entry, run,
+                              lapped))
+            return;
+        if (lapped) {
+            // A periodic sun: the light reaching the entry edge has already crossed the copies of everything
+            // upstream. March one warm-up lap from a period back (the same point, wrapped), depositing nothing, so
+            // the ray carries the refractions it picked up on the way in; then deposit over the next lap only,
+            // all of it (the entry edge is arbitrary, so no u_max_t fade from it).
+            g_t_skip = run;
+            o = entry - dir * run;
+            max_t = 2.0 * run;
+            g_fade_t = 1e9;
+            g_extra_steps = int(ceil(run / STEP_MAX_PX)) + 8;  // the warm-up lap's air steps
+        } else {
+            o = entry + dir * 0.5;  // half a px inside, so the march doesn't start off the view
+            max_t = min(max_t, run - 0.5);
+        }
     } else {
-        float a0 = atan(u_light_dir.y, u_light_dir.x);
+        float a0 = atan(ldir.y, ldir.x);
         float a = u_kind == 1 ? a0 + (2.0 * u - 1.0) * u_cone : 6.2831853 * u;
         dir = vec2(cos(a), sin(a));
         o = u_light_pos;
         g_spacing = (u_kind == 1 ? 2.0 * u_cone : 6.2831853) / float(u_rays);
+        // a light inside glass / fluid: the march starts inside that medium (first event: the exit refraction)
+        if (!off_view(o)) {
+            uint id = mat_id(pix(o));
+            if (id != 0u && see_through(kind_of(id))) g_start_medium = id;
+        }
     }
     g_start = o;
     g_t0 = 0.0;
-    march(o, dir, u_max_t, 0u);
+    march(o, dir, max_t, 0u);
 }
