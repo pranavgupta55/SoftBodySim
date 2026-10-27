@@ -7,6 +7,8 @@ materials change nothing: the world draws exactly as before.
 """
 from dataclasses import dataclass, fields, replace
 
+import numpy as np
+
 OPAQUE, GLASS, MIRROR, FLUID = 0, 1, 2, 3  # Material.kind
 BEVEL, DOME, PILLOW = 0, 1, 2  # Material.profile: height h(d) over the distance d to the nearest edge
 PATTERN_NONE, PATTERN_NOISE, PATTERN_STRIPES, PATTERN_CHECKER, PATTERN_DOTS = 0, 1, 2, 3, 4  # Material.pattern
@@ -67,3 +69,44 @@ def resolve(preset=None, overrides=None):
 def of_body(body):
     """A body's effective Material (its `material` / `material_over`, both optional)."""
     return resolve(getattr(body, "material", None), getattr(body, "material_over", None))
+
+
+# ---------------- GPU packing (gl_world.GLWorld.material_tex, shaders/material.glsl)
+# The material table is an RGBA32F texture, TEXELS texels wide, one row per material id (row 0 = id 0: no material,
+# all zeros). One material = TEXELS x 4 floats, laid out (texel: r, g, b, a):
+#   0: tint.r, tint.g, tint.b, tint_strength
+#   1: emissive.r, emissive.g, emissive.b, emissive_strength
+#   2: specular, roughness, bands, bevel_px
+#   3: profile, kind, ior, reflectivity
+#   4: transparency, absorption, pattern, pattern_scale
+#   5: pattern_strength, casts_shadow (0 / 1), lit (0 / 1), 0
+#   6, 7: reserved (0)
+# Integer and bool fields are stored as floats (exact). shaders/material.glsl's mat_fetch reads this back into a
+# struct Mat with the same field names. Add new fields only in the reserved slots, and update both sides.
+TEXELS = 8
+
+
+def pack(material):
+    """(TEXELS, 4) float32: one material's row of the material table (layout above)."""
+    m = material
+    rows = [
+        (*m.tint, m.tint_strength),
+        (*m.emissive, m.emissive_strength),
+        (m.specular, m.roughness, m.bands, m.bevel_px),
+        (m.profile, m.kind, m.ior, m.reflectivity),
+        (m.transparency, m.absorption, m.pattern, m.pattern_scale),
+        (m.pattern_strength, float(m.casts_shadow), float(m.lit), 0.0),
+    ]
+    out = np.zeros((TEXELS, 4), np.float32)
+    out[:len(rows)] = rows
+    return out
+
+
+def unpack(a):
+    """The Material of one packed row (pack's inverse, up to float32 rounding)."""
+    t = [[float(v) for v in row] for row in a]
+    return Material(tint=tuple(t[0][:3]), tint_strength=t[0][3], emissive=tuple(t[1][:3]), emissive_strength=t[1][3],
+                    specular=t[2][0], roughness=t[2][1], bands=int(t[2][2]), bevel_px=t[2][3], profile=int(t[3][0]),
+                    kind=int(t[3][1]), ior=t[3][2], reflectivity=t[3][3], transparency=t[4][0], absorption=t[4][1],
+                    pattern=int(t[4][2]), pattern_scale=t[4][3], pattern_strength=t[5][0],
+                    casts_shadow=bool(t[5][1]), lit=bool(t[5][2]))
