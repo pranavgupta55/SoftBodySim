@@ -25,7 +25,7 @@ it's uploaded only when it changes.
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
 GLSL 330 shaders. Hotkeys (all listed on the sidebar's Controls card): F compute card full / summary, G grid,
-V view (points / filled / filled without outlines), T motion trails, SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), ESC quit,
+V view (points / filled / filled without outlines), T motion trails, SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), B point / circle grab, O circle radius (4 presets; the wheel too), ESC quit,
 1-4 debug overlays (debug_overlay.py), [ / ] or the Controls card's - / + physics speed 1%-10000% and N one physics frame while paused (timectl.py).
 
 Worlds: `session` (world_selector.WorldSession) holds the Custom world and the preset worlds; `world` and `editor`
@@ -70,6 +70,7 @@ SCALE_DOWN = 2  # real screen px per render surface px
 GHOST_ALPHA = 100  # opacity of the translucent ghost layer (screenT)
 GRAB_AREA_MIN, GRAB_AREA_MAX = 10.0, 400.0  # the area grab's circle radius range (world units)
 GRAB_AREA_WHEEL = 1.15  # each wheel notch scales the circle by this
+GRAB_AREA_PRESETS = (20.0, 40.0, 80.0, 160.0)  # O cycles the circle's radius through these (world units)
 OVERLAY_LEGEND_PX = 6  # the debug overlay legend's top-left corner, UI px in from the top-left of the screen
 MEASURE_GPU = True  # ctx.finish() before the flip so the compute card can show GPU time
 INPUT_EVENTS = {pygame.KEYDOWN, pygame.KEYUP, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL}
@@ -348,7 +349,7 @@ def sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, now):
     return (inputs, mouse_px if hud.rect.collidepoint(mouse_px) else None, session.name, session.open, id(editor),
             editor.paused, editor.active, editor.stage, editor.show_compute, ViewConfig.show_grid, ViewConfig.filled,
             ViewConfig.outlines,
-            ViewConfig.trails, ViewConfig.grab_area, panel_open, int(now * SIDEBAR_SAFETY_HZ))
+            ViewConfig.trails, ViewConfig.grab_area, ViewConfig.grab_area_radius, panel_open, int(now * SIDEBAR_SAFETY_HZ))
 
 
 def grid_colors(background):
@@ -570,6 +571,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     ViewConfig.trails = not ViewConfig.trails
                 if event.key == pygame.K_b:  # B: grab the nearest point, or every point in a circle
                     ViewConfig.grab_area = not ViewConfig.grab_area
+                if event.key == pygame.K_o and ViewConfig.grab_area:  # O: next preset radius (after the current one)
+                    bigger = [r for r in GRAB_AREA_PRESETS if r > ViewConfig.grab_area_radius + 1e-6]
+                    ViewConfig.grab_area_radius = bigger[0] if bigger else GRAB_AREA_PRESETS[0]
                 if pygame.K_1 <= event.key <= pygame.K_4:
                     overlays.toggle(event.key - pygame.K_1)
                 if event.key == pygame.K_LEFTBRACKET:

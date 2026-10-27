@@ -1262,7 +1262,10 @@ class Editor(SelectionTools):
                         + ([] if self._editing() else [("drag", "grab bodies", None, not self.paused),
                                                        ("B", "grab", None if v is None else
                                                         ("circle" if getattr(v, "grab_area", False) else "point"),
-                                                        True)])
+                                                        True),
+                                                       ("O", "radius", None if v is None else
+                                                        f"{getattr(v, 'grab_area_radius', 0):.0f}",
+                                                        bool(getattr(v, "grab_area", False)))])
                         + [("ESC", "back" if self.active or self._esc_cancels() else "quit", None, True)]),
                 ("View", [("G", "grid", grid, True),
                           ("V", "view", look, True),
