@@ -237,7 +237,9 @@ class Editor(SelectionTools):
                          # two ends to place, each fixed or free (END_OPTIONS); segments = ropes + boxes, odd when
                          # both ends are alike (see chain_range)
                          "chain": {"n": 2, "segments": 3, "start": "fixed", "end": "fixed", "color": "grey",
-                                   "rope_color": "light_brown"}}
+                                   "rope_color": "light_brown"},
+                         # the lit renderer's material new bodies get (the Material card sets it, lighting_ui.py)
+                         "material": {"preset": None, "over": {}}}
         self.paused = False
         self.active = False  # editor mode
         self.stage = None  # "menu" -> "config" -> ("select" ->) "place"; Finish goes back to "menu"
@@ -489,6 +491,8 @@ class Editor(SelectionTools):
             body = RigidBody(pts, point_radius=3, **style)
         else:
             body = FixedBody(pts, point_radius=2, stick_width=2 if pts.shape[1] == 2 else 1, **style)
+        mat = self.settings.get("material") or {}
+        body.material, body.material_over = mat.get("preset"), dict(mat.get("over") or {})
         index = None
         if self.relation == "around":  # drawn under what it encloses: just before the first of those bodies
             enclosed = self._target()[1]
@@ -1270,6 +1274,8 @@ class Editor(SelectionTools):
                 ("View", [("G", "grid", grid, True),
                           ("V", "view", look, True),
                           ("T", "trails", trails, True),
+                          ("L", "lighting", None if v is None else ("on" if getattr(v, "lighting", False) else "off"),
+                           True),
                           ("F", "compute", "full" if self.show_compute else "short", True),
                           ("1-4", "overlays", None if self.overlays is None else self.overlays.state(), True)]),
                 ("Edit", [("R-click", "spawn menu", None, not self.active),

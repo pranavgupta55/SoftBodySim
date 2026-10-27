@@ -25,7 +25,8 @@ it's uploaded only when it changes.
 
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
 GLSL 330 shaders. Hotkeys (all listed on the sidebar's Controls card): F compute card full / summary, G grid,
-V view (points / filled / filled without outlines), T motion trails, SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), B point / circle grab, O circle radius (4 presets; the wheel too), ESC quit,
+V view (points / filled / filled without outlines), T motion trails, L lighting (the lit renderer; its Lights and
+Material cards, lighting_ui.py), SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), B point / circle grab, O circle radius (4 presets; the wheel too), ESC quit,
 1-4 debug overlays (debug_overlay.py), [ / ] or the Controls card's - / + physics speed 1%-10000% and N one physics frame while paused (timectl.py).
 
 Worlds: `session` (world_selector.WorldSession) holds the Custom world and the preset worlds; `world` and `editor`
@@ -60,6 +61,7 @@ from world_selector import WorldSession
 from trails import Trails
 from gravity_dial import GravityDial
 from palettes import PaletteCard
+from lighting_ui import LightsCard, MaterialCard
 from debug_overlay import DebugOverlays
 from timectl import TimeControl
 from gl_world import GLWorld
@@ -343,13 +345,15 @@ def draw_sidebar(hud, editor, perf_hud, mouse_px, draw_top, key=None):
 SIDEBAR_SAFETY_HZ = 2  # the sidebar is redrawn at least this often, whatever its key says (HudLayer.draw)
 
 
-def sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, now):
+def sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, now, look=()):
     """HudLayer.draw's key for this frame: what the cards show that can change without an input event changing
-    `inputs` (keys / buttons / wheel seen so far), plus the mouse while it is over the sidebar (hover)."""
+    `inputs` (keys / buttons / wheel seen so far), plus the mouse while it is over the sidebar (hover). look: the
+    lighting cards' versions (a slider or gizmo drag changes them without input events)."""
     return (inputs, mouse_px if hud.rect.collidepoint(mouse_px) else None, session.name, session.open, id(editor),
             editor.paused, editor.active, editor.stage, editor.show_compute, ViewConfig.show_grid, ViewConfig.filled,
-            ViewConfig.outlines,
-            ViewConfig.trails, ViewConfig.grab_area, ViewConfig.grab_area_radius, panel_open, int(now * SIDEBAR_SAFETY_HZ))
+            ViewConfig.outlines, ViewConfig.lighting,
+            ViewConfig.trails, ViewConfig.grab_area, ViewConfig.grab_area_radius, panel_open, int(now * SIDEBAR_SAFETY_HZ),
+            tuple(look))
 
 
 def grid_colors(background):
@@ -460,6 +464,22 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     # (the Controls card is the active world's editor: the session swaps it in this list when it switches worlds)
     hud.cards = [editor, session, perf_hud, gravity_dial]
     palette_card = PaletteCard(lambda: session.world, toggle_panel)  # last, while the active world has palettes
+
+    def toggle_lighting():
+        """L / the Lights card's button: the lit renderer for the active world (world.lighting; ViewConfig.lighting
+        follows the active world's, see the main loop)."""
+        ViewConfig.lighting = session.world.lighting = not ViewConfig.lighting
+
+    # while lighting is on: the Lights card, and the Material card while bodies are picked (lighting_ui.py)
+    lights_card = LightsCard(lambda: session.editor, ViewConfig, toggle_lighting)
+    material_card = MaterialCard(lambda: session.editor)
+    look_cards = (material_card, lights_card)
+    lit_seen = None  # (world, its lighting switch) last frame
+    lit_kwargs = {}  # GLWorld.render's lighting switch, if this gl_world has one (the lit renderer, gl_effects.py)
+    if gpu_world is not None:
+        import inspect
+        if "lighting" in inspect.signature(gpu_world.render).parameters:
+            lit_kwargs = {"lighting": True}
     session.bind_cards(hud.cards)
     hud.layout()
 
@@ -496,6 +516,21 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         sidebar_shown = not full or panel_open
         if full:
             editor.sidebar = hud.rect if panel_open else no_sidebar
+        lit = bool(getattr(world, "lighting", False))  # L is per world (a demo world starts lit)
+        if lit_seen is None:  # the first world: lit if it is or ViewConfig.lighting was set before main()
+            lit = ViewConfig.lighting = bool(ViewConfig.lighting or lit)
+            if lit:
+                world.lighting = True
+        elif (world, lit) != lit_seen:  # another world, or this one's switch changed (a scene load)
+            ViewConfig.lighting = lit
+        lit_seen = (world, lit)
+        for card in look_cards:  # the lighting cards come and go too (before the Palette card)
+            wanted = card.wanted(ViewConfig)
+            if wanted != (card in hud.cards):
+                if wanted:
+                    hud.cards.insert(hud.cards.index(palette_card) if palette_card in hud.cards else len(hud.cards), card)
+                else:
+                    hud.cards.remove(card)
         if (world.palette is not None) != (palette_card in hud.cards):  # the Palette card comes and goes with it
             if palette_card in hud.cards:
                 hud.cards.remove(palette_card)
@@ -545,8 +580,12 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
             # arrow / 0 / numpad keys, and clicks on the gravity card (not while the modal save / open dialog is up)
             elif editor.scenes.state is None and palette_card in hud.cards and palette_card.handle_event(event):
                 continue  # clicks on the Palette card
+            elif editor.scenes.state is None and any(c in hud.cards and c.handle_event(event) for c in look_cards):
+                continue  # clicks and slider drags on the lighting cards
             elif editor.scenes.state is None and gravity_dial.handle_event(event):
                 continue
+            if editor.scenes.state is None and not session.open and lights_card.handle_world_event(event):
+                continue  # light gizmos: pick, drag, aim; Delete removes the selected light
             if editor.handle_event(event):  # the Controls card, the rest of the sidebar, editor panels and placement
                 continue
             if event.type == pygame.MOUSEBUTTONDOWN:
@@ -569,6 +608,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                         ViewConfig.filled, ViewConfig.outlines = False, True
                 if event.key == pygame.K_t:
                     ViewConfig.trails = not ViewConfig.trails
+                if event.key == pygame.K_l:
+                    toggle_lighting()
                 if event.key == pygame.K_b:  # B: grab the nearest point, or every point in a circle
                     ViewConfig.grab_area = not ViewConfig.grab_area
                 if event.key == pygame.K_o and ViewConfig.grab_area:  # O: next preset radius (after the current one)
@@ -614,7 +655,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 gpu_world.render(world, view.get_size(), ViewConfig.filled, ViewConfig.zoom, background,
                                  outlines=ViewConfig.outlines,
                                  grid=grid_colors(world.background) if ViewConfig.show_grid else None,
-                                 trails=trails if ViewConfig.trails else None)
+                                 trails=trails if ViewConfig.trails else None,
+                                 **({"lighting": ViewConfig.lighting} if lit_kwargs else {}))
         else:
             if ViewConfig.show_grid:
                 world.draw_grid(view, zoom=ViewConfig.zoom, **grid_colors(world.background))
@@ -630,6 +672,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
             pygame.draw.circle(screen2, (255, 255, 255), (mx, my), max(2, int(ViewConfig.grab_area_radius
                                                                                 * ViewConfig.zoom)), 1)
         editor.draw_world(screen2, screenT, (mx, my))
+        lights_card.draw_world(screen2)  # light gizmos, while lighting is on
         if overlays.any():  # the legend: top left of the world area
             overlays.draw_legend(screenUI, world, (OVERLAY_LEGEND_PX, OVERLAY_LEGEND_PX))
         editor.draw_ui(screenUI, (mx, my))  # panels, buttons and hints (in the world area)
@@ -641,7 +684,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         if sidebar_shown:
             mouse_px = pygame.mouse.get_pos()
             draw_sidebar(hud, editor, perf_hud, mouse_px, draw_top,  # native res, over the composite
-                         sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, time.perf_counter()))
+                         sidebar_key(inputs, mouse_px, hud, session, editor, panel_open, time.perf_counter(),
+                                     [c.version for c in look_cards]))
 
         # ---------------- Present: textures -> one shader pass (+ the HUD quad) -> swap
         profiler.switch("present")
