@@ -305,6 +305,15 @@ def save_layout(path, diamonds, size, note="", spawn=None, keys=None, tiling=Non
 # cluster stops growing after "max_fails" vetoed or missing candidates.
 CLUSTER_DEFAULTS = {"share": 0.0, "round_share": 0.75, "round_size": [4, 8], "line_size": [4, 7],
                     "line_min_angle": 45.0, "max_fails": 3}
+# Optional size tiers (clusters["tiers"]; without it the single round_size / line_size pool above is used, as before):
+# each tier grows its "share" of the target tiles as clusters drawn from "size" (round; lines from "line_size", default
+# the same), largest tier first; the rest of the target is random fill (`share` is replaced by the tiers' sum). A
+# cluster gives up after max(max_fails, the tier's "max_fails" or wanted size // 2) vetoes; one under half its wanted
+# size is undone and reseeded (up to the tier's "retries", default 40), after which a short one is
+# kept and its tiles count toward the tier. "max_width" (optional) widens the cluster width limit for that tier only.
+TIER_DEFAULTS = [{"name": "large", "share": 0.10, "size": [18, 30]},
+                 {"name": "medium", "share": 0.20, "size": [8, 14]},
+                 {"name": "small", "share": 0.30, "size": [3, 6]}]
 
 
 def cluster_settings(clusters):
@@ -313,6 +322,8 @@ def cluster_settings(clusters):
         return None
     out = dict(CLUSTER_DEFAULTS)
     out.update(clusters if isinstance(clusters, dict) else {"share": float(clusters)})
+    if out.get("tiers"):
+        out["share"] = sum(t["share"] for t in out["tiers"])
     return out if out["share"] > 0 else None
 
 
@@ -412,9 +423,10 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
             return False
         merged = {id(c): c for c in (cluster[m] for m in linked)}.values()
         members = list(dict.fromkeys([int(k)] + [m for c in merged for m in c]))
-        if max_width is not None and not trusted:
+        cap = width_cap[0] if width_cap[0] is not None and growing else max_width
+        if cap is not None and not trusted:
             xs = np.concatenate([inside[m][0][0] for m in members])
-            if xs.max() - xs.min() > max_width:
+            if xs.max() - xs.min() > cap:
                 return False
         for m in members:
             cluster[m] = members
@@ -426,6 +438,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     touch = 1e-3 * size  # tiles of the tiling that share an edge or a corner have corners this close
     archetypes = []  # (kind, [picked indices], angle or None)
     sealed, growing = set(), set()  # picked tiles of archetype clusters; those of the one growing now
+    width_cap = [None]  # a tier's own max_width while its clusters grow (None: max_width)
 
     def touching_tiles(k):  # tiles of the tiling (inside the world) sharing an edge or a corner with tile k
         near_k = np.flatnonzero(np.hypot(*(centers - centers[k]).T) <= 2 * size + touch)
@@ -437,8 +450,12 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                     out.append(j)
         return out
 
-    def grow(rng, target, budget):  # archetype clusters until `budget` tiles are in them (or `target` picked)
-        placed, tries = 0, 0
+    def grow(rng, target, budget, tier=None):  # archetype clusters until `budget` tiles are in them (or `target` picked)
+        placed, tries, redo = 0, 0, 0
+        name = tier["name"] if tier else None
+        round_size = tier["size"] if tier else settings["round_size"]
+        line_size = tier.get("line_size", tier["size"]) if tier else settings["line_size"]
+        width_cap[0] = tier.get("max_width") if tier else None
         while placed < budget and len(chosen) < target and tries < 50 * max(1, budget):
             tries += 1
             free = [k for k in range(len(inside)) if k not in cluster and k not in banned]
@@ -451,21 +468,23 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
             members, tried, fails = [k], {k}, 0
             growing.add(k)
             # the kind behind its round_share of the tiles placed so far (round ones lose more to the cup veto)
-            n_round = sum(len(m) for kd, m, _ in archetypes if kd == "round")
-            n_all = sum(len(m) for _, m, _ in archetypes)
+            n_round = sum(len(m) for kd, m, _, tn in archetypes if kd == "round" and tn == name)
+            n_all = sum(len(m) for _, m, _, tn in archetypes if tn == name)
             gap_round = settings["round_share"] * (n_all + 1) - n_round
             if gap_round > 0.5 or (abs(gap_round) <= 0.5 and rng.random() < settings["round_share"]):
                 kind, angle = "round", None
-                want = int(rng.integers(settings["round_size"][0], settings["round_size"][1] + 1))
+                want = int(rng.integers(round_size[0], round_size[1] + 1))
             else:
                 kind = "line"
                 tilt = float(rng.uniform(settings["line_min_angle"], 90.0))
                 angle = tilt if rng.random() < 0.5 else -tilt  # + leaning right (down-right)
-                want = int(rng.integers(settings["line_size"][0], settings["line_size"][1] + 1))
+                want = int(rng.integers(line_size[0], line_size[1] + 1))
                 axis = np.array([math.cos(math.radians(angle)), math.sin(math.radians(angle))])
                 normal = np.array([-axis[1], axis[0]])
             want = min(want, budget - placed, target - len(chosen) + 1)
-            while len(members) < want and fails < settings["max_fails"] and len(chosen) < target:
+            max_fails = (max(settings["max_fails"], tier.get("max_fails", want // 2)) if tier
+                         else settings["max_fails"])
+            while len(members) < want and fails < max_fails and len(chosen) < target:
                 cand = sorted({j for m in members for j in touching_tiles(m)
                                if j not in tried and j not in cluster and j not in banned})
                 if kind == "line":  # only tiles past either end of the line so far
@@ -490,17 +509,29 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                     growing.add(j)
                 else:
                     fails += 1
+            if tier and len(members) < want // 2 and redo < tier.get("retries", 40):
+                redo += 1  # stalled far short: undo it (its tiles are the last picked, linked to nothing else), reseed
+                for m in members:
+                    del cluster[m]
+                del chosen[-len(members):]
+                continue
+            redo = 0
             placed += len(members)
-            archetypes.append((kind, members, angle))
+            archetypes.append((kind, members, angle, name))
             sealed.update(members)
         growing.clear()
+        width_cap[0] = None
         return placed
 
     if layout is None:
         target = max(1, int(round(fraction * len(inside))))
         if settings is not None:
             rng_c = np.random.default_rng([seed, 3])
-            grow(rng_c, target, int(round(settings["share"] * target)))
+            if settings.get("tiers"):  # largest first: big clusters need room
+                for t in sorted(settings["tiers"], key=lambda t: -t["size"][1]):
+                    grow(rng_c, target, int(round(t["share"] * target)), t)
+            else:
+                grow(rng_c, target, int(round(settings["share"] * target)))
             fill(rng_c.permutation(len(inside)), target)
         else:
             fill(np.random.default_rng(seed).permutation(len(inside)), target)
@@ -549,16 +580,18 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     if add:  # `add` more on top, by the same rules, in a second seeded order (an offshoot of the layout)
         target = len(chosen) + add
         if settings is not None:  # the same share of them as archetype clusters (stochastic rounding)
-            want = settings["share"] * add
-            grow(rng, target, int(want) + int(rng.random() < want - int(want)))
+            for t in sorted(settings.get("tiers") or [None], key=lambda t: -t["size"][1] if t else 0):
+                want = (t or settings)["share"] * add
+                grow(rng, target, int(want) + int(rng.random() < want - int(want)), t)
         fill(rng.permutation(len(inside)), target)
     out = sorted(chosen)
     if cluster_log is not None:
         pos = {k: i for i, k in enumerate(out)}
-        for kind, members, angle in archetypes:
+        for kind, members, angle, name in archetypes:
             if all(m in pos for m in members):  # (not dropped by `remove` since)
                 cluster_log.append({"kind": kind, "tiles": [pos[m] for m in members],
-                                    **({"angle": round(angle, 1)} if angle is not None else {})})
+                                    **({"angle": round(angle, 1)} if angle is not None else {}),
+                                    **({"tier": name} if name is not None else {})})
     return [inside[k][:2] for k in out]
 
 
