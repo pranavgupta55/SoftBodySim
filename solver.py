@@ -48,6 +48,7 @@ AUTO_CPU_POINTS = 650
 XPBD_REF_H = 1 / 240
 XPBD_REF_ITERATIONS = 4
 XPBD_CALIBRATION = 1.0
+GRAB_AREA_MIN_WEIGHT = 0.05  # an area grab skips points whose Gaussian pull weight is below this
 
 
 def spring_compliance(stiffness, count):
@@ -402,12 +403,15 @@ class World:
         # target = cursor + offset starts at the point itself and moves with the cursor (in the point's own frame,
         # so a copy across the seam is held where it is)
         off = self.P - c
-        idx = np.flatnonzero((dist <= radius) & (self.W > 0))
+        # Gaussian falloff, sigma = radius / 2 (w ~ 0.14 at the edge); points too weak to matter aren't held
+        sigma = max(float(radius), 1e-9) / 2
+        weight = np.exp(-dist ** 2 / (2 * sigma ** 2))
+        idx = np.flatnonzero((dist <= radius) & (self.W > 0) & (weight >= GRAB_AREA_MIN_WEIGHT))
         if idx.size:
             self.grabbed = None
             self.grab_shift = np.zeros(2)
             self.grab_target = np.array(pos, dtype=float)
-            self.grab_set = (idx, off[:, idx].copy(), float(radius))
+            self.grab_set = (idx, off[:, idx].copy(), float(radius), weight[idx])
 
     def drag_to(self, pos):
         shift = self.grab_shift
@@ -421,11 +425,11 @@ class World:
         """Nudge the held point toward the cursor once per substep of length h, so contacts (solved after) can
         out-vote the hand. The pull is set per second, so dragging feels the same at any substep count."""
         if self.grab_set is not None:  # an area grab: every held point toward its own target, each capped
-            idx, off, _ = self.grab_set
+            idx, off, _, w = self.grab_set  # each pull (and its speed cap) scaled by the point's Gaussian weight
             gap = self.grab_target[:, None] + off - self.P[:, idx]
-            step = gap * -math.expm1(-EnvConfig.grab_stiffness * h)
+            step = gap * -np.expm1(-EnvConfig.grab_stiffness * w * h)
             length = np.hypot(*step)
-            max_step = EnvConfig.grab_max_speed * h
+            max_step = EnvConfig.grab_max_speed * w * h
             step *= np.minimum(1.0, max_step / np.maximum(length, 1e-12))
             self.P[:, idx] += step
             return
@@ -685,9 +689,11 @@ class World:
         if self.grabbed is not None:
             pygame.draw.line(surface, (255, 255, 255), self.P[:, self.grabbed] * zoom, self.grab_target * zoom, 1)
         if self.grab_set is not None:  # an area grab: each held point to its target
-            idx, off, _ = self.grab_set
-            for a, b in zip(self.P[:, idx].T, (self.grab_target[:, None] + off).T):
-                pygame.draw.line(surface, (255, 255, 255), a * zoom, b * zoom, 1)
+            idx, off, _, w = self.grab_set  # opacity 0.5 * w, blended through a per-frame SRCALPHA layer
+            layer = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+            for a, b, wi in zip(self.P[:, idx].T, (self.grab_target[:, None] + off).T, w):
+                pygame.draw.line(layer, (255, 255, 255, int(round(127.5 * wi))), a * zoom, b * zoom, 1)
+            surface.blit(layer, (0, 0))
 
     def draw_grid(self, surface, line_col=(52, 58, 76), edge_cell_col=(37, 42, 55), point_cell_col=(45, 51, 68), zoom=1.0):
         """Debug view of the broad phase grid: cell (i, j) covers [i, i + 1) * cell_size, same as the solver's floor().
@@ -957,9 +963,9 @@ class World:
             dist = float(np.hypot(*pull))
             end[:, g] = self.P[:, g] + self.V[:, g] * t + (pull if dist <= reach else pull * (reach / dist))
         if self.grab_set is not None:  # an area grab: the same reach for each held point
-            idx, off, _ = self.grab_set
+            idx, off, _, w = self.grab_set
             pull = self.grab_target[:, None] + off - self.P[:, idx]
-            reach = EnvConfig.grab_max_speed * t
+            reach = EnvConfig.grab_max_speed * w * t
             dist = np.hypot(*pull)
             end[:, idx] = self.P[:, idx] + self.V[:, idx] * t + pull * np.minimum(1.0, reach / np.maximum(dist, 1e-12))
         return np.minimum(self.P, end) - r, np.maximum(self.P, end) + r

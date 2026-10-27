@@ -188,9 +188,9 @@ def _edit_bodies(world, mutate):
         ref = (world.bodies[k], world.grabbed - int(world.offsets[k]))
     held = None  # an area grab's points as (body, local index, offset)
     if getattr(world, "grab_set", None) is not None and world.bodies:
-        idx, off, radius = world.grab_set
+        idx, off, radius, wt = world.grab_set
         ks = world.point_body[idx]
-        held = ([(world.bodies[int(k)], int(i) - int(world.offsets[int(k)]), off[:, j]) for j, (i, k) in
+        held = ([(world.bodies[int(k)], int(i) - int(world.offsets[int(k)]), off[:, j], wt[j]) for j, (i, k) in
                  enumerate(zip(idx, ks))], radius)
     mutate()
     if world.bodies:
@@ -201,9 +201,10 @@ def _edit_bodies(world, mutate):
         world.grabbed = int(world.offsets[k]) + ref[1]
     if held is not None:
         where = {id(b): k for k, b in enumerate(world.bodies)}
-        kept = [(int(world.offsets[where[id(b)]]) + i, o) for b, i, o in held[0] if id(b) in where]
+        kept = [(int(world.offsets[where[id(b)]]) + i, o, wt) for b, i, o, wt in held[0] if id(b) in where]
         if kept:
-            world.grab_set = (np.array([i for i, _ in kept]), np.array([o for _, o in kept]).T, held[1])
+            world.grab_set = (np.array([i for i, _, _ in kept]), np.array([o for _, o, _ in kept]).T, held[1],
+                              np.array([wt for _, _, wt in kept]))
 
 
 def _wall_line(wall):

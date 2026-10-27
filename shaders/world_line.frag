@@ -5,6 +5,7 @@
 flat in ivec4 v_ends;
 flat in int v_width;
 flat in vec3 v_col;
+flat in float v_alpha;
 
 out vec4 f_color;
 
@@ -34,5 +35,5 @@ void main() {
     if (off < -half_w + (1 - v_width % 2) || off > half_w) {
         discard;
     }
-    f_color = vec4(v_col, 1.0);
+    f_color = vec4(v_col, v_alpha);
 }
