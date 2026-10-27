@@ -53,6 +53,7 @@ def main(argv):
     for scale in scales:
         world.P[:], world.PREV[:], world.V[:] = saved[:3]
         world._substep_cost, world._tick_acc = None, 0.0
+        world._drop_span()  # the last scale may have stopped mid CCD span; the saved state is a span boundary
         start, sim, asked, samples = world.ticks, 0.0, 0.0, []
         while sim < 4.0:
             world.step(FRAME, scale)

@@ -43,11 +43,12 @@ it still collides across the seam, it just keeps its coordinates. Fixed bodies n
 dragged point wraps like any other on a periodic axis, and World.grab_shift / grab_target move with it so the hand
 keeps pulling toward the cursor's image in the body's frame; in walled mode it never wraps (as before).
 
-World.step calls loop_step once per frame, before the substeps, so a wrap is never part of a substep's straight-line
-motion that CCD checks. On a periodic axis World._substeps also wraps between the frame's CCD spans (span_wraps): at
-high time scales one frame holds many spans, and a fast body could otherwise get more than a period past the bounds,
-where the +-L image pairs no longer reach what it should hit. Each span ends intersection-free, so this is the same
-safe translation as the per-frame one.
+World.step calls loop_step at the start of every CCD span (World._tick: one per 1/60 s of simulated time by default,
+aligned to the tick counter), so a wrap is never part of the straight-line motion that CCD checks, and it always
+sees an intersection-free state (mid-span states are only the substeps' proposal). "Frames" below (RETRY_FRAMES, the
+pending-wall retries) count those spans. World._substeps called directly with several spans also wraps between them
+(span_wraps): a fast body could otherwise get more than a period past the bounds, where the +-L image pairs no
+longer reach what it should hit. Each span ends intersection-free, so this is the same safe translation.
 """
 import numpy as np
 
@@ -514,7 +515,7 @@ def _periodic_wraps(world):
 
 
 def loop_step(world):
-    """One looping pass (World.step calls it before each frame's substeps): add pending walls that are clear, update
+    """One looping pass (World.step calls it at the start of each CCD span): add pending walls that are clear, update
     the periodic axes, translate groups across periodic seams, then the walled-mode wraps through the other active
     sides. Moves P and PREV only; velocities untouched. Returns [(body, (dx, dy)), ...] for the bodies moved, e.g.
     so motion trails don't draw the jump."""

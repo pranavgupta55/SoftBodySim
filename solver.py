@@ -98,8 +98,9 @@ def _outline_gap(a, b):
 
 
 class World:
-    """Owns all bodies and steps them, in fixed ticks of one substep (step). Per CCD span (one tick's substep;
-    _substeps called directly with n > 1: EnvConfig.ccd_stride substeps, by default all n):
+    """Owns all bodies and steps them, in fixed ticks of one substep (step). Per CCD span (span_ticks ticks, by
+    default EnvConfig.substeps = one 1/60 s frame, aligned to the tick counter; _substeps called directly with n > 1:
+    EnvConfig.ccd_stride substeps, by default all n):
 
     1. PBD substeps: predict, drag, then springs / shape matching + soft contacts (thickness and friction).
     2. Turn the span's motion into velocities and run continuous collision detection (CCD) on the straight-line
@@ -151,9 +152,12 @@ class World:
         # Optional debug recorder (debug_overlay.StepRecorder), set only while an overlay needs solver data. It is
         # told about each step's CCD hits and impact zone points; None (the default) costs one attribute check
         self.debug = None
-        # During a multi-substep CCD span (see _ccd_span): positions at its start, which are intersection-free, so
-        # contacts take their sides from them. None when CCD runs after every substep (contacts then use PREV)
+        # During a multi-substep CCD span (see _tick): positions at its start, which are intersection-free, so
+        # contacts take their sides from them. None at a span boundary, and when CCD runs after every substep
+        # (contacts then use PREV). A span can stay open between step() calls (it ends on the tick counter)
         self._span_start = None
+        self._span_count = 0  # substeps the open span has run
+        self._span_h = XPBD_REF_H  # the open span's substep length
         self._span_left = 0.0  # time from the current substep's start to the end of the span
         self._span_contacts = None  # (candidates, point box lo, point box hi), shared by the span's substeps
         self._span_reach = None  # _solve_contacts' reach, carried across the span's substeps
@@ -170,6 +174,7 @@ class World:
     def add(self, body, index=None):
         """Add a body (at the end, or at list position `index`: bodies draw in list order, so a container goes
         before what it holds). Repacks the arrays, so global point indices (e.g. a held grab) shift."""
+        self.settle()
         if index is None:
             self.bodies.append(body)
         else:
@@ -180,9 +185,11 @@ class World:
     def set_looping(self, side, on):
         """Looping for one side ("left", "right", "top", "bottom"): on removes that side's wall now; off re-adds it
         once nothing is beyond its line (pending until then). True if done now. See looping.py."""
+        self.settle()
         return looping.set_looping(self, side, on)
 
     def add_rope(self, rope):
+        self.settle()
         self.ropes.append(rope)
         self._recheck_backend()
 
@@ -191,6 +198,7 @@ class World:
 
     def add_chain(self, chain):
         """An entities.Chain: its boxes and then its ropes, in order along the chain (one repack)."""
+        self.settle()
         self.bodies.extend(chain.bodies)
         self.ropes.extend(chain.ropes)
         self._rebuild()
@@ -198,6 +206,7 @@ class World:
     # ---------------- Editing (the editor's select / delete / paste, while paused; separate from step)
     def add_many(self, bodies=(), ropes=(), hooks=()):
         """Add bodies (at the end, in order), ropes and hooks with one repack."""
+        self.settle()
         self.bodies.extend(bodies)
         self.ropes.extend(ropes)
         self.hooks.extend(hooks)
@@ -210,6 +219,7 @@ class World:
         """Remove bodies, ropes and hooks (by identity); ropes attached to a removed body or hook go too. One repack.
         Removed bodies get their own copies of their arrays, so they stay valid objects (e.g. to add back later).
         At least one body must remain (the packed arrays can't be empty)."""
+        self.settle()
         gone_b, gone_h, gone_r = {id(b) for b in bodies}, {id(h.pos) for h in hooks}, {id(r) for r in ropes}
 
         def attached(rope):  # an end on a removed body, or sharing a removed hook's position array
@@ -239,12 +249,15 @@ class World:
     def reorder(self, bodies):
         """Set the draw order: `bodies` is self.bodies in a new order (containers go before what they hold). Repacks."""
         assert sorted(map(id, bodies)) == sorted(map(id, self.bodies))
+        self.settle()
         self.bodies = list(bodies)
         self.grabbed = self.grab_set = None
         self._rebuild()
 
     def _rebuild(self):
-        """Pack every body into shared arrays; bodies keep views into them so they edit in place."""
+        """Pack every body into shared arrays; bodies keep views into them so they edit in place. An open CCD span
+        is dropped (its arrays are replaced): edits settle() first, a scene load (scene_io.install) starts over."""
+        self._drop_span()
         bodies = self.bodies
         self.P = np.concatenate([b.points for b in bodies], axis=1)
         self.PREV = np.concatenate([b.prev for b in bodies], axis=1)
@@ -504,9 +517,11 @@ class World:
 
     def step(self, dt, scale=1.0, frames=None):
         """Advance dt * scale seconds in whole fixed ticks (see _step): the time goes into an accumulator and every
-        whole tick_length() in it runs, the remainder waits for the next call. A tick is one complete step of one
-        substep, so the trajectory depends only on how many ticks ran, never on how time was cut into calls: 600 x
-        step(1/60) headless and the app's variable frame times give bit-identical states at the same tick count.
+        whole tick_length() in it runs, the remainder waits for the next call. A tick is one PBD substep; every
+        span_ticks ticks (counted from tick 0, whatever the calls) end with one CCD pass (_tick). So the trajectory
+        depends only on how many ticks ran, never on how time was cut into calls: 600 x step(1/60) headless and the
+        app's variable frame times give bit-identical states at the same tick count. A call may end mid-span (a
+        state CCD hasn't checked yet, which may overlap; settle() ends the span early).
         scale is the time scale (timectl.py): more or fewer ticks per call, never longer or shorter ones. dt is
         clamped at max_dt first (a hitch drops time instead of piling up ticks), and above scale 1 physics_budget
         may cap the ticks of a call (the excess time is dropped). frames is ignored (it used to set the substep count
@@ -542,8 +557,9 @@ class World:
         if abs(self._tick_acc) < 1e-6 * tick:
             self._tick_acc = 0.0
         if EnvConfig.physics_budget is not None and self._substep_cost:
-            # at most physics_budget of wall time per 1/60 s of real time; never below what scale 1 needs (dt / tick
-            # plus one for the carried remainder), so scales <= 1 are never cut. The excess is dropped, not carried
+            # at most physics_budget of wall time per 1/60 s of real time (85% of the frame); never below what scale 1
+            # needs (dt / tick plus one for the carried remainder), so scales <= 1 are never cut. The excess is
+            # dropped, not carried
             base = int(dt / tick + 1e-6) + 1
             n = min(n, max(base, int(EnvConfig.physics_budget * 60.0 * dt / self._substep_cost)))
         self._run_ticks(n, tick)
@@ -578,18 +594,97 @@ class World:
         cost = (self.clock() - t0) / n
         self._substep_cost = cost if self._substep_cost is None else 0.7 * self._substep_cost + 0.3 * cost
 
+    @staticmethod
+    def span_ticks(h):
+        """Ticks of length h per CCD span: EnvConfig.ccd_stride, by default substeps (one 1/60 s frame), and at most
+        ccd_max_span seconds. Span k covers ticks k * span .. (k + 1) * span - 1 of the global tick counter (_tick)."""
+        stride = EnvConfig.substeps if EnvConfig.ccd_stride is None else int(EnvConfig.ccd_stride)
+        if EnvConfig.ccd_max_span is not None:  # no CCD span longer than ccd_max_span seconds (see EnvConfig)
+            stride = min(stride, int(EnvConfig.ccd_max_span / h + 1e-9))
+        return max(1, stride)
+
     def _tick(self, h):
-        """One tick: looping, then one substep of length h with its own CCD pass."""
-        # before the substep, where the state is settled and intersection-free
-        if self.pending_walls or any(self.looping.values()):
-            self.last_wraps += looping.loop_step(self)
-        elif self.period is not None:
-            looping.clear_periodic(self)
+        """One tick: one PBD substep of length h inside the CCD span it belongs to. Spans are aligned to the tick
+        counter (self.ticks), so where they start and end never depends on how ticks were split between step()
+        calls: a span may begin in one call and end in the next (the span state lives on the World). At a span
+        start (the state is CCD-clean, intersection-free) looping runs first; at its end the CCD pass checks the
+        span's straight-line motion. Between, the state is the substeps' proposal and may overlap (a frame can show
+        it; settle() ends a span early, e.g. before an edit)."""
+        stride = self.span_ticks(h)
+        if self._span_start is not None and (h != self._span_h or stride == 1):  # settings changed mid-span
+            self._close_span()
+        if self._span_start is None:
+            # at a span boundary, where the state is settled and intersection-free
+            if self.pending_walls or any(self.looping.values()):
+                self.last_wraps += looping.loop_step(self)
+            elif self.period is not None:
+                looping.clear_periodic(self)
         self._step_len = h
-        self._substeps(1, h)
+        if stride == 1:
+            self._substeps(1, h)
+            return
+        if self._span_start is None:
+            self._open_span(h)
+        self._span_substep(h, (stride - self.ticks % stride) * h)
+        if (self.ticks + 1) % stride == 0:
+            self._close_span()
+
+    def settle(self):
+        """End the open CCD span now (CCD over the ticks it has run), leaving an intersection-free state. For
+        anything that edits or snapshots the world between steps (World's edit methods, scene_io.capture): a
+        mid-span state isn't CCD-checked, and an edit would change the arrays the span started from. The next tick
+        opens a span that ends at the next aligned boundary. No-op at a boundary."""
+        if self._span_start is not None:
+            self._with_env(self._close_span)
+
+    def _drop_span(self):
+        """Forget the open span without its CCD pass (the arrays it refers to are being replaced: _rebuild)."""
+        self._span_start, self._span_contacts, self._span_reach = None, None, None
+        self._span_count = 0
+
+    def _open_span(self, h):
+        self._span_start, self._span_contacts, self._span_reach = self.P.copy(), None, None
+        self._span_count, self._span_h = 0, h
+
+    def _span_substep(self, h, left):
+        """One substep of the open span without CCD; left: time from its start to the span's end."""
+        self._span_left = left
+        if self.bounce_bodies:
+            self._bounce(h)
+        if self.backend is None or not self.backend.pbd_substep(h):  # False: the backend can't run this scene
+            self._pbd_substep(h)
+        self.V[:] = (self.P - self.PREV) / h
+        self._limit_speed()
+        self.P[:] = self.PREV + self.V * h
+        self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
+        self._span_count += 1
+
+    def _close_span(self):
+        """The CCD pass over the open span's straight-line motion (Bridson et al. 2002, sec. 5: any internal
+        dynamics propose the end positions, CCD then edits the average velocity).
+
+        The span starts intersection-free and CCD makes its straight path from there collision-free, the same
+        argument as per-substep CCD with h = m h. Contacts in the substeps take their sides from the span start and
+        share one swept-box candidate list (_span_candidates). Points CCD leaves alone keep their last substep's
+        velocity; points it edited take the corrected average velocity."""
+        X0, m, h = self._span_start, self._span_count, self._span_h
+        self._drop_span()
+        if m == 0:
+            return
+        T = m * h
+        v_last = self.V.copy()
+        self.PREV[:] = X0
+        self.V[:] = v_avg = (self.P - X0) / T
+        with self._section("ccd"):
+            self._resolve_ccd(T)
+        changed = (self.V != v_avg).any(axis=0)
+        self.P[:] = X0 + self.V * T
+        self.V[:] = np.where(changed, self.V * max(0.0, 1.0 - EnvConfig.damping * h) ** m, v_last)
 
     def _substeps(self, n, h):
-        """n substeps of length h, with CCD per substep or per span (ccd_stride, ccd_max_span)."""
+        """n substeps of length h, with CCD per substep or per span (ccd_stride, ccd_max_span). Not used by step()
+        (its ticks go through _tick, which uses this only for 1-tick spans); for research scripts that step a World
+        directly, outside any tick span."""
         sec = self._section
         stride = n if EnvConfig.ccd_stride is None else max(1, min(int(EnvConfig.ccd_stride), n))
         if EnvConfig.ccd_max_span is not None:  # no CCD span longer than ccd_max_span seconds (see EnvConfig)
@@ -615,39 +710,15 @@ class World:
             self.V *= max(0.0, 1.0 - EnvConfig.damping * h)
 
     def _ccd_span(self, h, m):
-        """m substeps of length h without CCD, then one CCD pass over the span's straight-line motion (Bridson et al.
-        2002, sec. 5: any internal dynamics propose the end positions, CCD then edits the average velocity).
-
-        The span starts intersection-free and CCD makes its straight path from there collision-free, the same
-        argument as per-substep CCD with h = m h. Contacts in the substeps take their sides from the span start and
-        share one swept-box candidate list (_span_candidates). Points CCD leaves alone keep their last substep's
-        velocity; points it edited take the corrected average velocity."""
-        sec = self._section
-        T = m * h
-        X0 = self.P.copy()
-        self._span_start, self._span_contacts, self._span_reach = X0, None, None
-        damp = max(0.0, 1.0 - EnvConfig.damping * h)
+        """m substeps of length h without CCD, then one CCD pass over the span's straight-line motion (_close_span)."""
+        self._open_span(h)
         try:
             for k in range(m):
-                self._span_left = T - k * h
-                if self.bounce_bodies:
-                    self._bounce(h)
-                if self.backend is None or not self.backend.pbd_substep(h):  # False: the backend can't run this scene
-                    self._pbd_substep(h)
-                self.V[:] = (self.P - self.PREV) / h
-                self._limit_speed()
-                self.P[:] = self.PREV + self.V * h
-                self.V *= damp
-        finally:
-            self._span_start, self._span_contacts, self._span_reach = None, None, None
-        v_last = self.V.copy()
-        self.PREV[:] = X0
-        self.V[:] = v_avg = (self.P - X0) / T
-        with sec("ccd"):
-            self._resolve_ccd(T)
-        changed = (self.V != v_avg).any(axis=0)
-        self.P[:] = X0 + self.V * T
-        self.V[:] = np.where(changed, self.V * damp ** m, v_last)
+                self._span_substep(h, (m - k) * h)
+        except BaseException:
+            self._drop_span()
+            raise
+        self._close_span()
 
     def _limit_speed(self):
         """Terminal velocity: scale down any point velocity faster than the limit (direction kept). It runs on V

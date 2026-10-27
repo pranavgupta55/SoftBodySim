@@ -27,11 +27,11 @@ class EnvConfig:
     terminal_velocity = 1000.0
     cell_size = 24.0  # px; spatial hash grid cell size, keep >= longest edge you care about
     max_dt = 1 / 30  # s of real time one World.step call may take in (frame hitches: the rest is dropped)
-    # Substeps per CCD pass. Every World.step tick is one substep with its own CCD pass, so neither this nor
-    # ccd_max_span changes anything in a tick; they only matter to World._substeps called with n > 1 directly
-    # (research scripts). There: 1: CCD after every substep, contact candidates rebuilt every substep. k > 1: k
+    # Substeps (ticks) per CCD pass. 1: CCD after every substep, contact candidates rebuilt every substep. k > 1: k
     # substeps run without CCD, then one CCD pass checks the straight path from their start to their end, and the
-    # contact candidates come from swept boxes over those k substeps. None: once per call (all substeps).
+    # contact candidates come from swept boxes over those k substeps. World.step's ticks: None means `substeps`
+    # ticks (one 1/60 s frame), spans aligned to the tick counter (World._tick), so they don't depend on how ticks
+    # are split between calls. World._substeps called with n > 1 directly (research scripts): None means all n.
     ccd_stride = None
     # s; longest CCD span (whatever ccd_stride says): CCD checks the straight line from a span's start to its end, so
     # a long span turns a body's curved path around an obstacle into a chord through it (shapes stretch 10-20x at
@@ -68,13 +68,15 @@ class EnvConfig:
     # (research 10 soft_rest) is 0.26 px/s with PBD and 1.72 / 0.93 / 0.26 with XPBD at 2 / 5 / 10; a 120 px drop
     # rebounds 12.9 px with PBD, 12.6 / 12.1 / 9.9 px at 0 / 3 / 10 (research 01 also found ~10).
     spring_damping = 10.0
-    # s of physics wall time per 1/60 s of real time that a high time scale may use (World.step): past it a call runs
-    # fewer ticks than asked and the excess time is dropped (the sim runs slower than the time scale asks:
+    # s of physics wall time per 1/60 s of real time that a time scale above 1 may use (World.step): past it a call
+    # runs fewer ticks than asked and the excess time is dropped (the sim runs slower than the time scale asks:
     # World.last_sim_dt < last_requested_dt, shown as "actual" on the Controls card), from a running mean of what a
-    # tick takes on this machine. Half the frame (1/120 s per 1/60 s), so the frame rate holds instead of spiralling
-    # down (slower frames -> more ticks per frame -> slower frames). It never cuts below what scale 1 needs, so speeds
-    # <= 100% are untouched. Ticks are never made longer (that would change the trajectory). None: no budget.
-    physics_budget = 1 / 120
+    # tick takes on this machine. 85% of the frame (0.85 / 60 s per 1/60 s), leaving the rest for rendering and
+    # input. The cap is per call and proportional to the call's real dt, so it can't spiral (slower frames -> more
+    # ticks per frame -> slower frames): a frame costing render + 0.85 dt of physics settles at dt = render / 0.15
+    # (2 ms of rendering: ~13 ms frames, ~75 fps). It never cuts below what scale 1 needs, so speeds <= 100% are
+    # untouched. Ticks are never made longer (that would change the trajectory). None: no budget.
+    physics_budget = 0.85 / 60
 
 
 # Small steps (research 01 and 10 F8): more substeps, fewer solver passes. Energy, free fall, chain stretch and
