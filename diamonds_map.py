@@ -380,7 +380,10 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     gap = 0.0 if outline else gap  # the outline rule links only tiles that touch
     near = float(near) if outline else 0.0  # near-miss ban: corners closer than this count as touching (snapped)
     link = max(gap, near, 1e-6 * size)
-    reach = 2 * size + max(gap, near)  # centers farther apart than this can't touch, cup or link
+    # clusters "random_gap": the cup rule's gap for the random fill (not the archetype clusters), x gap
+    random_gap = float(clusters.get("random_gap", 1.0)) if isinstance(clusters, dict) else 1.0
+    cup_gap = [gap]  # the cup gap in force: gap, or gap x random_gap while the random fill runs
+    reach = 2 * size + max(gap * max(random_gap, 1.0), near)  # centers farther apart can't touch, cup or link
     # each diamond's center = its corners' mean, the same reduction as d[0].mean(axis=1), for all of them at once
     centers = corners.mean(axis=2) if corners is not None else np.array([d[0].mean(axis=1) for d in inside])
     shifts = [(dx, dy) for dx in (0.0, -world_w, world_w) for dy in (0.0, -world_h, world_h)]
@@ -417,7 +420,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                     if dx:
                         ok = False
                     linked.append(m)
-            elif not trusted and not outline and forms_cup(p, q, size, gap):
+            elif not trusted and not outline and forms_cup(p, q, size, cup_gap[0]):
                 ok, why[0] = False, "outer pair cup"
             elif _corner_gap(p, q) <= link:
                 if dx:
@@ -573,7 +576,12 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                     grow(rng_c, target, int(round(t["share"] * target)), t)
             else:
                 grow(rng_c, target, int(round(settings["share"] * target)))
+            if settings.get("random_share") is not None:  # random tiles = that share of all picked ones
+                rs = settings["random_share"]
+                target = min(target, len(chosen) + int(round(len(chosen) * rs / (1.0 - rs))))
+            cup_gap[0] = gap * random_gap
             fill(rng_c.permutation(len(inside)), target)
+            cup_gap[0] = gap
         else:
             fill(np.random.default_rng(seed).permutation(len(inside)), target)
     else:
@@ -629,7 +637,9 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
             for t in sorted(settings.get("tiers") or [None], key=lambda t: -t["size"][1] if t else 0):
                 want = (t or settings)["share"] * add
                 grow(rng, target, int(want) + int(rng.random() < want - int(want)), t)
+        cup_gap[0] = gap * random_gap if settings is not None else gap
         fill(rng.permutation(len(inside)) if add_order is None else steered(add_order), target)
+        cup_gap[0] = gap
     out = sorted(chosen)
     if cluster_log is not None:
         pos = {k: i for i, k in enumerate(out)}

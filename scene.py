@@ -167,7 +167,7 @@ DIAMONDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", 
 DIAMONDS_LAYOUT = os.path.join(DIAMONDS_DIR, "evolved 1.json")  # the default one
 
 # the "penrose" worlds: the same scene over a Penrose P3 rhombus tiling (diamonds_map.penrose_tiles) instead
-PENROSE_SIDE = 16.8  # (24, then 12, before 2026-10-27) edge length of its fat (72 degree) and thin (36 degree) rhombi
+PENROSE_SIDE = 20.16  # (24, then 12, then 16.8, before 2026-10-27) edge length of its fat (72 degree) and thin (36 degree) rhombi
 PENROSE_SEED = 1  # the pentagrid offsets' seed of a new layout (saved layouts keep their own)
 # Penrose edges run in 5 directions 36 degrees apart, so some always slope 18 degrees or less, under the friction
 # angle (atan 0.5 = 26.6 degrees). Measured on random layouts (30 s, 2 seeds; shapes under 5 px/s of 168, random
@@ -178,7 +178,7 @@ PENROSE_SEED = 1  # the pentagrid offsets' seed of a new layout (saved layouts k
 PENROSE_ROTATION = 18.0  # degrees: no horizontal edges
 PENROSE_MIN_SLOPE = 0.0  # pick only tiles whose edges all slope at least this (diamonds_map.steep_tiles; 0: all)
 # CUP_GAP of new penrose layouts per tile edge (the "pair" rule only): 2.5 x edge, i.e. 60 at edge 24 (the numbers
-# above), 42 at 16.8. Saved layouts keep their own "cup_gap"
+# above), 50.4 at 20.16. Saved layouts keep their own "cup_gap"
 PENROSE_CUP_GAP_PER_EDGE = 2.5
 # cup rule of new penrose layouts (see DIAMONDS_CUPS): "pair" (the gap rule, PENROSE_CUP_GAP_PER_EDGE) or "outline" (only
 # touching tiles, plus PENROSE_NEAR). At edge 24 / density 1.5x, outline fit all 695 tiles on 1800x1169 (pair at gap
@@ -192,7 +192,7 @@ PENROSE_SPAWN = {
     **DIAMONDS_SPAWN,
     # tiles per square world unit: the same share of the world's area as maps/diamonds/evolved 3 (302 diamonds,
     # each a 60 degree rhombus of edge DIAMOND_SIDE): 10.3%; times 1.5 x 1.2 x 1.3 = 2.34 (~24.2% of the area,
-    # ~2270 tiles of edge 16.8 on 1800x1169; the cup rule leaves room for far fewer)
+    # ~1540 tiles of edge 20.16 on 1800x1169; the cup rule leaves room for far fewer)
     "density": 2.34 * 302 * DIAMOND_SIDE ** 2 * math.sin(math.radians(60)) / PENROSE_MEAN_AREA / (1800 * 1169),
 }
 PENROSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "penrose")
