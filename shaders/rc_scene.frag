@@ -1,7 +1,8 @@
 // Radiance cascades, scene pass (gl_sdf.py GiEffect): the G-buffer at half resolution as the GI scene. Each texel
 // covers a 2x2 block of render px: rgb = mean emission of the block's solid px, a = 1 if any px is solid.
 // Solid = a shadow-casting occluder (blocks light) or an emissive body px (gives light). Emission is the px's albedo
-// x material emissive x emissive_strength. Needs material.glsl (mat_fetch) and sdf_common.glsl.
+// x material emissive x emissive_strength, 0 for an unlit material (compose shows it unlit: no glow there, so
+// none thrown either). Needs material.glsl (mat_fetch) and sdf_common.glsl.
 uniform sampler2D u_normal;   // G-buffer normal (flags in alpha)
 uniform sampler2D u_albedo;   // G-buffer albedo
 uniform usampler2D u_mat;     // G-buffer material id
@@ -23,7 +24,7 @@ void main() {
         uint id = texelFetch(u_mat, p, 0).r;
         if (id != 0u) {
             Mat m = mat_fetch(u_mats, id);
-            pe = texelFetch(u_albedo, p, 0).rgb * m.emissive * m.emissive_strength;
+            pe = texelFetch(u_albedo, p, 0).rgb * m.emissive * m.emissive_strength * float(m.lit);  // unlit: no glow
         }
         if (solid || max(pe.r, max(pe.g, pe.b)) > 0.0) {
             e += pe;

@@ -242,9 +242,11 @@ class Harness:
         return np.frombuffer(self.gw.tex.read(), np.uint8).reshape(h, w, 4)[..., :3].copy()
 
     def read(self, key):
-        """A shared RGBA16F texture as (h, w, 4) float32."""
+        """A shared RGBA16F / RGBA32F texture as (h, w, 4) float32."""
         w, h = self.size
-        return np.frombuffer(self.frame.shared[key].read(), np.float16).reshape(h, w, 4).astype(np.float32)
+        tex = self.frame.shared[key]
+        dt = np.float32 if tex.dtype == "f4" else np.float16
+        return np.frombuffer(tex.read(), dt).reshape(h, w, 4).astype(np.float32)
 
     def release(self):
         for e in self.effects:

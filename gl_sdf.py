@@ -15,9 +15,10 @@ emissive bodies throw on everything around them (occluded by shadow casters), to
 runs while GI_ENABLED is True (module flag, default False, read every frame) or the world has `gi` set (a per-world
 switch, saved in scenes; the Lights card's GI button toggles it), and then costs: a half-res scene pass, its own
 half-res jump flood (emitters + occluders), N_CASCADES cascade passes and an upsampling pass. GI_GAIN, times the
-world's own `gi_gain` (if any; saved in scenes, set by a map's "lighting" block), scales the result. On periodic
-maps the GI wraps seamlessly: the probe grid runs two top-cascade probe spacings past the period, and cascade merges
-and the upsampling take any footprint that would leave the grid one period over.
+world's own `gi_gain` (if any; saved in scenes, set by a map's "lighting" block), scales the result (gi_gain():
+clamped to [0, MAX_GAIN], a non-finite gain counts as 1; GI_EMIT_GAIN likewise). Unlit materials emit nothing.
+On periodic maps the GI wraps seamlessly: the probe grid runs two top-cascade probe spacings past the period, and
+cascade merges and the upsampling take any footprint that would leave the grid one period over.
 
 Periodic maps: frame.period (render px; an axis with 0 doesn't repeat) is assumed to start at pixel 0; lookups
 wrap into [0, period) and distances are minimum-image.
@@ -40,6 +41,25 @@ def _period(period, scale=1.0):
     if period is None:
         return 0.0, 0.0
     return tuple(max(float(p or 0.0), 0.0) / scale for p in period)
+
+
+MAX_GAIN = 50.0  # GI gains are clamped to [0, MAX_GAIN]
+
+
+def _gain(v):
+    """A gain as a float in [0, MAX_GAIN]; 1 when it isn't a finite number."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(max(v, 0.0), MAX_GAIN) if math.isfinite(v) else 1.0
+
+
+def gi_gain(world):
+    """The effective GI gain: GI_GAIN x world.gi_gain (1 when unset), each made finite, the product in
+    [0, MAX_GAIN]."""
+    g = getattr(world, "gi_gain", None)
+    return min(_gain(GI_GAIN) * (1.0 if g is None else _gain(g)), MAX_GAIN)
 
 
 def _set(prog, name, value):
@@ -191,7 +211,7 @@ class GiEffect:
             tex.use(unit)
         for unit, name in enumerate(("u_normal", "u_albedo", "u_mat", "u_mats")):
             _set(p["scene"], name, unit)
-        _set(p["scene"], "u_emit_gain", float(GI_EMIT_GAIN))
+        _set(p["scene"], "u_emit_gain", _gain(GI_EMIT_GAIN))
         self.scene_fbo.use()
         frame.fullscreen(p["scene"])
         dist = self.jfa.build(frame, p, self.scene, 1, period)
@@ -221,7 +241,7 @@ class GiEffect:
         _set(o, "u_dist", 1)
         _set(o, "u_mat", 2)
         _set(o, "u_period", period)
-        _set(o, "u_gain", float(GI_GAIN) * float(getattr(world, "gi_gain", None) or 1.0))
+        _set(o, "u_gain", gi_gain(world))
         self.out_fbo.use()
         frame.fullscreen(o)
         frame.shared["gi"] = self.out

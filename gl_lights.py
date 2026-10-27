@@ -1,15 +1,17 @@
 """Lights and compose for the lit renderer (effects in gl_effects' plugin API, see research/lighting_contract.md).
 
-LightsEffect (order 200): every enabled light of lights.of_world(frame.world) in one instanced additive draw into
-shared["light"] (diffuse RGB) and shared["spec"] (specular RGB), both RGBA16F. Lights go to the GPU in a std140
+LightsEffect (order 200): every drawable light of frame.world (lights.sanitize: disabled / invalid ones dropped, the
+rest clamped) in one instanced additive draw into shared["light"] (diffuse RGB) and shared["spec"] (specular RGB),
+RGBA16F, RGBA32F while more than F4_MIN_LIGHTS lights draw (LIGHT_DTYPE). Lights go to the GPU in a std140
 uniform block, 4 vec4 per light (pack_lights), MAX_LIGHTS per draw (more lights draw in batches). Point lights
 cover the box of their radius, spot lights the box of their cone, directional lights the whole surface; light_accum
 does the per-pixel work (N.L with the light at its pseudo height, Blinn-Phong, toon bands, shadows from
 shared["sdf"] via sdf_shadow.glsl when there is one, minimum-image distances on periodic maps).
 
-ComposeEffect (order 300): GLWorld.tex = albedo * (ambient + light + gi + caustics) + spec + emissive on lit pixels,
-albedo unchanged on unlit ones; then a copy into shared["scene_lit"] (RGBA8) for refraction. Missing light / spec /
-gi / caustics read as black.
+ComposeEffect (order 300): GLWorld.tex = tone(exposure x (albedo * (ambient + light + gi + caustics) + spec +
+emissive)) on lit pixels (TONEMAP: a hue-preserving shoulder above TONE_KNEE plus a +-0.5/255 dither; off: a plain
+clamp; exposure: world.exposure, 1 by default), albedo unchanged on unlit ones; then a copy into
+shared["scene_lit"] (RGBA8) for refraction. Missing light / spec / gi / caustics read as black.
 """
 import math
 
@@ -28,41 +30,78 @@ DIRECTIONAL_HEIGHT_REF = 60.0
 # pixel gets 1 (the falloff alone shapes the pool) and a tilted bevel 1 + DIFFUSE_RELIEF x (N.L - flat N.L), so faces
 # toward the light brighten and faces away darken by how much they turn.
 DIFFUSE_RELIEF = 0.8
-LIGHT_LEVELS = 0  # > 0: compose quantises the total light to this many levels per unit, Bayer dithered (retro look)
+# The light / spec targets: RGBA16F rounds every additive light to half precision (300 dim lights drift ~8% near 1),
+# RGBA32F doesn't but costs ~1-1.5 ms a frame at 900x584 on penrose maps, so by default (None) they are RGBA32F only
+# while more than F4_MIN_LIGHTS lights draw (reallocated when the count crosses it). "f2" / "f4" force one. Where
+# float32 render targets fail they fall back to "f2".
+LIGHT_DTYPE = None
+F4_MIN_LIGHTS = 32
+LIGHT_LEVELS = 0  # > 0: compose quantises the total light's luminance to this many levels per unit, Bayer dithered
+MIN_SOFTNESS_PX = 0.75  # the smallest shadow softness passed to the shader: an anti-aliased edge for hard shadows
+# compose's tone mapping: a hue-preserving shoulder above TONE_KNEE (the brightest channel rolls off smoothly towards
+# 1 instead of clipping, so an orange light stays orange instead of going flat white) plus a +-0.5/255 dither against
+# banding. Off: plain clamp, as before. world.exposure (if set) scales the lit colour before it.
+TONEMAP = True
+TONE_KNEE = 0.8
 
 
 def pack_lights(lights, zoom):
-    """(n, 16) float32: the enabled lights in light_quad.vert / light_accum.frag's layout, positions in render px.
+    """(n, 16) float32: the drawable lights (lights.sanitize: disabled / invalid ones dropped, the rest clamped) in
+    light_quad.vert / light_accum.frag's layout, positions in render px.
         [pos.x, pos.y, height (px; directional: elevation tangent), kind]
         [colour * intensity (rgb), radius px]
         [dir.x, dir.y, cos inner, cos outer]          dir: unit; spot axis / directional travel direction
-        [falloff, softness px, casts shadows 0/1, 0]"""
+        [falloff, softness px, casts shadows 0/1, 0]
+    Softness is at least MIN_SOFTNESS_PX: a 0 (hard) shadow still gets an anti-aliased edge."""
+    zoom = float(zoom) if math.isfinite(float(zoom)) and float(zoom) > 0 else 1.0
     rows = []
-    for lt in lights:
-        if not lt.enabled or lt.kind not in KINDS:
+    for raw in lights:
+        lt = lights_mod.sanitize(raw)
+        if lt is None:
             continue
         kind = KINDS[lt.kind]
-        dx, dy = (float(v) for v in lt.dir)
-        norm = math.hypot(dx, dy)
-        dx, dy = (dx / norm, dy / norm) if norm > 0 else (0.0, 1.0)
-        outer = min(max(float(lt.cone_outer), 0.0), 180.0)
-        inner = min(max(float(lt.cone_inner), 0.0), outer)
-        cos_o, cos_i = math.cos(math.radians(outer)), math.cos(math.radians(inner))
+        dx, dy = lt.dir
+        cos_o, cos_i = math.cos(math.radians(lt.cone_outer)), math.cos(math.radians(lt.cone_inner))
         cos_i = max(cos_i, cos_o + 1e-4)  # smoothstep needs edge0 < edge1
-        height = (max(float(lt.height), 0.0) / DIRECTIONAL_HEIGHT_REF if kind == 2
-                  else max(float(lt.height), 0.0) * zoom)
-        r, g, b = (float(c) * float(lt.intensity) for c in tuple(lt.color)[:3])
-        rows.append([float(lt.pos[0]) * zoom, float(lt.pos[1]) * zoom, height, kind,
-                     r, g, b, max(float(lt.radius), 0.0) * zoom,
+        height = lt.height / DIRECTIONAL_HEIGHT_REF if kind == 2 else lt.height * zoom
+        r, g, b = (c * lt.intensity for c in lt.color)
+        rows.append([lt.pos[0] * zoom, lt.pos[1] * zoom, height, kind,
+                     r, g, b, lt.radius * zoom,
                      dx, dy, cos_i, cos_o,
-                     max(float(lt.falloff), 0.0), max(float(lt.softness), 0.0) * zoom,
+                     lt.falloff, max(lt.softness * zoom, MIN_SOFTNESS_PX),
                      1.0 if lt.casts_shadows else 0.0, 0.0])
-    return np.array(rows, np.float32).reshape(-1, 16)
+    with np.errstate(over="ignore", invalid="ignore"):
+        out = np.array(rows, np.float32).reshape(-1, 16)
+    # float32 overflow (huge positions x zoom) -> the largest finite value, so no inf / NaN reaches the shader
+    return np.nan_to_num(out, nan=0.0, posinf=np.finfo(np.float32).max / 4, neginf=-np.finfo(np.float32).max / 4)
 
 
 def _period(frame):
     p = getattr(frame, "period", None)
     return (0.0, 0.0) if p is None else (float(p[0] or 0.0), float(p[1] or 0.0))
+
+
+def exposure(world):
+    """world.exposure (multiplies the lit colour before tone mapping): finite, in [0, 64]; 1 when unset or bad."""
+    e = getattr(world, "exposure", None)
+    try:
+        e = 1.0 if e is None else float(e)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(max(e, 0.0), 64.0) if math.isfinite(e) else 1.0
+
+
+def shadow_reach(size, frame):
+    """(u_shadow_reach, u_shadow_fade_start) in px: how far a directional light's shadow march looks, and from where
+    its shadows fade out. On a periodic map the march wraps, so it looks at least 1.5 periods (an occluder one period
+    over still shades) and fades from half way, so a long shadow doesn't end on a hard line; otherwise the surface
+    diagonal and no fade (0)."""
+    diag = float(math.hypot(*size))
+    p = _period(frame)
+    if max(p) > 0:
+        reach = max(diag, 1.5 * max(p))
+        return reach, 0.5 * reach
+    return diag, 0.0
 
 
 def _restore(ctx, prev):
@@ -89,18 +128,40 @@ class LightsEffect:
         self.vaos = {}
         self.ubo = ctx.buffer(reserve=MAX_LIGHTS * 64)
         self.light = self.spec = self.fbo = None
+        self.dtype = None  # what the targets are ("f2" / "f4")
+        self.want = "f2"  # what was asked for (an "f4" that failed stays "f2" without retrying every frame)
         self._alloc(size)
 
-    def _alloc(self, size):
-        if self.fbo is not None:
-            for o in (self.fbo, self.light, self.spec):
+    def _dtype(self, n_lights):
+        """The target dtype for n lights: LIGHT_DTYPE if forced, else f4 past F4_MIN_LIGHTS (back to f2 at or below
+        F4_MIN_LIGHTS * 3 / 4, so a count near the threshold doesn't reallocate every frame)."""
+        if LIGHT_DTYPE in ("f2", "f4"):
+            return LIGHT_DTYPE
+        if n_lights > F4_MIN_LIGHTS:
+            return "f4"
+        return "f2" if n_lights <= F4_MIN_LIGHTS * 3 // 4 else self.want
+
+    def _alloc(self, size, dtype="f2"):
+        for o in (self.fbo, self.light, self.spec):
+            if o is not None:
                 o.release()
+        self.light = self.spec = self.fbo = None
         self.size = tuple(size)
-        self.light = self.ctx.texture(self.size, 4, dtype="f2")
-        self.spec = self.ctx.texture(self.size, 4, dtype="f2")
+        self.want = dtype
+        for dtype in dict.fromkeys((dtype, "f2")):  # fp32 sums don't drift over hundreds of lights
+            try:
+                self.light = self.ctx.texture(self.size, 4, dtype=dtype)
+                self.spec = self.ctx.texture(self.size, 4, dtype=dtype)
+                self.fbo = self.ctx.framebuffer([self.light, self.spec])
+                self.dtype = dtype
+                break
+            except moderngl.Error:  # no float32 render targets here: half floats
+                for o in (self.fbo, self.light, self.spec):
+                    if o is not None:
+                        o.release()
+                self.light = self.spec = self.fbo = None
         for t in (self.light, self.spec):
             t.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.fbo = self.ctx.framebuffer([self.light, self.spec])
 
     def _prog(self, frame, has_sdf):
         if has_sdf not in self.progs:
@@ -113,13 +174,16 @@ class LightsEffect:
 
     def run(self, gw, frame):
         ctx = self.ctx
-        if tuple(frame.size) != self.size:
-            self._alloc(frame.size)
+        data = pack_lights(lights_mod.of_world(frame.world)[0], float(frame.zoom))
+        want = self._dtype(len(data))
         prev = ctx.fbo
+        if tuple(frame.size) != self.size or want != self.want:
+            if prev is self.fbo:  # (about to be released: nothing to restore)
+                prev = None
+            self._alloc(frame.size, want)
         frame.shared["light"], frame.shared["spec"] = self.light, self.spec
         self.fbo.use()
         self.fbo.clear(0.0, 0.0, 0.0, 0.0)
-        data = pack_lights(lights_mod.of_world(frame.world)[0], float(frame.zoom))
         if len(data):
             sdf = frame.shared.get("sdf")
             prog, vao = self._prog(frame, sdf is not None)
@@ -130,8 +194,9 @@ class LightsEffect:
                 tex.use(unit)
                 if name in prog:
                     prog[name].value = unit
+            reach, fade_start = shadow_reach(self.size, frame)
             values = {"u_res": tuple(float(s) for s in self.size), "u_period": _period(frame),
-                      "u_shadow_reach": float(math.hypot(*self.size)), "u_relief": float(DIFFUSE_RELIEF)}
+                      "u_shadow_reach": reach, "u_shadow_fade_start": fade_start, "u_relief": float(DIFFUSE_RELIEF)}
             for name, v in values.items():
                 if name in prog:
                     prog[name].value = v
@@ -211,8 +276,11 @@ class ComposeEffect:
         ambient = lights_mod.of_world(frame.world)[1]
         if "u_ambient" in prog:
             prog["u_ambient"].value = tuple(float(c) for c in tuple(ambient)[:3])
-        if "u_levels" in prog:
-            prog["u_levels"].value = float(LIGHT_LEVELS)
+        values = {"u_levels": float(LIGHT_LEVELS), "u_tonemap": bool(TONEMAP),
+                  "u_knee": min(max(float(TONE_KNEE), 0.0), 0.99), "u_exposure": exposure(frame.world)}
+        for name, v in values.items():
+            if name in prog:
+                prog[name].value = v
         ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
         fbo.use()
         self.vao.render(moderngl.TRIANGLE_STRIP, vertices=4)
