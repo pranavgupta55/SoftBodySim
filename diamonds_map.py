@@ -402,14 +402,23 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
 
     def try_add(k, trusted=False):  # pick diamond k if the rules allow it: True if picked
         p, linked, touching, ok = inside[k][0], [], [], True
+        own = []  # members of the growing cluster touching p (inner_cups "outline": tested by outline_cup, not pairs)
+        why[0] = None
         n = len(chosen)
         far = ((np.abs(cx_picked[:n, None] + shift_x - centers[k][0]) > reach)
                | (np.abs(cy_picked[:n, None] + shift_y - centers[k][1]) > reach))
         for i, s in zip(*np.nonzero(~far)):
             m, (dx, dy) = chosen[i], shifts[s]
             q = inside[m][0] + np.array([[dx], [dy]])
-            if not trusted and not outline and forms_cup(p, q, size, gap):
-                ok = False
+            if inner_outline and m in growing and not trusted:
+                if _corner_gap(p, q) <= touch:
+                    own.append(q)
+                if _corner_gap(p, q) <= link:
+                    if dx:
+                        ok = False
+                    linked.append(m)
+            elif not trusted and not outline and forms_cup(p, q, size, gap):
+                ok, why[0] = False, "outer pair cup"
             elif _corner_gap(p, q) <= link:
                 if dx:
                     ok = trusted  # no cluster through the left / right seam
@@ -417,6 +426,8 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                 touching.append(_snap(q, p, near) if near > 0 else q)
             if not ok:
                 break
+        if ok and own and outline_cup(p, own, size) is not None:
+            ok, why[0] = False, "inner outline cup"
         if ok and outline and not trusted:
             cup = outline_cup(p, touching, size)
             if cup is not None:
@@ -424,7 +435,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                 if cup_log is not None:
                     cup_log.append(cup_pattern(cup[1]))
         if ok and not trusted and sealed and any(m in sealed and m not in growing for m in linked):
-            ok = False  # finished archetype clusters keep their shape: nothing else links onto them
+            ok, why[0] = False, "sealed neighbour"  # finished archetype clusters keep their shape: nothing else links onto them
         if not ok:
             return False
         merged = {id(c): c for c in (cluster[m] for m in linked)}.values()
@@ -433,6 +444,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
         if cap is not None and not trusted:
             xs = np.concatenate([inside[m][0][0] for m in members])
             if xs.max() - xs.min() > cap:
+                why[0] = "width limit"
                 return False
         for m in members:
             cluster[m] = members
@@ -445,6 +457,13 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     archetypes = []  # (kind, [picked indices], angle or None)
     sealed, growing = set(), set()  # picked tiles of archetype clusters; those of the one growing now
     width_cap = [None]  # a tier's own max_width while its clusters grow (None: max_width)
+    # inner_cups: "pair" (forms_cup against every picked tile) or "outline": a candidate for the growing archetype
+    # cluster is tested against that cluster's own members by the outline rule (outline_cup), the pair rule only
+    # against all other tiles
+    inner_outline = bool(settings) and settings.get("inner_cups", "pair") == "outline" and not outline
+    why = [None]  # the rule that vetoed the last try_add
+    vetoes = {}  # per tier: reason -> vetoed growth candidates (debug: pick_diamonds.last_vetoes)
+    pick_diamonds.last_vetoes = vetoes
 
     def touching_tiles(k):  # tiles of the tiling (inside the world) sharing an edge or a corner with tile k
         near_k = np.flatnonzero(np.hypot(*(centers - centers[k]).T) <= 2 * size + touch)
@@ -476,8 +495,9 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
             # the kind behind its round_share of the tiles placed so far (round ones lose more to the cup veto)
             n_round = sum(len(m) for kd, m, _, tn in archetypes if kd == "round" and tn == name)
             n_all = sum(len(m) for _, m, _, tn in archetypes if tn == name)
-            gap_round = settings["round_share"] * (n_all + 1) - n_round
-            if gap_round > 0.5 or (abs(gap_round) <= 0.5 and rng.random() < settings["round_share"]):
+            rs = tier.get("round_share", settings["round_share"]) if tier else settings["round_share"]
+            gap_round = rs * (n_all + 1) - n_round
+            if gap_round > 0.5 or (abs(gap_round) <= 0.5 and rng.random() < rs):
                 kind, angle = "round", None
                 want = int(rng.integers(round_size[0], round_size[1] + 1))
             else:
@@ -515,6 +535,8 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
                     growing.add(j)
                 else:
                     fails += 1
+                    v = vetoes.setdefault(name, {})
+                    v[why[0] or "other"] = v.get(why[0] or "other", 0) + 1
             if tier and len(members) < want // 2 and redo < tier.get("retries", 40):
                 redo += 1  # stalled far short: undo it (its tiles are the last picked, linked to nothing else), reseed
                 for m in members:
