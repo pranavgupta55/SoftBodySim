@@ -85,7 +85,7 @@
 ],
 "materials": {
 "hexagon": "glow",
-"diamond": "matte",
+"diamond": "glass",
 "wall": "matte"
 },
 "material_over": {
