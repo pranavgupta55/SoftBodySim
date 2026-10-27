@@ -445,7 +445,11 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
             if not try_add(k):
                 continue
             members, tried, fails = [k], {k}, 0
-            if rng.random() < settings["round_share"]:
+            # the kind behind its round_share of the tiles placed so far (round ones lose more to the cup veto)
+            n_round = sum(len(m) for kd, m, _ in archetypes if kd == "round")
+            n_all = sum(len(m) for _, m, _ in archetypes)
+            gap_round = settings["round_share"] * (n_all + 1) - n_round
+            if gap_round > 0.5 or (abs(gap_round) <= 0.5 and rng.random() < settings["round_share"]):
                 kind, angle = "round", None
                 want = int(rng.integers(settings["round_size"][0], settings["round_size"][1] + 1))
             else:
