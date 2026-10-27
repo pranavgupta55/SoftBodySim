@@ -19,7 +19,7 @@ from materials import PATTERN_CHECKER
 from solver import World
 
 BACKGROUND = [96, 98, 112]
-AMBIENT = (0.10, 0.10, 0.14)
+AMBIENT = (0.30, 0.30, 0.36)
 POOL_OCTAGON_R = 13.0  # water octagons' circumradius (world units)
 POOL_ROWS = 3
 
@@ -65,6 +65,7 @@ def build_lighting_demo(world_width, world_height):
     world.background = list(BACKGROUND)
     world.show_grid = False
     world.lighting = True
+    world.caustics = True  # gl_glass.CausticsEffect: the spot light focused through the lens
     world.ambient = AMBIENT
     floor = h - INSET
     bodies = []
@@ -126,15 +127,18 @@ def build_lighting_demo(world_width, world_height):
     soft(polygon_points(0.92 * w, 0.84 * h, 22, 7), Endesga.sand, "matte")
 
     world.add_many(bodies)
+    for wall in getattr(world, "walls", {}).values():  # the box walls would shade the whole room from the sun
+        _material(wall, "matte", casts_shadow=False)
 
     world.lights = [
-        Light(kind=POINT, pos=(0.20 * w, 0.30 * h), color=(1.0, 0.72, 0.42), intensity=1.4, radius=0.55 * w,
-              softness=10.0, height=60.0),  # warm
-        Light(kind=POINT, pos=(0.84 * w, 0.24 * h), color=(0.45, 0.55, 1.0), intensity=1.2, radius=0.45 * w,
-              softness=6.0, height=50.0),  # cool blue
+        Light(kind=POINT, pos=(0.22 * w, 0.42 * h), color=(1.0, 0.72, 0.42), intensity=1.3, radius=0.75 * w,
+              falloff=1.3, softness=10.0, height=60.0),  # warm
+        Light(kind=POINT, pos=(0.82 * w, 0.40 * h), color=(0.45, 0.55, 1.0), intensity=1.1, radius=0.6 * w,
+              falloff=1.3, softness=6.0, height=50.0),  # cool blue
         Light(kind=SPOT, pos=(0.5 * w, 0.05 * h), dir=_unit(0.0, 1.0), color=(1.0, 0.97, 0.9), intensity=1.8,
               radius=0.9 * h, cone_inner=12.0, cone_outer=22.0, softness=4.0, height=80.0),  # through the lens
-        Light(kind=DIRECTIONAL, pos=(0.64 * w, 0.06 * h), dir=_unit(0.35, 1.0),  # (pos: only where its gizmo sits) color=(0.85, 0.9, 1.0), intensity=0.25, softness=2.0,
-              height=200.0),  # a weak sun
+        # a weak sun (pos: only where its gizmo sits)
+        Light(kind=DIRECTIONAL, pos=(0.64 * w, 0.06 * h), dir=_unit(0.35, 1.0), color=(0.85, 0.9, 1.0), intensity=0.15,
+              softness=2.0, height=200.0),
     ]
     return world

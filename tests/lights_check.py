@@ -128,13 +128,15 @@ def main():
 
     # many lights: 300 (two batches) dim lights equal one bright one
     one = Light(pos=(450, 450), radius=400, intensity=1.5, color=(1, 1, 1))
+    # read where the sum is ~0.4: RGBA16F rounds each of the 300 additions to half an ulp (2^-12 below 1, 2^-13
+    # below 0.5), which at a sum near 1 alone drifts ~8%
     h.run([one], sdf=False)
-    a = h.read("light")[FLOOR_Y, 450, 0]
+    a = h.read("light")[FLOOR_Y, 650, 0]
     h.run([one.copy(intensity=0.005)] * 300, sdf=False)
-    b = h.read("light")[FLOOR_Y, 450, 0]
+    b = h.read("light")[FLOOR_Y, 650, 0]
     check(abs(a - b) < 0.05 * a, f"300 lights add up like one (RGBA16F sums: {a:.3f} vs {b:.3f})")
     h.run([one.copy(intensity=0.0)] * 299 + [one], sdf=False)
-    check(h.read("light")[FLOOR_Y, 450, 0] == a, "the 300th light (second batch) draws")
+    check(h.read("light")[FLOOR_Y, 650, 0] == a, "the 300th light (second batch) draws")
     h.run([one.copy(enabled=False)], sdf=False)
     check(h.read("light").max() == 0, "disabled lights draw nothing")
 

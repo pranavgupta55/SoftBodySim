@@ -23,6 +23,11 @@ KINDS = {lights_mod.POINT: 0, lights_mod.SPOT: 1, lights_mod.DIRECTIONAL: 2}
 # Directional lights have no position: their elevation's tangent is Light.height / this (the default height, 60,
 # gives 45 degrees), so the same height slider still raises or lowers them.
 DIRECTIONAL_HEIGHT_REF = 60.0
+# Diffuse on flat ground: 0 = plain N.L with the light at its pseudo height (a flat pixel d px away gets
+# h / sqrt(d^2 + h^2), so pools fade fast and anything far off the light is near black); > 0 = "relief" shading: a flat
+# pixel gets 1 (the falloff alone shapes the pool) and a tilted bevel 1 + DIFFUSE_RELIEF x (N.L - flat N.L), so faces
+# toward the light brighten and faces away darken by how much they turn.
+DIFFUSE_RELIEF = 0.8
 LIGHT_LEVELS = 0  # > 0: compose quantises the total light to this many levels per unit, Bayer dithered (retro look)
 
 
@@ -126,7 +131,7 @@ class LightsEffect:
                 if name in prog:
                     prog[name].value = unit
             values = {"u_res": tuple(float(s) for s in self.size), "u_period": _period(frame),
-                      "u_shadow_reach": float(math.hypot(*self.size))}
+                      "u_shadow_reach": float(math.hypot(*self.size)), "u_relief": float(DIFFUSE_RELIEF)}
             for name, v in values.items():
                 if name in prog:
                     prog[name].value = v

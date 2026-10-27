@@ -2,7 +2,8 @@
 // shared["light"] (location 0) and shared["spec"] (location 1).
 //
 // Diffuse: N.L with N from the G-buffer normal (z implied) and L towards the light raised to its pseudo height, so
-// bevelled edges facing the light brighten. Specular: Blinn-Phong, view straight down (0, 0, 1), shininess =
+// bevelled edges facing the light brighten; with u_relief > 0 measured relative to a flat pixel (which gets 1).
+// Specular: Blinn-Phong, view straight down (0, 0, 1), shininess =
 // exp2(10 * (1 - roughness)), strength material.specular. Toon materials (bands > 0) quantise both. Unlit pixels
 // (flag bit2 clear) get nothing. Each light's term is multiplied by its shadow (sdf_shadow, or the stub when there
 // is no SDF) unless it doesn't cast shadows. Distances are minimum-image across u_period.
@@ -18,6 +19,7 @@ uniform sampler2D u_mat_table;  // material table (mat_fetch)
 uniform sampler2D u_sdf;        // shared["sdf"] (unused by the no-SDF stub)
 uniform vec2 u_period;
 uniform float u_shadow_reach;   // directional lights: how far the shadow march looks, px
+uniform float u_relief;         // gl_lights.DIFFUSE_RELIEF: 0 = plain N.L, > 0 = flat 1 + relief x (N.L - flat N.L)
 
 flat in int v_light;
 
@@ -89,7 +91,8 @@ void main() {
 
     Mat m = mat_fetch(u_mat_table, texelFetch(u_mat, px, 0).r);
     float bands = float(m.bands);
-    float diff = toon(max(dot(n, l), 0.0) * atten, bands);
+    float ndl = u_relief > 0.0 ? max(1.0 + u_relief * (dot(n, l) - l.z), 0.0) : max(dot(n, l), 0.0);
+    float diff = toon(ndl * atten, bands);
     float spec = 0.0;
     if (m.specular > 0.0) {
         vec3 h = normalize(l + vec3(0.0, 0.0, 1.0));
