@@ -28,7 +28,7 @@ import moderngl
 import numpy as np
 import pygame
 
-from entities import Body, EnvConfig
+from entities import FILL_EXPAND, Body, EnvConfig
 import looping
 from solver import World
 
@@ -226,7 +226,9 @@ class WorldPacker:
         col = np.full(loop.shape[1], pack_rgb([BORDER_COL])[0])
         layer = body_layer[t.loop_body]
         ones = np.ones(loop.shape[1], np.int64)
-        for k in range(BORDER_WIDTH if outlines else 0):
+        if not outlines:  # no border: the shape grown FILL_EXPAND px outward in its own fill colour
+            col = fill_c[t.loop_body]
+        for k in range(BORDER_WIDTH if outlines else 1 + FILL_EXPAND):
             lines.append(np.stack([loop[0] + k * sx, loop[1] + k * sy, nxt[0] + k * sx, nxt[1] + k * sy, ones, col,
                                    layer, 0 * ones], axis=1))
         return fills.astype(np.int32), loop.T.astype(np.int32)
@@ -245,7 +247,8 @@ class WorldPacker:
             for end in (a, b):
                 stamps.append(np.stack([end[0], end[1], border, layer, zero, zero], axis=1))
                 radii.append(outer / 2)
-        lines.append(np.stack([a[0], a[1], b[0], b[1], sw, fill_c[sb], layer + 1, zero], axis=1))
+        fw = sw if outlines else sw + 2 * FILL_EXPAND
+        lines.append(np.stack([a[0], a[1], b[0], b[1], fw, fill_c[sb], layer + 1, zero], axis=1))
 
     @staticmethod
     def _points(t, P, which, body_layer, bodies, lines, stamps, radii):

@@ -116,6 +116,9 @@ def polygon_points(cx, cy, radius, n, angle=-math.pi / 2):
     return np.array([cx + radius * np.cos(angles), cy + radius * np.sin(angles)])
 
 
+FILL_EXPAND = 2  # px the no-outline filled view grows each shape outward (Body.draw_filled, gl_world)
+
+
 class Body:
     """A closed polygon of points. Collision outline is the loop 0 -> 1 -> ... -> n-1 -> 0."""
     fixed = False
@@ -172,13 +175,14 @@ class Body:
         for pos in pts.T:
             pygame.draw.circle(surface, self.point_col, pos, self.point_radius)
 
-    def draw_filled(self, surface, border_col=(0, 0, 0), border_width=2, zoom=1.0):
-        """Filled view: the perimeter loop as a solid polygon with a border, no points or springs."""
+    def draw_filled(self, surface, border_col=(0, 0, 0), border_width=2, zoom=1.0, expand=FILL_EXPAND):
+        """Filled view: the perimeter loop as a solid polygon with a border, no points or springs. border_width 0:
+        no border, the shape grown `expand` px outward in its own fill colour instead."""
         pts = self.points * zoom
         if pts.shape[1] == 2:  # a segment: a thick line in the fill colour with a black outline
             a, b = pts[:, 0], pts[:, 1]
             if border_width <= 0:  # no outline: just the fill line
-                pygame.draw.line(surface, self.fill_col, a, b, max(self.stick_width, 1))
+                pygame.draw.line(surface, self.fill_col, a, b, max(self.stick_width, 1) + 2 * expand)
                 return
             pygame.draw.line(surface, border_col, a, b, max(self.stick_width, 1) + 2 * border_width)
             for end in (a, b):
@@ -192,6 +196,8 @@ class Body:
         pygame.draw.polygon(surface, self.fill_col, loop.T.tolist())
         if border_width > 0:
             draw_border(surface, loop, border_col, border_width, self.winding)
+        elif expand > 0:  # the outline and `expand` 1px copies outward, in the fill colour
+            draw_border(surface, loop, self.fill_col, 1 + expand, self.winding)
 
 
 def draw_border(surface, loop, col=(0, 0, 0), width=2, winding=None):
