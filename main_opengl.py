@@ -475,11 +475,6 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     material_card = MaterialCard(lambda: session.editor)
     look_cards = (material_card, lights_card)
     lit_seen = None  # (world, its lighting switch) last frame
-    lit_kwargs = {}  # GLWorld.render's lighting switch, if this gl_world has one (the lit renderer, gl_effects.py)
-    if gpu_world is not None:
-        import inspect
-        if "lighting" in inspect.signature(gpu_world.render).parameters:
-            lit_kwargs = {"lighting": True}
     session.bind_cards(hud.cards)
     hud.layout()
 
@@ -653,10 +648,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 trails.update(world, dt / fps, stepped)
             with profiler.section("world gl"):  # grid, trails and bodies into the GPU world layer
                 gpu_world.render(world, view.get_size(), ViewConfig.filled, ViewConfig.zoom, background,
-                                 outlines=ViewConfig.outlines,
+                                 outlines=ViewConfig.outlines, lighting=ViewConfig.lighting,
                                  grid=grid_colors(world.background) if ViewConfig.show_grid else None,
-                                 trails=trails if ViewConfig.trails else None,
-                                 **({"lighting": ViewConfig.lighting} if lit_kwargs else {}))
+                                 trails=trails if ViewConfig.trails else None)
         else:
             if ViewConfig.show_grid:
                 world.draw_grid(view, zoom=ViewConfig.zoom, **grid_colors(world.background))

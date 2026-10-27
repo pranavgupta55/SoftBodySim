@@ -2,11 +2,12 @@
 // at the truncated centre.
 in ivec4 in_pos;    // centre x, y (whole px), mask top-left offset from the centre x, y
 in ivec4 in_mask;   // mask x, y in the atlas, mask width, height
-in ivec2 in_style;  // packed 0xBBGGRR colour, depth layer
+in ivec3 in_style;  // packed 0xBBGGRR colour, depth layer, material id (lighting on)
 
 flat out ivec2 v_origin;  // the mask's top-left pixel on the framebuffer
 flat out ivec2 v_atlas;
 flat out vec3 v_col;
+flat out int v_mat;
 
 void main() {
     ivec2 lo = in_pos.xy + in_pos.zw;
@@ -14,4 +15,5 @@ void main() {
     v_origin = lo;
     v_atlas = in_mask.xy;
     v_col = unpack_rgb(in_style.x);
+    v_mat = in_style.z;
 }

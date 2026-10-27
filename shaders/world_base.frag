@@ -5,6 +5,7 @@
 // u_cells (0 empty, 1 an edge's padded box, 2 a point), then lines go on top, as draw_grid does with fills and lines.
 // Trails: u_trail holds each trail pixel's colour and opacity a (256ths, in alpha); the CPU path blends
 // pixel = (pixel * (256 - a) + colour * a) >> 8.
+// G-buffer (lighting on): all of this is albedo; normal flat with no flags, material 0.
 uniform vec3 u_background;  // 0-255
 uniform bool u_grid;
 uniform isampler2D u_xmap;
@@ -16,7 +17,9 @@ uniform vec3 u_point_col;
 uniform bool u_trails;
 uniform sampler2D u_trail;
 
-out vec4 f_color;
+layout(location = 0) out vec4 f_color;
+layout(location = 1) out vec4 f_normal;
+layout(location = 2) out uint f_mat;
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -44,4 +47,6 @@ void main() {
         }
     }
     f_color = vec4(col / 255.0, 1.0);
+    f_normal = vec4(0.5, 0.5, 0.0, 0.0);  // background: flat, no body, no flags
+    f_mat = 0u;
 }

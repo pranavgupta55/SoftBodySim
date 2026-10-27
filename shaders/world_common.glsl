@@ -8,6 +8,17 @@
 uniform vec2 u_size;   // framebuffer size, px
 uniform ivec2 u_clip;  // pixels at or past this (the world view's size) are clipped, like a pygame subsurface
 
+// Lighting on (gl_world draws into the G-buffer): world programs write all three outputs, f_color (location 0: the
+// albedo, the unlit colour plus material tint / pattern), f_normal (1) and f_mat (2) (research/lighting_contract.md).
+// Lighting off: the same programs draw into GLWorld.fbo, which has only location 0; f_color is then exactly the unlit
+// colour and the other outputs go nowhere.
+uniform bool u_lit;
+
+// G-buffer normal texel: rg = n.xy * 0.5 + 0.5 (+y down), b = edge distance px / 255, a = flags / 255
+vec4 gbuf_normal(vec2 n, float d, int flags) {
+    return vec4(n * 0.5 + 0.5, clamp(d / 255.0, 0.0, 1.0), float(flags) / 255.0);
+}
+
 const float LAYERS = 1048576.0;  // 2^20 layers: exact in float32 and in a 24-bit depth buffer
 
 vec4 to_clip(vec2 px, int layer) {
