@@ -15,7 +15,9 @@ def new_chain_id():
 
 class EnvConfig:
     gravity = np.array([0.0, 500.0])  # px/s^2, +y is down on screen
-    substeps = 4  # physics substeps per frame
+    # physics substeps per 1/60 s frame. The sim runs in fixed ticks of one substep each, 1 / (60 * substeps) s
+    # (1/240 s), whatever the frame rate (World.step)
+    substeps = 4
     iterations = 4  # constraint + contact solver passes per substep
     contact_radius = 3.0  # px; a point collides with an edge when closer than this
     friction = 0.5  # 0 = ice, 1 = sticky
@@ -24,17 +26,16 @@ class EnvConfig:
     # A fall down a whole 982-unit-tall world peaks near 850 px/s, so only longer falls (looping worlds) reach it.
     terminal_velocity = 1000.0
     cell_size = 24.0  # px; spatial hash grid cell size, keep >= longest edge you care about
-    max_dt = 1 / 30  # clamp for frame hitches
-    # Substeps per CCD pass. 1: CCD after every substep, contact candidates rebuilt every substep. k > 1: k substeps
-    # run without CCD, then one CCD pass checks the straight path from their start to their end, and the contact
-    # candidates come from swept boxes over those k substeps. None: once per frame (all substeps).
+    max_dt = 1 / 30  # s of real time one World.step call may take in (frame hitches: the rest is dropped)
+    # Substeps per CCD pass. Every World.step tick is one substep with its own CCD pass, so neither this nor
+    # ccd_max_span changes anything in a tick; they only matter to World._substeps called with n > 1 directly
+    # (research scripts). There: 1: CCD after every substep, contact candidates rebuilt every substep. k > 1: k
+    # substeps run without CCD, then one CCD pass checks the straight path from their start to their end, and the
+    # contact candidates come from swept boxes over those k substeps. None: once per call (all substeps).
     ccd_stride = None
     # s; longest CCD span (whatever ccd_stride says): CCD checks the straight line from a span's start to its end, so
-    # a long span (a slow frame at a high time scale: 10 substeps of 1/60 s) turns a body's curved path around an
-    # obstacle into a chord through it, CCD stops the points on that chord, and the rest of the body falls on: shapes
-    # stretch 10-20x (diamonds/evolved 1 at 500% on a 30 fps frame: a 1/6 s span, worst edge 21x; capped at 1/30 s
-    # 2.1x with XPBD springs, 3.0x with PBD ones). 1/30 s is 400% at 120 fps, so it adds CCD passes only above
-    # that speed or on slower frames. None: no limit.
+    # a long span turns a body's curved path around an obstacle into a chord through it (shapes stretch 10-20x at
+    # 1/6 s spans). None: no limit.
     ccd_max_span = 1 / 30
     ccd_passes = 8  # collision-impulse passes per CCD pass before falling back to rigid impact zones
     ccd_gap = 0.01  # px; minimum gap continuous collision detection keeps between a point and an edge
@@ -67,29 +68,13 @@ class EnvConfig:
     # (research 10 soft_rest) is 0.26 px/s with PBD and 1.72 / 0.93 / 0.26 with XPBD at 2 / 5 / 10; a 120 px drop
     # rebounds 12.9 px with PBD, 12.6 / 12.1 / 9.9 px at 0 / 3 / 10 (research 01 also found ~10).
     spring_damping = 10.0
-    # Most substeps one World.step runs per 1/60 s frame (World.step's frames=1), however high the time scale: 16 =
-    # today's count at 400%. Past it the substeps get longer instead of more numerous, so a high time scale costs
-    # no more per frame than 400% and the frame rate (and with it the delivered speed) holds; XPBD springs keep
-    # their stiffness at the longer substeps. Measured on diamonds/evolved 1 (CPU, 8 substeps per 1/120 s frame,
-    # ccd_max_span 1/30 s): substeps of 1/96, 1/48, 1/32 s keep the worst edge stretch at 2.1-2.4x (PBD springs at
-    # 1/60 s: 4-21x); at 1/16 s and longer CCD needs impact zones and a frame costs 10x more. None: no cap.
-    max_substeps = 16
-    # s of physics wall time per 1/60 s frame (World.step's frames=1) that a high time scale may use: past it the
-    # substeps get longer instead of more numerous, from a running mean of what a substep takes on this machine. Half
-    # the frame (1/120 s per 1/60 s), so at 120 fps a frame has room left to draw and the frame rate holds instead of
-    # spiralling down (slower frames -> more substeps per frame -> slower frames). It never cuts below the scale-1
-    # count, so speeds <= 100% are untouched and deterministic. None: no budget (max_substeps only).
+    # s of physics wall time per 1/60 s of real time that a high time scale may use (World.step): past it a call runs
+    # fewer ticks than asked and the excess time is dropped (the sim runs slower than the time scale asks:
+    # World.last_sim_dt < last_requested_dt, shown as "actual" on the Controls card), from a running mean of what a
+    # tick takes on this machine. Half the frame (1/120 s per 1/60 s), so the frame rate holds instead of spiralling
+    # down (slower frames -> more ticks per frame -> slower frames). It never cuts below what scale 1 needs, so speeds
+    # <= 100% are untouched. Ticks are never made longer (that would change the trajectory). None: no budget.
     physics_budget = 1 / 120
-    # s; longest substep: when max_substeps would make them longer, more substeps run instead (frames get slower).
-    # None: no limit.
-    max_substep_dt = 1 / 40
-    # True: when max_substep_dt would need more substeps than physics_budget allows, run the budget's substeps (at
-    # least the scale-1 count) at max_substep_dt and simulate less than the time scale asks (World.last_sim_dt <
-    # last_requested_dt), so the frame rate holds instead of spiralling down to max_dt. False: max_substep_dt adds
-    # substeps past the budget. Measured on diamonds/evolved 1 (E-cores, 1800x1169 window): at 1000% / 5000% True
-    # runs 48 / 50 fps delivering 2.4x / 2.5x, False 9 / 2.5 fps delivering 3.0x / 3.7x; worst stretch the same
-    # (every substep is at most max_substep_dt either way). Off by default: it trades delivered speed for frame rate.
-    budget_limits_speed = False
 
 
 # Small steps (research 01 and 10 F8): more substeps, fewer solver passes. Energy, free fall, chain stretch and

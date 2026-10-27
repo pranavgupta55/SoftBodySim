@@ -65,7 +65,7 @@ from timectl import TimeControl
 from gl_world import GLWorld
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
-FPS = 120  # frame cap; physics keeps its 1/240 s substeps at any rate (World.step's frames)
+FPS = 160  # frame cap, purely visual: physics runs fixed 1/240 s ticks at any frame rate (World.step)
 SCALE_DOWN = 2  # real screen px per render surface px
 GHOST_ALPHA = 100  # opacity of the translucent ghost layer (screenT)
 GRAB_AREA_MIN, GRAB_AREA_MAX = 10.0, 400.0  # the area grab's circle radius range (world units)
@@ -590,16 +590,17 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         profiler.switch("physics")
         world.drag_to((wx, wy), ViewConfig.grab_area_radius if ViewConfig.grab_area else None)
         overlays.attach(world)  # World.debug: a step recorder while overlay 2 or 4 is on, else None
-        # dt is in frames here, World wants seconds; the time scale applies to the physics only (timectl.py)
+        # dt is in frames here, World wants seconds; the time scale applies to the physics only (timectl.py). The
+        # world runs whole fixed ticks and carries the rest, so the frame rate never changes the physics
         stepped = not editor.paused
         if stepped:
-            world.step(*time_ctl.step_args(dt / fps), frames=60 / fps)
+            world.step(*time_ctl.step_args(dt / fps))
             time_ctl.note(dt / fps, getattr(world, "last_sim_dt", 0.0))  # the delivered speed (Controls card)
             overlays.after_step(world)
         else:
             time_ctl.reset_actual()
-        for _ in range(time_ctl.take_steps() if editor.paused else 0):  # N: one nominal frame per press
-            world.step(*time_ctl.step_args(1 / fps), frames=60 / fps)
+        for _ in range(time_ctl.take_steps() if editor.paused else 0):  # N: one 1/60 s frame (x scale) per press
+            world.step_frame(time_ctl.scale)
             overlays.after_step(world)
             stepped = True
         time_ctl.pending = 0  # a step requested just before resuming is dropped

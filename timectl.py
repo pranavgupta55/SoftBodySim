@@ -1,20 +1,20 @@
 """Slow motion / fast forward and frame stepping for main_opengl.py (keys [ / ], the Controls card's - / + buttons, N).
 
-The time scale multiplies the physics dt only; rendering, the editor and the profiler keep running at the display
-rate. To keep slow motion smooth and the physics the same, the substep length h stays what it is at 1x: World.step(dt,
-scale) runs round(substeps * s) substeps (at least 1) over s times the frame's dt, and the hitch clamp (max_dt) scales
-the same way (substeps / max_dt are the world's own: EnvConfig or its env overrides). With the default 4 substeps:
+The time scale multiplies the physics time only; rendering, the editor and the profiler keep running at the display
+rate. The physics runs in fixed ticks of one substep, 1 / (60 * substeps) s (1/240 s at the default 4 substeps; the
+world's own substeps: EnvConfig or its env overrides), and World.step(dt, scale) runs as many whole ticks as
+dt * scale holds, carrying the rest to the next frame. So a time scale changes how many ticks run per real second,
+never the ticks themselves: every speed follows the same trajectory, tick for tick. With the default 4 substeps:
 
-    0.25x   1 substep  of 1/240 s per frame   (the 1x trajectory, a quarter as far per frame; 1/4 the physics cost)
-    0.5x    2 substeps of 1/240 s per frame
-    1x      4 substeps of 1/240 s per frame   (exactly World.step's defaults)
-    2x      8 substeps of 1/240 s per frame   (twice the physics cost per frame)
-    100x    400 substeps of 1/240 s per frame (100 times the cost: the frame rate drops if the machine can't keep up)
+    0.25x   60 ticks of 1/240 s per real second   (about one every 4th frame at 160 fps)
+    1x      240 ticks per second                   (1.5 per frame at 160 fps, 4 per frame at 60 fps)
+    2x      480 ticks per second                   (twice the physics cost)
+    100x    24000 ticks per second                 (100 times the cost: past EnvConfig.physics_budget a frame runs
+                                                    fewer ticks than asked and the rest is dropped, so the delivered
+                                                    speed, `actual` below, falls short of the request)
 
-Below 1/substeps (0.25x at 4 substeps) the single substep shrinks instead: 0.01x runs 1 substep of 1/6000 s per frame.
-
-Frame stepping (N, while paused) advances one display frame's worth of physics at the current scale: 1/60 s x scale,
-with the same substeps as a running frame, so 0.25x + N steps a single 1/240 s substep at a time.
+Frame stepping (N, while paused) runs one 1/60 s frame at the current scale: round(substeps x scale) ticks, at least
+one, so 1x + N steps 4 ticks and 0.25x + N a single 1/240 s tick at a time (World.step_frame).
 """
 from entities import EnvConfig
 
@@ -67,7 +67,7 @@ class TimeControl:
 
     def readout(self, short=False):
         """The Controls card's speed text: "speed 500%", or "speed 500% (actual 380%)" while the sim delivers under
-        95% of the request (a slow machine, the max_dt clamp or EnvConfig.budget_limits_speed). short: "500%" /
+        95% of the request (a slow machine, the max_dt clamp or EnvConfig.physics_budget). short: "500%" /
         "500% (380%)", for a narrow card."""
         lagging = self.actual is not None and self.actual < 0.95 * self.scale
         extra = (f" ({self.actual * 100:.0f}%)" if short else f" (actual {self.actual * 100:.0f}%)") if lagging else ""
@@ -86,5 +86,5 @@ class TimeControl:
         return dt, self.scale
 
     def substeps(self, base=None):
-        """Substeps per frame at the current scale, for `base` substeps at 1x (default EnvConfig.substeps)."""
+        """Ticks one N press runs at the current scale (World.step_frame), for `base` substeps (default EnvConfig's)."""
         return max(1, round((EnvConfig.substeps if base is None else base) * self.scale))
