@@ -1,10 +1,12 @@
 // One instance per pygame.draw.line: a quad over its pixel box (see world_line.frag for which pixels it keeps).
 in ivec4 in_ends;   // x1, y1, x2, y2: whole pixels (pygame truncates float endpoints)
-in ivec4 in_style;  // width px, packed 0xBBGGRR colour, depth layer, unused
+in ivec4 in_style;  // width px, packed 0xBBGGRR colour, depth layer,
+                    // transparency 0..255 (0 = opaque)
 
 flat out ivec4 v_ends;
 flat out int v_width;
 flat out vec3 v_col;
+flat out float v_alpha;
 
 void main() {
     int pad = in_style.x / 2 + 1;
@@ -14,4 +16,5 @@ void main() {
     v_ends = in_ends;
     v_width = in_style.x;
     v_col = unpack_rgb(in_style.y);
+    v_alpha = 1.0 - float(in_style.w) / 255.0;
 }

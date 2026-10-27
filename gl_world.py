@@ -123,7 +123,7 @@ class WorldPacker:
     """World -> instance arrays for the three draw calls (pure numpy, no GL: testable on its own).
 
     pack() returns dict(fills=(k, 8) int32 [start, count, colour, layer, minx, miny, maxx, maxy],
-    verts=(m, 2) int32 fill vertices, lines=(k, 8) int32 [x1, y1, x2, y2, width, colour, layer, 0],
+    verts=(m, 2) int32 fill vertices, lines=(k, 8) int32 [x1, y1, x2, y2, width, colour, layer, transparency 0..255 (0 opaque)],
     stamps=(k, 6) int64 [cx, cy, colour, layer, width, 0] with radii=(k,) float64)."""
 
     def __init__(self):
@@ -195,11 +195,11 @@ class WorldPacker:
             a, b = _px(world.P[:, world.grabbed] * zoom), _px(np.asarray(world.grab_target) * zoom)
             lines.append(np.array([[a[0], a[1], b[0], b[1], 1, pack_rgb([(255, 255, 255)])[0], layer, 0]]))
         if getattr(world, "grab_set", None) is not None and nb:  # an area grab: each held point to its target
-            idx, off, _ = world.grab_set
+            idx, off, _, w = world.grab_set  # opacity 0.5 * w: the pull's strength, half max with dozens held
             a, b = _px(world.P[:, idx] * zoom), _px((np.asarray(world.grab_target)[:, None] + off) * zoom)
             k = len(idx)
             lines.append(np.stack([a[0], a[1], b[0], b[1], np.ones(k), np.full(k, pack_rgb([(255, 255, 255)])[0]),
-                                   np.full(k, layer), np.zeros(k)], axis=1))
+                                   np.full(k, layer), np.round(255 * (1 - 0.5 * w))], axis=1))
         cat = lambda xs, w: np.concatenate(xs).astype(np.int64) if xs else np.zeros((0, w), np.int64)
         lines = cat(lines, 8)
         return dict(fills=fills, verts=verts, lines=lines[lines[:, 4] >= 1].astype(np.int32), stamps=cat(stamps, 6),
@@ -502,7 +502,10 @@ class GLWorld:
             self.fills.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
         if len(lines):
             n = self.lines.write(lines)
+            ctx.enable(moderngl.BLEND)  # translucent grab lines; opaque ones (alpha 1) draw as before
+            ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ZERO, moderngl.ONE
             self.lines.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
+            ctx.disable(moderngl.BLEND)
         if len(stamps):
             inst = self._stamps(stamps, data["radii"])
             if len(inst):
