@@ -49,6 +49,9 @@ XPBD_REF_H = 1 / 240
 XPBD_REF_ITERATIONS = 4
 XPBD_CALIBRATION = 1.0
 GRAB_AREA_MIN_WEIGHT = 0.05  # an area grab skips points whose Gaussian pull weight is below this
+GRAB_AREA_SIGMA = 1.0  # the area grab's Gaussian sigma, x the circle's radius (w ~ 0.61 on the circle)
+GRAB_AREA_REACH = 2.0  # it holds points out to this x the radius (w ~ 0.14 there)
+GRAB_AREA_FORCE = 0.35  # its pull (stiffness and speed cap) relative to the single-point grab's
 
 
 def spring_compliance(stiffness, count):
@@ -403,10 +406,11 @@ class World:
         # target = cursor + offset starts at the point itself and moves with the cursor (in the point's own frame,
         # so a copy across the seam is held where it is)
         off = self.P - c
-        # Gaussian falloff, sigma = radius / 2 (w ~ 0.14 at the edge); points too weak to matter aren't held
-        sigma = max(float(radius), 1e-9) / 2
+        # Gaussian falloff, sigma = GRAB_AREA_SIGMA x radius, out to GRAB_AREA_REACH x radius; points too weak to
+        # matter aren't held
+        sigma = max(float(radius), 1e-9) * GRAB_AREA_SIGMA
         weight = np.exp(-dist ** 2 / (2 * sigma ** 2))
-        idx = np.flatnonzero((dist <= radius) & (self.W > 0) & (weight >= GRAB_AREA_MIN_WEIGHT))
+        idx = np.flatnonzero((dist <= GRAB_AREA_REACH * radius) & (self.W > 0) & (weight >= GRAB_AREA_MIN_WEIGHT))
         if idx.size:
             self.grabbed = None
             self.grab_shift = np.zeros(2)
@@ -427,9 +431,9 @@ class World:
         if self.grab_set is not None:  # an area grab: every held point toward its own target, each capped
             idx, off, _, w = self.grab_set  # each pull (and its speed cap) scaled by the point's Gaussian weight
             gap = self.grab_target[:, None] + off - self.P[:, idx]
-            step = gap * -np.expm1(-EnvConfig.grab_stiffness * w * h)
+            step = gap * -np.expm1(-EnvConfig.grab_stiffness * GRAB_AREA_FORCE * w * h)
             length = np.hypot(*step)
-            max_step = EnvConfig.grab_max_speed * w * h
+            max_step = EnvConfig.grab_max_speed * GRAB_AREA_FORCE * w * h
             step *= np.minimum(1.0, max_step / np.maximum(length, 1e-12))
             self.P[:, idx] += step
             return
@@ -965,7 +969,7 @@ class World:
         if self.grab_set is not None:  # an area grab: the same reach for each held point
             idx, off, _, w = self.grab_set
             pull = self.grab_target[:, None] + off - self.P[:, idx]
-            reach = EnvConfig.grab_max_speed * w * t
+            reach = EnvConfig.grab_max_speed * GRAB_AREA_FORCE * w * t
             dist = np.hypot(*pull)
             end[:, idx] = self.P[:, idx] + self.V[:, idx] * t + pull * np.minimum(1.0, reach / np.maximum(dist, 1e-12))
         return np.minimum(self.P, end) - r, np.maximum(self.P, end) + r
