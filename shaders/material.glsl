@@ -7,7 +7,8 @@ const int PROFILE_BEVEL = 0, PROFILE_DOME = 1, PROFILE_PILLOW = 2;
 const int PATTERN_NONE = 0, PATTERN_NOISE = 1, PATTERN_STRIPES = 2, PATTERN_CHECKER = 3, PATTERN_DOTS = 4;
 // G-buffer normal.a flag bits (x 255)
 const int FLAG_OCCLUDER = 1, FLAG_CASTS_SHADOW = 2, FLAG_LIT = 4;
-const int FLAG_NO_EMIT = 8;  // a body's black border (filled view): lit, but it doesn't glow with the body
+// a body's black border (filled view): lit, but it doesn't glow with the body nor turn see-through / mirror
+const int FLAG_BORDER = 8;
 
 struct Mat {
     vec3 tint;
