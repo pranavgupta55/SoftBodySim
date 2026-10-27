@@ -49,9 +49,9 @@ XPBD_REF_H = 1 / 240
 XPBD_REF_ITERATIONS = 4
 XPBD_CALIBRATION = 1.0
 GRAB_AREA_MIN_WEIGHT = 0.05  # an area grab skips points whose Gaussian pull weight is below this
-GRAB_AREA_SIGMA = 1.0  # the area grab's Gaussian sigma, x the circle's radius (w ~ 0.61 on the circle)
-GRAB_AREA_REACH = 2.0  # it holds points out to this x the radius (w ~ 0.14 there)
-GRAB_AREA_FORCE = 0.35  # its pull (stiffness and speed cap) relative to the single-point grab's
+GRAB_AREA_SIGMA = 0.75  # the area grab's Gaussian sigma, x the circle's radius; the curve is shifted and
+# rescaled so the pull is 1 at the cursor and falls to exactly 0 on the circle (nothing outside it is held)
+GRAB_AREA_FORCE = 0.1  # its pull (stiffness and speed cap) relative to the single-point grab's
 
 
 def spring_compliance(stiffness, count):
@@ -406,11 +406,12 @@ class World:
         # target = cursor + offset starts at the point itself and moves with the cursor (in the point's own frame,
         # so a copy across the seam is held where it is)
         off = self.P - c
-        # Gaussian falloff, sigma = GRAB_AREA_SIGMA x radius, out to GRAB_AREA_REACH x radius; points too weak to
+        # Gaussian falloff (sigma = GRAB_AREA_SIGMA x radius) shifted to reach 0 on the circle; points too weak to
         # matter aren't held
         sigma = max(float(radius), 1e-9) * GRAB_AREA_SIGMA
-        weight = np.exp(-dist ** 2 / (2 * sigma ** 2))
-        idx = np.flatnonzero((dist <= GRAB_AREA_REACH * radius) & (self.W > 0) & (weight >= GRAB_AREA_MIN_WEIGHT))
+        rim = math.exp(-float(radius) ** 2 / (2 * sigma ** 2))
+        weight = (np.exp(-dist ** 2 / (2 * sigma ** 2)) - rim) / (1.0 - rim)
+        idx = np.flatnonzero((dist <= radius) & (self.W > 0) & (weight >= GRAB_AREA_MIN_WEIGHT))
         if idx.size:
             self.grabbed = None
             self.grab_shift = np.zeros(2)
