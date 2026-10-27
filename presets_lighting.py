@@ -18,7 +18,7 @@ from lights import DIRECTIONAL, POINT, SPOT, Light
 from materials import PATTERN_CHECKER
 from solver import World
 
-BACKGROUND = [14, 14, 22]
+BACKGROUND = [96, 98, 112]
 AMBIENT = (0.10, 0.10, 0.14)
 POOL_OCTAGON_R = 13.0  # water octagons' circumradius (world units)
 POOL_ROWS = 3

@@ -47,6 +47,6 @@ void main() {
         }
     }
     f_color = vec4(col / 255.0, 1.0);
-    f_normal = vec4(0.5, 0.5, 0.0, 0.0);  // background: flat, no body, no flags
+    f_normal = vec4(0.5, 0.5, 0.0, 4.0 / 255.0);  // background: flat, lit (material 0 = default), not an occluder
     f_mat = 0u;
 }

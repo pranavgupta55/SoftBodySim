@@ -623,6 +623,7 @@ class GLWorld:
             body_mat[k] = i
         self.body_mat, self.n_materials = body_mat, len(table)
         packed = np.zeros((len(table), materials.TEXELS, 4), np.float32)
+        packed[0] = materials.pack(materials.resolve())  # row 0: the background (lit, default material)
         for i, m in enumerate(table[1:], 1):
             packed[i] = materials.pack(m)
         data = packed.tobytes()
