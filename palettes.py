@@ -41,19 +41,22 @@ PALETTES = {
     "lanterns": {"background": _hex("5a5866")[0], "wall": _hex("5a5866"),
                  "diamond": _hex("9a96a8", "8a8fa3", "a39a92"),
                  "hexagon": _hex("feae34", "f77622", "fee761", "e43b44", "2ce8f5", "0099db", "63c74d", "b55088")},
-    # a pumpkin by candlelight (paperheartdesign.com's Halloween palette): near-black room, dark wine walls, maroon
-    # tiles (and a shade between them), pumpkin orange and brick red shapes (and a shade between those). A fifth of
-    # its heptagons get eyes (pumpkin_eyes.py).
-    "pumpkin": {"background": _hex("170409")[0], "wall": _hex("3b1016"),
-                "diamond": _hex("67131a", "4f1218"), "hexagon": _hex("e27d56", "b3382f", "c95a41")},
+    # a pumpkin by candlelight (after paperheartdesign.com's Halloween palette): near-black room, dark wine walls,
+    # maroon tiles (and a shade between them), pumpkin orange and burnt orange shapes (and a shade between those).
+    # Made for maps/penrose/evolved 1 halloween, whose pumpkins (pumpkins.py) have eyes in every palette. (Called
+    # "pumpkin" at first: RENAMED maps the old name, e.g. in saved scenes.)
+    "halloween": {"background": _hex("170409")[0], "wall": _hex("3b1016"),
+                  "diamond": _hex("67131a", "4f1218"), "hexagon": _hex("ea8a3e", "c4522a", "d86d34")},
 }
 DEFAULT = "forest"
+RENAMED = {"pumpkin": "halloween"}  # old palette name -> its name now
 
 
 def apply_palette(world, name):
     """Recolor every body with a palette_role, and the background, from PALETTES[name]; remember it on the world.
     A world with `palette_background` set (a lit map's "background" rule, scene.apply_map_lighting) gets its
     background from lit_background instead of the palette's own."""
+    name = RENAMED.get(name, name)
     pal = PALETTES[name]
     materials = pal.get("materials", {})
     for body in world.bodies:

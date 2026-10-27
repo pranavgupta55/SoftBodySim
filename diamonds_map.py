@@ -672,10 +672,13 @@ def _dist_to_polygon(p, poly):
     return 0.0 if np.count_nonzero(straddle & (x < xc)) % 2 else d
 
 
-def place_hexagons(obstacles, world_w, world_h, count, seed=7, r_min=8.0, r_max=20.0, side=5.0, gap=6.0, tries=200):
+def place_hexagons(obstacles, world_w, world_h, count, seed=7, r_min=8.0, r_max=20.0, side=5.0, gap=6.0, tries=200,
+                   sizes=None):
     """Up to `count` non-overlapping circles (cx, cy, r, angle) for hexagons of circumradius r in [r_min, r_max],
     anywhere in the world between the side walls, each at least `gap` from every obstacle polygon (2, n) and from
-    the others. A hexagon lies inside its circle, so circle clearance is hexagon clearance. Seeded."""
+    the others. A hexagon lies inside its circle, so circle clearance is hexagon clearance. Seeded.
+    sizes: optional (lo, hi) radius range per circle (the k-th placed one draws from sizes[k] instead; the random
+    draws are the same, so None and [(r_min, r_max)] * count place identically)."""
     rng = np.random.default_rng(seed + 1)
     placed = []
     # Speed only, same results: each test is first narrowed to the circles / obstacles whose bounding box comes
@@ -687,8 +690,9 @@ def place_hexagons(obstacles, world_w, world_h, count, seed=7, r_min=8.0, r_max=
              if obstacles else np.empty((0, 4)))
     circles = np.empty((count, 3))  # the placed circles' x, y, r
     for _ in range(count):
+        lo, hi = (r_min, r_max) if sizes is None else sizes[len(placed)]
         for _ in range(tries):
-            r = float(rng.uniform(r_min, r_max))
+            r = float(rng.uniform(lo, hi))
             lo_x, hi_x = side + r + gap, world_w - side - r - gap
             c = np.array([rng.uniform(lo_x, hi_x), rng.uniform(r + gap, world_h - r - gap)])
             cx, cy, n = float(c[0]), float(c[1]), len(placed)
