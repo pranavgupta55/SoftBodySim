@@ -56,6 +56,7 @@ PRESETS = {
     "toon": Material(specular=0.7, roughness=0.3, bands=3),
 }
 FIELDS = {f.name for f in fields(Material)}
+_WHITE = Material().emissive  # the default emissive colour (of_body: "nobody set it")
 
 
 def resolve(preset=None, overrides=None):
@@ -66,13 +67,35 @@ def resolve(preset=None, overrides=None):
     return replace(base, **{k: (tuple(v) if isinstance(v, list) else v) for k, v in overrides.items() if k in FIELDS})
 
 
+def body_hue(rgb):
+    """An RGB 0-255 colour as a 0..1 emissive of the same hue at full brightness (brightest channel 1), the way
+    palettes.glow_colour makes it; None for black or no colour."""
+    try:
+        c = [float(v) for v in rgb[:3]]
+    except (TypeError, ValueError, IndexError):
+        return None
+    top = max(c) if len(c) == 3 else 0.0
+    if not top > 0 or not np.isfinite(top):
+        return None
+    return tuple(round(max(v, 0.0) / top, 4) for v in c)
+
+
 def of_body(body):
     """A body's effective Material (its `material` / `material_over`, both optional). World box walls (wall_side)
-    cast no shadow unless their material says so: they'd shade the whole room from a directional light."""
+    cast no shadow unless their material says so: they'd shade the whole room from a directional light.
+    A glowing body (emissive_strength > 0) whose emissive colour nobody set (neither its preset nor material_over)
+    glows in its own colour's hue (body_hue of fill_col) instead of the default white: a bare "glow" body is a
+    lamp of its colour, not a flat white disc."""
     over = getattr(body, "material_over", None)
     if getattr(body, "wall_side", None) is not None and "casts_shadow" not in (over or {}):
         over = {**(over or {}), "casts_shadow": False}
-    return resolve(getattr(body, "material", None), over)
+    m = resolve(getattr(body, "material", None), over)
+    if (m.emissive_strength > 0 and "emissive" not in (over or {})
+            and PRESETS.get(getattr(body, "material", None) or DEFAULT, PRESETS[DEFAULT]).emissive == _WHITE):
+        hue = body_hue(getattr(body, "fill_col", None))
+        if hue is not None:
+            m = replace(m, emissive=hue)
+    return m
 
 
 # ---------------- GPU packing (gl_world.GLWorld.material_tex, shaders/material.glsl)
@@ -89,17 +112,56 @@ def of_body(body):
 # struct Mat with the same field names. Add new fields only in the reserved slots, and update both sides.
 TEXELS = 8
 
+# pack() sanitises at the GPU boundary (resolve / material_over keep whatever was typed, so editor and scene-file
+# values round-trip unchanged): NaN (or a non-number) becomes the field's default, then each field is clamped to
+# these ranges (+-inf to the nearest bound). In-range values pass through bit for bit. roughness <= 1 also keeps
+# shaders/light_accum.frag's shininess exp2(10 * (1 - roughness)) >= 1; ior <= 3 keeps refraction offsets sane.
+_D = Material()
+RANGES = {
+    "tint": (0.0, 16.0), "tint_strength": (0.0, 1.0), "emissive": (0.0, 16.0), "emissive_strength": (0.0, 8.0),
+    "specular": (0.0, 1.0), "roughness": (0.0, 1.0), "bands": (0, 16), "bevel_px": (0.0, 64.0), "ior": (1.0, 3.0),
+    "reflectivity": (0.0, 1.0), "transparency": (0.0, 1.0), "absorption": (0.0, 64.0), "pattern_scale": (0.5, 1e6),
+    "pattern_strength": (0.0, 1.0),
+}
+ENUMS = {"profile": (BEVEL, DOME, PILLOW), "kind": (OPAQUE, GLASS, MIRROR, FLUID),
+         "pattern": (PATTERN_NONE, PATTERN_NOISE, PATTERN_STRIPES, PATTERN_CHECKER, PATTERN_DOTS)}
+
+
+def _num(v, default):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return float(default)
+    return float(default) if v != v else v  # NaN -> the default
+
+
+def _field(m, name):
+    """One sanitised field of m (a float, or a tuple of 3 for colours)."""
+    v, d = getattr(m, name), getattr(_D, name)
+    if name in ENUMS:  # (rounded like mat_fetch does; unknown values -> the default)
+        v = _num(v, d)
+        return float(round(v)) if np.isfinite(v) and round(v) in ENUMS[name] else float(d)
+    lo, hi = RANGES[name]
+    if isinstance(d, tuple):
+        try:
+            vs = tuple(v)[:3] if len(v) >= 3 else d
+        except TypeError:
+            vs = d
+        return tuple(min(max(_num(c, dc), lo), hi) for c, dc in zip(vs, d))
+    return min(max(_num(v, d), lo), hi)
+
 
 def pack(material):
-    """(TEXELS, 4) float32: one material's row of the material table (layout above)."""
+    """(TEXELS, 4) float32: one material's row of the material table (layout above), sanitised (RANGES / ENUMS)."""
     m = material
+    f = {name: _field(m, name) for name in (*RANGES, *ENUMS)}
     rows = [
-        (*m.tint, m.tint_strength),
-        (*m.emissive, m.emissive_strength),
-        (m.specular, m.roughness, m.bands, m.bevel_px),
-        (m.profile, m.kind, m.ior, m.reflectivity),
-        (m.transparency, m.absorption, m.pattern, m.pattern_scale),
-        (m.pattern_strength, float(m.casts_shadow), float(m.lit), 0.0),
+        (*f["tint"], f["tint_strength"]),
+        (*f["emissive"], f["emissive_strength"]),
+        (f["specular"], f["roughness"], f["bands"], f["bevel_px"]),
+        (f["profile"], f["kind"], f["ior"], f["reflectivity"]),
+        (f["transparency"], f["absorption"], f["pattern"], f["pattern_scale"]),
+        (f["pattern_strength"], float(bool(m.casts_shadow)), float(bool(m.lit)), 0.0),
     ]
     out = np.zeros((TEXELS, 4), np.float32)
     out[:len(rows)] = rows

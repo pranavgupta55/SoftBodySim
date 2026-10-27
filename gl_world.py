@@ -703,10 +703,11 @@ class GLWorld:
         """Material ids per body (self.body_mat) and the material table, redone only when a body's material or
         material_over changed (or bodies were added / removed): per frame this is one comparison per body."""
         bodies = world.bodies
-        sig = [(getattr(b, "material", None), getattr(b, "material_over", None) or None) for b in bodies]
+        sig = [(getattr(b, "material", None), getattr(b, "material_over", None) or None,  # (+ fill_col: of_body's
+                tuple(() if getattr(b, "fill_col", None) is None else b.fill_col)) for b in bodies]  # glow hue)
         if sig == self._mat_sig:
             return
-        self._mat_sig = [(m, dict(o) if o else None) for m, o in sig]  # copies: in-place edits show up too
+        self._mat_sig = [(m, dict(o) if o else None, c) for m, o, c in sig]  # copies: in-place edits show up too
         table = [None, materials.resolve()]
         ids = {table[1]: 1}
 
