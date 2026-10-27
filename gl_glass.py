@@ -28,8 +28,10 @@ FLUID_SIGMA_WORLD x zoom px, wrapping on periodic axes) and thresholded at FLUID
 bodies merge into one liquid surface (gaps bridged, corners rounded); the field's gradient is its normal and its
 value its thickness, feeding the same resolve.
 
-Caustics (CausticsEffect): each light shoots CAUSTIC_RAYS rays through the march; points sampled along the rays
-after they were refracted / reflected are splatted additively into shared["caustics"] (RGBA16F), then a separable blur.
+Caustics (CausticsEffect): each light shoots CAUSTIC_RAYS evenly spaced rays, each marched once in a geometry shader
+(caustics_rays.geom); the straight pieces of a ray's path in open air after it was refracted (/ reflected) are drawn
+as additive lines into shared["caustics"] (RGBA16F), then a separable blur. Continuous lines, not points sampled along
+the rays: no dotted / grainy rays, and deterministic, so stable from frame to frame.
 """
 import os
 
@@ -70,13 +72,22 @@ FLUID_THICK_PX = 16.0  # thickness where the smoothed liquid is 1
 FLUID_SEARCH = 12  # px a bridge pixel looks around (8 directions) for a fluid body, for its material
 # ---- caustics
 CAUSTICS = False  # CausticsEffect runs only when this (its .enabled) or the world's `caustics` attribute is True
-CAUSTIC_RAYS = 2048  # per light
-CAUSTIC_SAMPLES = 48  # points per ray
-CAUSTIC_BLUR_PX = 3.0  # sigma of the separable blur over the deposited points
+CAUSTIC_RAYS = 4096  # per light
+CAUSTIC_SEG_PX = 32.0  # a ray's line is split into pieces this long (the light's falloff is linear along each)
+CAUSTIC_MAX_VERTS = 64  # geometry shader output per ray (a strip per air piece; 2 per piece on periodic maps)
+# Caustic rays refract on smoothed rim normals (a pre-pass, caustics_normals.frag; glass_common.rim_normal), not the
+# sdf gradient, whose pixel stairs (+-10 degrees and more) fan the light into streaks: the G-buffer bevel normals of
+# the rim, averaged over +-CAUSTIC_NORMAL_SMOOTH_PX along the outline (smooths polygon facets too). 0 px: off.
+CAUSTIC_NORMAL_SMOOTH_PX = 8.0
+CAUSTIC_NORMAL_TAPS = 4  # samples each side for that average
+CAUSTIC_NORMAL_DEPTH = 3  # px a tap looks inward past the outline for a rim pixel with a bevel normal
+CAUSTIC_NORMAL_CORNER_DEG = 35.0  # taps more than this off the hit's own normal are left out (corners stay sharp)
+CAUSTIC_RIM_BAND = 3.0  # rim pixels: within this many px of the body's edge
+CAUSTIC_BLUR_PX = 3.0  # sigma of the separable blur over the deposited lines
 CAUSTIC_MAX_T = 600.0  # px of ray path
 CAUSTIC_GAIN = 1.0
 CAUSTIC_MIRRORS = False  # also deposit light only mirrors bent (a flat mirror wall = a second, streaky light source)
-CAUSTIC_STEPS = 192  # march steps per caustic sample (rays cross the whole view)
+CAUSTIC_STEPS = 192  # march steps per caustic ray (rays cross the whole view)
 PUSHPULL_MIN = 8  # push-pull stops halving at this size (px): fewer, cheaper passes; holes this coarse are rare
 KINDS_EVERY = 10  # runs between rescans of the world's material kinds (skips the passes a world doesn't need)
 
@@ -115,15 +126,25 @@ def _read(name):
         return f.read()
 
 
-def program(ctx, frag, vert=None, sdf=False, **defines):
+_POINT_VERT = """#version 330 core
+void main() {
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+}
+"""
+
+
+def program(ctx, frag, vert=None, sdf=False, geom=None, **defines):
     """Compile a G program: #version, the constants (`defines` override them), [USE_SDF + S's sdf_shadow.glsl],
     F's material.glsl (Mat, mat_fetch, KIND_*), glass_common.glsl, then the shader (a fullscreen triangle vertex
-    shader unless `vert`). Own loader rather than FrameInfo.load: it needs the #defines and builds programs in make()
-    before any frame exists."""
+    shader unless `vert`; with a `geom` geometry shader, a bare point vertex shader). Own loader rather than
+    FrameInfo.load: it needs the #defines and builds programs in make() before any frame exists."""
     head = "#version 330 core\n" + _defines(**defines)
     if sdf:
         head += "#define USE_SDF\n" + _read("sdf_shadow.glsl") + "\n"
     head += _read("material.glsl") + "\n" + _read("glass_common.glsl") + "\n"
+    if geom:
+        return ctx.program(vertex_shader=_POINT_VERT, geometry_shader=head + _read(geom),
+                           fragment_shader=head + _read(frag))
     return ctx.program(vertex_shader=head + _read(vert) if vert else _FS_VERT, fragment_shader=head + _read(frag))
 
 
@@ -420,13 +441,24 @@ class CausticsEffect:
         key = (name, sdf)
         if key not in self.progs:
             if name == "rays":
-                p = program(self.ctx, "caustics_splat.frag", vert="caustics_rays.vert", sdf=sdf,
-                            MARCH_STEPS=CAUSTIC_STEPS, CAUSTIC_MIRRORS=CAUSTIC_MIRRORS)
+                rim = {"USE_RIM_TEX": 1} if self._smooth() else {}
+                p = program(self.ctx, "caustics_splat.frag", geom="caustics_rays.geom", sdf=sdf,
+                            MARCH_STEPS=CAUSTIC_STEPS, CAUSTIC_MIRRORS=CAUSTIC_MIRRORS, CAUSTIC_PIECES=1,
+                            CAUSTIC_SEG_PX=float(CAUSTIC_SEG_PX), CAUSTIC_MAX_VERTS=CAUSTIC_MAX_VERTS, **rim)
+            elif name == "normals":
+                p = program(self.ctx, "caustics_normals.frag", sdf=sdf, RIM_SMOOTH_PX=float(CAUSTIC_NORMAL_SMOOTH_PX),
+                            RIM_TAPS=CAUSTIC_NORMAL_TAPS, RIM_DEPTH=CAUSTIC_NORMAL_DEPTH,
+                            RIM_CORNER=float(np.cos(np.radians(CAUSTIC_NORMAL_CORNER_DEG))),
+                            RIM_BAND=float(CAUSTIC_RIM_BAND))
             else:
                 p = program(self.ctx, "caustics_blur.frag", sdf=sdf, CAUSTIC_BLUR_PX=CAUSTIC_BLUR_PX)
             self.progs[key] = p
             self.vaos[key] = self.ctx.vertex_array(p, [])
         return self.progs[key], self.vaos[key]
+
+    @staticmethod
+    def _smooth():
+        return CAUSTIC_NORMAL_SMOOTH_PX > 0 and CAUSTIC_NORMAL_TAPS > 0
 
     def run(self, gw, frame):
         world = getattr(frame, "world", None)
@@ -442,6 +474,15 @@ class CausticsEffect:
         prev = ctx.fbo
         timer = _Timer(ctx, self.profile, self.queries)
         sdf = frame.shared.get("sdf")
+        ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
+        rim = None
+        if self._smooth():  # the smoothed rim normals the march refracts on
+            rim = self.pool.tex("rim", self.size, 2, "f2")
+            prog, vao = self._prog("normals", sdf is not None)
+            _common(prog, frame, sdf)
+            self.pool.fbo(rim).use()
+            vao.render(moderngl.TRIANGLES, vertices=3)
+            timer.lap("normals")
         raw = self.pool.tex("raw", self.size, 4, "f2")
         res = self.pool.tex("caustics", self.size, 4, "f2")
         fbo = self.pool.fbo(raw)
@@ -449,6 +490,9 @@ class CausticsEffect:
         fbo.clear(0.0, 0.0, 0.0, 0.0)
         prog, vao = self._prog("rays", sdf is not None)
         _common(prog, frame, sdf)
+        if rim is not None:
+            rim.use(13)
+            _set(prog, u_rim=13)
         zoom = float(frame.zoom)
         ctx.disable(moderngl.DEPTH_TEST)
         ctx.enable(moderngl.BLEND)
@@ -459,9 +503,9 @@ class CausticsEffect:
                  u_light_dir=tuple(float(c) for c in lt.dir), u_cone=float(np.radians(lt.cone_outer)),
                  u_light_col=tuple(float(c) * lt.intensity * CAUSTIC_GAIN for c in lt.color),
                  u_radius_px=max(float(lt.radius) * zoom, 1.0), u_falloff=float(lt.falloff),
-                 u_rays=CAUSTIC_RAYS, u_samples=CAUSTIC_SAMPLES, u_max_t=float(CAUSTIC_MAX_T),
+                 u_rays=CAUSTIC_RAYS, u_max_t=float(CAUSTIC_MAX_T),
                  u_size=tuple(float(s) for s in self.size))
-            vao.render(moderngl.POINTS, vertices=CAUSTIC_RAYS * CAUSTIC_SAMPLES)
+            vao.render(moderngl.POINTS, vertices=CAUSTIC_RAYS)
         ctx.disable(moderngl.BLEND)
         ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
         timer.lap("rays")
