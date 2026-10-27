@@ -152,7 +152,7 @@ def build_looping(world_width, world_height):
 
 
 FLUID_COUNT = 675  # dodecagons in the "fluid" preset
-FLUID_SIDES = 12  # their side count
+FLUID_SIDES = 12  # their side count (springs: every point to every other, the most a shape can have)
 FLUID_DEPTH = 0.4  # the share of the world's height they fill, from the bottom
 FLUID_BLUES = ([18, 60, 130], [90, 200, 240])  # darkest and lightest shade: each dodecagon is a random mix
 FLUID_FRICTION = 0.05  # slippery, so the pile flows (this world's own setting, World.env)
@@ -189,7 +189,7 @@ def build_fluid(world_width, world_height, count=FLUID_COUNT, seed=0):
             size = r * rng.uniform(0.85, 1.0)  # not all the same size, so they don't lock into a crystal
             angle = rng.uniform(0, 2 * math.pi / FLUID_SIDES)
             bodies.append(SoftBody(polygon_points(cx, cy, size, FLUID_SIDES, angle=angle), stiffness=0.1,
-                                   skip_sets=2, point_radius=2, **_style(col)))
+                                   skip_sets=FLUID_SIDES // 2 - 1, point_radius=2, **_style(col)))
         row += 1
     world.add_many(bodies)
     return world
