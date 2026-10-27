@@ -1,7 +1,8 @@
 """The "diamonds" preset's geometry: a tumbling-blocks rhombus tiling (the lattice of an isometric image, see
 maps/diamonds.json, which also gives the palette) laid over the world at any size, a seeded random pick of its
 diamonds that never forms a cup, plus placement of the falling hexagons. Pure geometry; scene.py turns the results
-into bodies.
+into bodies. penrose_tiles gives a Penrose P3 rhombus tiling (de Bruijn's pentagrid) in the same [(corners, rgb, kind)]
+form, for the "penrose" worlds: the picking rules work on any convex tiles.
 """
 import json
 import math
@@ -48,6 +49,60 @@ def lattice_diamonds(world_w, world_h, side, seed=7, palette=None, y0=0.0):
     # one draw per face in order: the same stream as drawing them one at a time
     picks = rng.integers(len(palette), size=len(corners)).tolist() if len(corners) else []
     return [(corners[k], list(palette[p]), faces[k % 3]) for k, p in enumerate(picks)]
+
+
+def pentagrid_offsets(seed):
+    """de Bruijn's five pentagrid offsets (gamma_0..4) for `seed`: random in [0, 1), shifted to sum exactly to 0, so
+    the dual tiling is a true Penrose (P3) tiling. Random offsets are regular (no three grid lines meet) almost surely."""
+    g = np.random.default_rng(seed).uniform(0.0, 1.0, 5)
+    g -= g.mean()
+    g[4] = -g[:4].sum()
+    return g
+
+
+def penrose_tiles(world_w, world_h, side, seed=1, palette=None, margin=None):
+    """Every rhombus of a Penrose P3 tiling with edge `side` that reaches into the world grown by `margin` (default
+    2 sides) on every side: [(corners (2, 4), rgb, kind)], kind "fat" (72 / 108 degree corners) or "thin" (36 / 144),
+    sorted by center (rows of y, then x), each a random palette color as lattice_diamonds gives them.
+    de Bruijn's pentagrid: grid lines x.e_j + gamma_j = k (e_j five unit vectors 72 degrees apart, gamma_j from
+    pentagrid_offsets(seed), summing to 0); each crossing of a family-r line with a family-s line is one rhombus,
+    whose corners are side * sum_j K_j e_j for the integer K_j = ceil(x.e_j + gamma_j) of the four grid cells around
+    the crossing. The tiling depends only on `seed` and `side` (never on the world size), so tile keys are stable."""
+    if palette is None:
+        palette = [c for c in load_tiling()["palette"] if sum(c) > 230]
+    margin = 2 * side if margin is None else margin
+    e = np.array([[math.cos(2 * math.pi * j / 5), math.sin(2 * math.pi * j / 5)] for j in range(5)])  # (5, 2)
+    gamma = pentagrid_offsets(seed)
+    # a grid point p lands near side * (2.5 p + sum_j gamma_j e_j) (sum_j (p.e_j) e_j = 2.5 p): the grid region that
+    # covers the grown world, padded by 2 grid units
+    shift = gamma @ e
+    lo = (np.array([-margin, -margin]) / side - shift) / 2.5 - 2
+    hi = (np.array([world_w + margin, world_h + margin]) / side - shift) / 2.5 + 2
+    box = np.array([[lo[0], lo[1]], [hi[0], lo[1]], [lo[0], hi[1]], [hi[0], hi[1]]])
+    proj = box @ e.T + gamma  # (4, 5): each family's line index at the region's corners
+    ks = [np.arange(math.floor(proj[:, j].min()) - 1, math.ceil(proj[:, j].max()) + 2) for j in range(5)]
+    corners, kinds = [], []
+    for r in range(5):
+        for s in range(r + 1, 5):
+            kr, kss = (a.ravel() for a in np.meshgrid(ks[r], ks[s], indexing="ij"))
+            a = np.array([e[r], e[s]])  # p.e_r = kr - gamma_r, p.e_s = ks - gamma_s
+            p = np.linalg.solve(a, np.array([kr - gamma[r], kss - gamma[s]])).T  # (n, 2) crossings
+            k = np.ceil(p @ e.T + gamma)  # (n, 5) the cell's indices; families r and s are on their lines
+            k[:, r], k[:, s] = kr, kss
+            dr, ds = np.eye(5)[r], np.eye(5)[s]
+            quad = np.stack([k, k + dr, k + dr + ds, k + ds], axis=1)  # (n, 4, 5) the 4 cells around the crossing
+            corners.append(side * np.einsum("nqj,jd->ndq", quad, e))  # (n, 2, 4)
+            kinds += ["fat" if s - r in (1, 4) else "thin"] * len(kr)
+    corners = np.concatenate(corners)
+    kinds = np.array(kinds)
+    lo_c, hi_c = corners.min(axis=2), corners.max(axis=2)
+    keep = np.flatnonzero((hi_c[:, 0] >= -margin) & (lo_c[:, 0] <= world_w + margin)
+                          & (hi_c[:, 1] >= -margin) & (lo_c[:, 1] <= world_h + margin))
+    centers = corners[keep].mean(axis=2)
+    keep = keep[np.lexsort((np.round(centers[:, 0], 1), np.round(centers[:, 1], 1)))]
+    rng = np.random.default_rng(seed)
+    picks = rng.integers(len(palette), size=len(keep)).tolist()
+    return [(corners[i], list(palette[c]), str(kinds[i])) for i, c in zip(keep, picks)]
 
 
 def _corner_arc(poly, k):
@@ -121,6 +176,14 @@ def layout_shift(path):
         return tuple(float(v) for v in json.load(f).get("shift", (0.0, 0.0)))
 
 
+def layout_tiling(path):
+    """A saved layout's tiling: {"tiling": "diamonds"} (the default, for files without one) or {"tiling": "penrose",
+    "pentagrid_seed": int, "edge": float} (penrose_tiles' seed and edge length, so it rebuilds identically)."""
+    with open(path) as f:
+        data = json.load(f)
+    return {k: data[k] for k in ("tiling", "pentagrid_seed", "edge") if k in data} or {"tiling": "diamonds"}
+
+
 def shift_diamonds(diamonds, shift, world_w, world_h):
     """[(corners, rgb)] translated by shift (dx, dy); one that ends up wholly past the right / bottom edge comes back
     one world width / height over (the world loops on every side). Ones straddling an edge stay put: the seams are
@@ -137,11 +200,12 @@ def shift_diamonds(diamonds, shift, world_w, world_h):
     return out
 
 
-def save_layout(path, diamonds, size, note="", spawn=None, keys=None):
+def save_layout(path, diamonds, size, note="", spawn=None, keys=None, tiling=None):
     """Write the picked diamonds' tile keys ([(corners, rgb)] from pick_diamonds, or `keys` directly), the world size
-    they were picked for and (optional) the layout's own shape spawning settings to `path` as JSON."""
+    they were picked for, (optional) the layout's own shape spawning settings and (optional) its tiling (a dict, see
+    layout_tiling; left out for the default diamonds tiling) to `path` as JSON."""
     keys = [tile_key(c) for c, _ in diamonds] if keys is None else [list(k) for k in keys]
-    data = {"note": note, "size": list(size), **({"spawn": spawn} if spawn else {}), "tiles": keys}
+    data = {"note": note, "size": list(size), **(tiling or {}), **({"spawn": spawn} if spawn else {}), "tiles": keys}
     with open(path, "w") as f:
         json.dump(data, f, indent=0)
 

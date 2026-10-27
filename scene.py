@@ -158,11 +158,41 @@ DIAMONDS_SPAWN = {
 DIAMONDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "diamonds")
 DIAMONDS_LAYOUT = os.path.join(DIAMONDS_DIR, "evolved 1.json")  # the default one
 
+# the "penrose" worlds: the same scene over a Penrose P3 rhombus tiling (diamonds_map.penrose_tiles) instead
+PENROSE_SIDE = 24.0  # edge length of its fat (72 degree) and thin (36 degree) rhombi
+PENROSE_SEED = 1  # the pentagrid offsets' seed of a new layout (saved layouts keep their own)
+# a fat rhombus per golden ratio of thin ones: the mean tile area
+_PHI = (1 + math.sqrt(5)) / 2
+PENROSE_MEAN_AREA = PENROSE_SIDE ** 2 * (_PHI * math.sin(math.radians(72)) + math.sin(math.radians(36))) / (_PHI + 1)
+PENROSE_SPAWN = {
+    **DIAMONDS_SPAWN,
+    # tiles per square world unit: the same share of the world's area as maps/diamonds/evolved 3 (302 diamonds,
+    # each a 60 degree rhombus of edge DIAMOND_SIDE): 10.3%, ~464 Penrose tiles on 1800x1169
+    "density": 302 * DIAMOND_SIDE ** 2 * math.sin(math.radians(60)) / PENROSE_MEAN_AREA / (1800 * 1169),
+}
+PENROSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "penrose")
 
-def diamonds_spawn(layout=None, spawn=None):
-    """The shape spawning settings for a diamonds world: DIAMONDS_SPAWN, then the layout file's own, then `spawn`."""
+
+def _layout_tiling(layout, tiling=None, pentagrid_seed=None):
+    """{"tiling": ..., "pentagrid_seed": ..., "edge": ...} a diamonds world is built on: the layout file's own (if
+    `layout` is one), else `tiling` ("diamonds" by default) and, for "penrose", `pentagrid_seed` (PENROSE_SEED)."""
+    from diamonds_map import layout_tiling
+    if isinstance(layout, str):
+        info = layout_tiling(layout)
+    else:
+        info = {"tiling": tiling or "diamonds"}
+    if info["tiling"] == "penrose":
+        info.setdefault("pentagrid_seed", PENROSE_SEED if pentagrid_seed is None else pentagrid_seed)
+        info.setdefault("edge", PENROSE_SIDE)
+    return info
+
+
+def diamonds_spawn(layout=None, spawn=None, tiling=None):
+    """The shape spawning settings for a diamonds world: DIAMONDS_SPAWN (PENROSE_SPAWN on the penrose tiling: the
+    layout file's own, else `tiling`), then the layout file's own, then `spawn`."""
     from diamonds_map import layout_spawn
-    out = dict(DIAMONDS_SPAWN)
+    penrose = _layout_tiling(layout, tiling)["tiling"] == "penrose"
+    out = dict(PENROSE_SPAWN if penrose else DIAMONDS_SPAWN)
     if isinstance(layout, str):
         out.update(layout_spawn(layout))
     out.update(spawn or {})
@@ -170,7 +200,7 @@ def diamonds_spawn(layout=None, spawn=None):
 
 
 def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=INSET, layout=DIAMONDS_LAYOUT,
-                         remove=0, add=0, add_seed=0, spawn=None):
+                         remove=0, add=0, add_seed=0, spawn=None, tiling=None, pentagrid_seed=None):
     """"diamonds" preset (fullscreen in main_opengl: the panel floats over it; grid off): fixed diamonds from a
     tumbling-blocks tiling (edge DIAMOND_SIDE, its top row at the top edge; never two that form a cup,
     diamonds_map.forms_cup, even across the wraps), and soft shapes (hexagons and heptagons, half each) of random
@@ -183,21 +213,30 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     layout: a saved layout file (DIAMONDS_LAYOUT) or (tile keys, world size it was made for); its diamonds that fit
     this world are used, and a bigger world than the one it was made for is topped up with random ones past it.
     None: a seeded random layout of the spawn settings' diamond density. remove / add / add_seed: a variant of it with that many diamonds
-    dropped and added (diamonds_map.pick_diamonds)."""
-    from diamonds_map import (lattice_diamonds, layout_shift, load_layout, pick_diamonds, place_hexagons,
-                              shift_diamonds)
+    dropped and added (diamonds_map.pick_diamonds).
+    tiling: "diamonds" (default) or "penrose": a Penrose P3 tiling (diamonds_map.penrose_tiles, edge PENROSE_SIDE,
+    pentagrid offsets seeded by `pentagrid_seed`, default PENROSE_SEED) whose picked rhombi are the obstacles, by the
+    same cup / cluster rules. A layout file's own tiling ("tiling", "pentagrid_seed", "edge") overrides both."""
+    from diamonds_map import (lattice_diamonds, layout_shift, load_layout, penrose_tiles, pick_diamonds,
+                              place_hexagons, shift_diamonds)
     from palettes import DEFAULT, apply_palette
 
-    spawn = diamonds_spawn(layout, spawn)
+    info = _layout_tiling(layout, tiling, pentagrid_seed)
+    spawn = diamonds_spawn(layout, spawn, info["tiling"])
 
     world = World()
     add_world_box(world, world_width, world_height, inset)
     for side in ("top", "bottom", "left", "right"):
         world.set_looping(side, True)
     world.show_grid = False  # the G grid overlay starts off here (main_opengl keeps G per world)
-    tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed, y0=DIAMOND_SIDE)
+    if info["tiling"] == "penrose":
+        side = float(info["edge"])
+        tiles = penrose_tiles(world_width, world_height, side, seed=int(info["pentagrid_seed"]))
+    else:
+        side = DIAMOND_SIDE
+        tiles = lattice_diamonds(world_width, world_height, DIAMOND_SIDE, seed=seed, y0=DIAMOND_SIDE)
     keys, size = load_layout(layout) if isinstance(layout, str) else layout if layout is not None else (None, None)
-    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=DIAMOND_SIDE, gap=CUP_GAP,
+    diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=CUP_GAP,
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
                              add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)))
     if isinstance(layout, str):  # the layout file's own offset (diamonds_map.layout_shift), if any
@@ -237,15 +276,19 @@ PRESETS = {
 PRESETS.update(BASIC_PRESETS)  # blank, random walls, looping (presets_basic.py)
 
 
-def diamonds_presets():
-    """{"diamonds/<name>": builder} for each saved layout in DIAMONDS_DIR (a folder on the Worlds panel)."""
+def diamonds_presets(folder=DIAMONDS_DIR, prefix="diamonds"):
+    """{"<prefix>/<name>": builder} for each saved layout in `folder` (a folder on the Worlds panel): DIAMONDS_DIR's
+    as "diamonds/<name>", PENROSE_DIR's as "penrose/<name>" (each file says its own tiling)."""
     from functools import partial
-    names = sorted(f[:-5] for f in os.listdir(DIAMONDS_DIR) if f.endswith(".json"))
-    return {f"diamonds/{n}": partial(build_diamonds_scene, layout=os.path.join(DIAMONDS_DIR, n + ".json"))
+    if not os.path.isdir(folder):
+        return {}
+    names = sorted(f[:-5] for f in os.listdir(folder) if f.endswith(".json"))
+    return {f"{prefix}/{n}": partial(build_diamonds_scene, layout=os.path.join(folder, n + ".json"))
             for n in names}
 
 
-# the diamonds folder goes right after the default scene (first in the Worlds panel's list)
-PRESETS = {"default": PRESETS["default"], **diamonds_presets(), **{k: v for k, v in PRESETS.items() if k != "default"}}
+# the diamonds and penrose folders go right after the default scene (first in the Worlds panel's list)
+PRESETS = {"default": PRESETS["default"], **diamonds_presets(), **diamonds_presets(PENROSE_DIR, "penrose"),
+           **{k: v for k, v in PRESETS.items() if k != "default"}}
 # presets built across the whole window with no sidebar; H shows / hides it as a panel floating over the world
-FULLSCREEN_PRESETS = {name for name in PRESETS if name.startswith("diamonds/")}
+FULLSCREEN_PRESETS = {name for name in PRESETS if name.startswith(("diamonds/", "penrose/"))}
