@@ -8,6 +8,9 @@ remembers its palette in `World.palette` (None: it has no palettes, and the card
 The card is a sidebar card provider (card_height / place / draw_card, see hud_layer.py), shown by main_opengl.py only
 while the active world has a palette: a button per palette, its name and a strip of its colors, and a button that
 hides the panel (H; main_opengl.py floats the sidebar over its fullscreen worlds).
+
+A palette may also give roles a lit-renderer material (optional "materials": {role: materials.PRESETS name}); it goes
+only to bodies without a material of their own (see _palette_material).
 """
 import pygame
 
@@ -37,14 +40,32 @@ DEFAULT = "forest"
 def apply_palette(world, name):
     """Recolor every body with a palette_role, and the background, from PALETTES[name]; remember it on the world."""
     pal = PALETTES[name]
+    materials = pal.get("materials", {})
     for body in world.bodies:
         role = getattr(body, "palette_role", None)
         if role in pal:
             cols = pal[role]
             col = list(cols[int(getattr(body, "palette_pick", 0)) % len(cols)])
             body.point_col, body.stick_col, body.fill_col = col, col, col
+        if role is not None:
+            _palette_material(body, materials.get(role))
     world.background = list(pal["background"])
     world.palette = name
+
+
+def _palette_material(body, preset):
+    """A palette's material for the body's role (its optional "materials": {role: materials.PRESETS name}), only on a
+    body without a material of its own: one it has none of, or the one the last palette gave it (palette_material)."""
+    own = getattr(body, "material", None)
+    given = getattr(body, "palette_material", None)
+    if own is not None and own != given:
+        return  # set by hand (the Material card) or by the scene: kept
+    body.material = preset
+    if preset is None:
+        if given is not None:
+            body.palette_material = None
+    else:
+        body.palette_material = preset
 
 
 def palette_colors(name):

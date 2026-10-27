@@ -114,6 +114,11 @@ class Body:
     # contacts, 1 = perfectly elastic. Treats the bodies as balls (impulses through the centres, no spin), e.g. the
     # Newton's cradle. Set it before World.add.
     restitution = 0.0
+    # How the lit renderer draws it (materials.py; research/lighting_contract.md): a materials.PRESETS name (None:
+    # materials.DEFAULT) and a dict of Material fields overriding it. Nothing else reads them; other code uses
+    # getattr defaults (materials.of_body), so objects without them still work.
+    material = None
+    material_over = None
 
     def __init__(self, points=None, vels=None, mass=1.0, point_col=None, stick_col=None, point_radius=2, stick_width=1,
                  fill_col=None):
@@ -129,6 +134,7 @@ class Body:
         self.fill_col = self.point_col if fill_col is None else fill_col  # used by the filled shape view
         self.point_radius = point_radius
         self.stick_width = stick_width
+        self.material, self.material_over = None, {}
 
         idx = np.arange(n)
         if n >= 3:

@@ -80,6 +80,7 @@ class ViewConfig:
     filled = False  # V: filled polygons instead of points + springs (starts on points: view mode 1)
     outlines = True  # with filled: black borders on the polygons (V cycles points -> filled -> no outlines)
     trails = False  # T: fading motion trails behind moving bodies (trails.py)
+    lighting = False  # L: lit renderer (materials, lights, shadows, glass; research/lighting_contract.md)
     zoom = 0.5  # render pixels per world unit: 0.5 shows twice as much world each way
     # share of the screen width taken by the right-hand sidebar (all the cards); the world fills the rest. The sidebar
     # is at least wide enough for legible cards (ui_style.sidebar_rect), e.g. 158 px (12%) on a 1280 px screen
@@ -317,12 +318,14 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
 # Imported last: preset modules import from here.
 from presets_cradle import build_newtons_cradle  # noqa: E402
 from presets_basic import PRESETS as BASIC_PRESETS  # noqa: E402
+from presets_lighting import build_lighting_demo  # noqa: E402
 
 PRESETS = {
     "default": build_scene,
     "newtons cradle": build_newtons_cradle,
 }
 PRESETS.update(BASIC_PRESETS)  # blank, random walls, looping (presets_basic.py)
+PRESETS["lighting demo"] = build_lighting_demo  # the lit renderer's showcase (presets_lighting.py); starts lit
 
 
 def diamonds_presets(folder=DIAMONDS_DIR, prefix="diamonds"):
@@ -340,4 +343,4 @@ def diamonds_presets(folder=DIAMONDS_DIR, prefix="diamonds"):
 PRESETS = {"default": PRESETS["default"], **diamonds_presets(), **diamonds_presets(PENROSE_DIR, "penrose"),
            **{k: v for k, v in PRESETS.items() if k != "default"}}
 # presets built across the whole window with no sidebar; H shows / hides it as a panel floating over the world
-FULLSCREEN_PRESETS = {name for name in PRESETS if name.startswith(("diamonds/", "penrose/"))}
+FULLSCREEN_PRESETS = {name for name in PRESETS if name.startswith(("diamonds/", "penrose/"))} | {"lighting demo"}

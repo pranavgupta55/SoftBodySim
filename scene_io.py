@@ -31,6 +31,11 @@ chain piece's "chain_id" (renumbered on load, so it never clashes with the sessi
 top-level "state" with the world's looping sides, its tagged walls (by body index, or "detached" when a looping side's
 wall is out of the body list), pending walls, bounds and terminal velocity.
 
+Lit renderer data (research/lighting_contract.md; optional, absent in older files): a body's "material" (a
+materials.PRESETS name) and "material_over" ({Material field: value}), and in "state": "lights" (lights.Light.to_dict
+each, moved with the scene), "ambient" ([r, g, b] linear) and "lighting" (the world starts lit; written by
+scene_data / preset_data only, so an undo step never switches lighting).
+
 Every loaded state is validated (state_problems) before it replaces the world: the collision system assumes it starts
 from an intersection-free state, so no crossing edges and every point at least load_gap() from other bodies' edges
 (containment is fine). The editor's placement rule (contact_radius) is stricter; the shipped examples meet it.
@@ -73,7 +78,7 @@ def current_env(world=None):
 DEFAULT_ENV = current_env()  # applied when a preset (which has no env of its own) is loaded
 _KINDS = ((SoftBody, "soft"), (RigidBody, "rigid"), (FixedBody, "fixed"), (Body, "body"))
 _CLASSES = {"soft": SoftBody, "rigid": RigidBody, "fixed": FixedBody, "body": Body}
-BODY_EXTRAS = ("restitution", "wall_side", "palette_role", "palette_pick")  # optional per-body settings (numbers / strings), saved when present
+BODY_EXTRAS = ("restitution", "wall_side", "palette_role", "palette_pick", "palette_material")  # optional per-body settings (numbers / strings), saved when present
 SIDES = ("left", "right", "top", "bottom")
 
 
@@ -140,7 +145,39 @@ def _body_dict(b, arr, col, wall=False):
             d[name] = float(v)
         elif isinstance(v, str):
             d[name] = v
+    _put_material(d, b)
     return d
+
+
+def _plain(v):
+    """A material / light setting as plain JSON data: tuples and arrays become lists of floats, numpy scalars plain."""
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        return float(v)
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return [_plain(x) for x in v]
+    return v
+
+
+def _put_material(d, b):
+    """The lit renderer's material of a body (materials.py): "material" (a preset name) and "material_over" (a dict of
+    Material fields), each saved only when set."""
+    name = getattr(b, "material", None)
+    if isinstance(name, str):
+        d["material"] = name
+    over = getattr(b, "material_over", None)
+    if isinstance(over, dict) and over:
+        d["material_over"] = {str(k): _plain(v) for k, v in over.items()}
+
+
+def _get_material(b, d):
+    if isinstance(d.get("material"), str):
+        b.material = d["material"]
+    if isinstance(d.get("material_over"), dict):
+        b.material_over = {str(k): (tuple(v) if isinstance(v, list) else v) for k, v in d["material_over"].items()}
 
 
 def _world_state(world, index, arr, col):
@@ -167,6 +204,21 @@ def _world_state(world, index, arr, col):
     tv = getattr(world, "terminal_velocity", None)
     if isinstance(tv, (int, float)) and not isinstance(tv, bool) and math.isfinite(tv):
         st["terminal_velocity"] = float(tv)
+    st.update(_lighting_state(world))
+    return st
+
+
+def _lighting_state(world):
+    """The lit renderer's world settings (lights.py), saved when the world has them: "lights" (Light.to_dict each),
+    "ambient" (linear RGB). The lighting switch itself ("lighting") is a view setting: scene_data / preset_data add it,
+    undo snapshots leave it out (Z never turns lighting on or off)."""
+    st = {}
+    lights = getattr(world, "lights", None)
+    if lights:
+        st["lights"] = [{k: _plain(v) for k, v in light.to_dict().items()} for light in lights]
+    ambient = getattr(world, "ambient", None)
+    if ambient is not None:
+        st["ambient"] = [float(c) for c in ambient]
     return st
 
 
@@ -219,6 +271,8 @@ def _with_contents(data, world, box):
     """data plus the world's contents; the world's own friction / damping / terminal velocity (World.env) go in
     data["env"] only (a load puts them back into World.env), so a file states each setting once."""
     data.update(capture(world, box))
+    if isinstance(getattr(world, "lighting", None), bool):  # the lit renderer's switch (a file's, not an undo step's)
+        data.setdefault("state", {})["lighting"] = world.lighting
     ids = {}  # chain ids numbered 1, 2, ... in order (a load gives them fresh ones anyway): stable save -> load -> save
     for d in data["bodies"] + data["ropes"]:
         if "chain_id" in d:
@@ -296,6 +350,7 @@ def _build_body(d, k, off, moved):
     for name in BODY_EXTRAS:
         if name in d:
             setattr(b, name, d[name] if isinstance(d[name], str) else float(d[name]))
+    _get_material(b, d)
     return b
 
 
@@ -329,6 +384,14 @@ def build(data, offset=(0.0, 0.0), new_chains=False):
         for piece, d in zip(bodies + ropes, list(data["bodies"]) + list(data["ropes"])):
             _get_chain(piece, d, ids, new_chains)
         state = dict(data.get("state") or {})
+        if "lights" in state:  # Light objects (fresh ones: an undo step never shares them with the live world)
+            state["lights"] = [_light(d) for d in state["lights"]]
+            for light in state["lights"]:  # they move with the scene (a direction doesn't)
+                light.pos = (light.pos[0] + float(off[0, 0]), light.pos[1] + float(off[1, 0]))
+        if "ambient" in state:
+            state["ambient"] = tuple(float(c) for c in state["ambient"])
+            if len(state["ambient"]) != 3:
+                raise SceneError("malformed scene (ambient)")
         if "walls" not in state and "world" in data:  # an older file: tag its world box walls by where they lie
             sw, sh, si = (float(data["world"][k]) for k in ("width", "height", "inset"))
             tagged = {}
@@ -352,6 +415,26 @@ def build(data, offset=(0.0, 0.0), new_chains=False):
     except (KeyError, IndexError, TypeError, ValueError, AttributeError) as e:
         raise SceneError(f"malformed scene ({type(e).__name__}: {e})") from None
     return bodies, ropes, hooks, state
+
+
+def _light(d):
+    """A lights.Light from its saved dict, its numbers and colours checked."""
+    from lights import Light
+    light = Light.from_dict(d)
+    for name in ("pos", "dir", "color"):
+        v = getattr(light, name)
+        size = 3 if name == "color" else 2
+        v = tuple(float(c) for c in v)
+        if len(v) != size or not all(math.isfinite(c) for c in v):
+            raise SceneError(f"malformed light ({name})")
+        setattr(light, name, v)
+    for name in ("intensity", "radius", "falloff", "cone_inner", "cone_outer", "softness", "height"):
+        v = float(getattr(light, name))
+        if not math.isfinite(v):
+            raise SceneError(f"malformed light ({name})")
+        setattr(light, name, v)
+    light.kind, light.casts_shadows, light.enabled = str(light.kind), bool(light.casts_shadows), bool(light.enabled)
+    return light
 
 
 def _fit_walls(bodies, data, box):
@@ -506,6 +589,10 @@ def install(world, bodies, ropes, hooks, state=None):
         world.background = None
     if hasattr(world, "palette"):
         world.palette = None
+    if hasattr(world, "lights"):  # (no lights: lights.of_world's defaults; "lighting" is kept, see _lighting_state)
+        world.lights = []
+    if hasattr(world, "ambient"):
+        world.ambient = None
     if hasattr(world, "last_wraps"):
         world.last_wraps = []
     if hasattr(world, "_tick_acc"):  # no part-tick of the old scene's time carries over
@@ -515,6 +602,9 @@ def install(world, bodies, ropes, hooks, state=None):
         world.__dict__.pop("_periodic_wait", None)
         world.__dict__.pop("_wrap_wait", None)
     for key, value in (state or {}).items():
+        if key in LIGHTING_KEYS:  # optional on every World (lights.of_world reads them with defaults)
+            _install_lighting(world, key, value)
+            continue
         if not hasattr(world, key):
             continue
         if key == "looping" and isinstance(world.looping, dict):
@@ -530,6 +620,18 @@ def install(world, bodies, ropes, hooks, state=None):
         else:
             setattr(world, key, value)
     world._rebuild()
+
+
+LIGHTING_KEYS = ("lights", "ambient", "lighting")
+
+
+def _install_lighting(world, key, value):
+    if key == "lights":
+        world.lights = list(value)
+    elif key == "ambient":
+        world.ambient = tuple(value)
+    else:
+        world.lighting = bool(value)
 
 
 def apply_env(env, world=None):
