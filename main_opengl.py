@@ -588,7 +588,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
 
         # ---------------- Updating Screen
         profiler.switch("physics")
-        world.drag_to((wx, wy))
+        world.drag_to((wx, wy), ViewConfig.grab_area_radius if ViewConfig.grab_area else None)
         overlays.attach(world)  # World.debug: a step recorder while overlay 2 or 4 is on, else None
         # dt is in frames here, World wants seconds; the time scale applies to the physics only (timectl.py)
         stepped = not editor.paused

@@ -112,9 +112,11 @@ class World:
         self.hooks = []  # entities.Hook: fixed points for ropes; drawn only, never stepped or collided
         self.grabbed = None  # global index of the point being dragged
         self.grab_target = np.zeros(2)
-        # area grab (grab with a radius): (point indices (k,), offsets (2, k), radius); point j is pulled toward
-        # grab_target + its offset (in its own frame), so the held points keep their layout around the cursor
+        # area grab (grab with a radius): a force field around the cursor, re-picked every frame (drag_to):
+        # grab_set = (point indices (k,), offsets (2, k), radius, weights (k,)); point j is pulled toward
+        # grab_target + its offset, i.e. the cursor's copy nearest it (offset = minus its image shift)
         self.grab_set = None
+        self.grab_radius = None  # the area grab's radius while it is held, else None
         self.zone_count = 0  # how many CCD passes needed the rigid impact zone fallback (for debugging)
         self.projection_count = 0  # how many CCD passes the inelastic projection fallback fixed (for debugging)
         self.profiler = None  # optional profiler.Profiler: step() then times its phases (see _section)
@@ -396,34 +398,59 @@ class World:
             self.grab_target = np.array(pos, dtype=float) - shift if shift.any() else np.array(pos, dtype=float)
 
     def grab_area(self, pos, radius):
-        """Pick up every movable point within `radius` of pos, of any bodies (on either copy across a periodic seam):
-        grab_set. Each is pulled toward the cursor plus its offset from the cursor at the moment of the grab, so the
-        held region moves with the cursor like one piece while springs and contacts act on it."""
-        c = np.reshape(np.asarray(pos, dtype=float), (2, 1))
+        """Start an area grab: a force field pulling every movable point inside the circle of `radius` around the
+        cursor toward it (any body, either copy across a periodic seam), weighted by a Gaussian that falls to 0 on
+        the circle. Which points it holds is re-picked every frame (drag_to), so it acts like a constantly applied
+        force on whatever is under the circle."""
+        self.grabbed = None
+        self.grab_shift = np.zeros(2)
+        self.grab_target = np.array(pos, dtype=float)
+        self.grab_radius = float(radius)
+        self._area_pick()
+
+    def _area_pick(self):
+        """grab_set: the movable points inside the area grab's circle now, each with its Gaussian weight and the
+        offset to the cursor's copy nearest it."""
+        radius = self.grab_radius
+        c = np.reshape(self.grab_target, (2, 1))
         dist = np.hypot(*(self.P - c))
+        off = np.zeros_like(self.P)
         for s in looping.image_shifts(self.period):  # a point counts if any of its visible copies is in the circle
-            dist = np.minimum(dist, np.hypot(*(self.P + s[:, None] - c)))
-        # target = cursor + offset starts at the point itself and moves with the cursor (in the point's own frame,
-        # so a copy across the seam is held where it is)
-        off = self.P - c
+            d = np.hypot(*(self.P + s[:, None] - c))
+            nearer = d < dist
+            dist = np.where(nearer, d, dist)
+            off[:, nearer] = -s[:, None]  # that copy is at P + s, so the cursor is at c - s in the point's frame
         # Gaussian falloff (sigma = GRAB_AREA_SIGMA x radius) shifted to reach 0 on the circle; points too weak to
         # matter aren't held
-        sigma = max(float(radius), 1e-9) * GRAB_AREA_SIGMA
-        rim = math.exp(-float(radius) ** 2 / (2 * sigma ** 2))
+        sigma = max(radius, 1e-9) * GRAB_AREA_SIGMA
+        rim = math.exp(-radius ** 2 / (2 * sigma ** 2))
         weight = (np.exp(-dist ** 2 / (2 * sigma ** 2)) - rim) / (1.0 - rim)
         idx = np.flatnonzero((dist <= radius) & (self.W > 0) & (weight >= GRAB_AREA_MIN_WEIGHT))
-        if idx.size:
-            self.grabbed = None
-            self.grab_shift = np.zeros(2)
-            self.grab_target = np.array(pos, dtype=float)
-            self.grab_set = (idx, off[:, idx].copy(), float(radius), weight[idx])
+        self.grab_set = (idx, off[:, idx], radius, weight[idx]) if idx.size else None
 
-    def drag_to(self, pos):
+    def drag_to(self, pos, radius=None):
+        """Move the hand to pos (an area grab: also re-picks the points under it, with `radius` if given)."""
         shift = self.grab_shift
         self.grab_target = np.array(pos, dtype=float) - shift if shift.any() else np.array(pos, dtype=float)
+        if self.grab_radius is not None:
+            if radius is not None:
+                self.grab_radius = float(radius)
+            self._area_pick()
+
+    def grab_lines(self):
+        """The area grab's pull lines, one per body it holds: from the body's center (mean of all its points) to
+        the cursor's copy in that body's frame, and the mean weight of its held points: (2, m), (2, m), (m,)."""
+        idx, off, _, w = self.grab_set
+        ks, first, inv = np.unique(self.point_body[idx], return_index=True, return_inverse=True)
+        counts = np.bincount(inv)
+        mean_w = np.bincount(inv, weights=w) / counts
+        n_pts = self.P.shape[1]
+        ends = np.append(self.offsets, n_pts)
+        centers = np.stack([self.P[:, ends[k]:ends[k + 1]].mean(axis=1) for k in ks], axis=1)
+        return centers, self.grab_target[:, None] + off[:, first], mean_w
 
     def release(self):
-        self.grabbed = self.grab_set = None
+        self.grabbed = self.grab_set = self.grab_radius = None
         self.grab_shift = np.zeros(2)
 
     def _apply_grab(self, h):
@@ -693,10 +720,10 @@ class World:
             hk.draw(surface, zoom, filled, outlines)
         if self.grabbed is not None:
             pygame.draw.line(surface, (255, 255, 255), self.P[:, self.grabbed] * zoom, self.grab_target * zoom, 1)
-        if self.grab_set is not None:  # an area grab: each held point to its target
-            idx, off, _, w = self.grab_set  # opacity 0.5 * w, blended through a per-frame SRCALPHA layer
-            layer = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
-            for a, b, wi in zip(self.P[:, idx].T, (self.grab_target[:, None] + off).T, w):
+        if self.grab_set is not None:  # an area grab: a line per held body, center to cursor
+            layer = pygame.Surface(surface.get_size(), pygame.SRCALPHA)  # opacity 0.5 x its mean pull weight
+            ca, cb, w = self.grab_lines()
+            for a, b, wi in zip(ca.T, cb.T, w):
                 pygame.draw.line(layer, (255, 255, 255, int(round(127.5 * wi))), a * zoom, b * zoom, 1)
             surface.blit(layer, (0, 0))
 

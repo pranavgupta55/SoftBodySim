@@ -196,10 +196,10 @@ class WorldPacker:
         if world.grabbed is not None and nb:
             a, b = _px(world.P[:, world.grabbed] * zoom), _px(np.asarray(world.grab_target) * zoom)
             lines.append(np.array([[a[0], a[1], b[0], b[1], 1, pack_rgb([(255, 255, 255)])[0], layer, 0]]))
-        if getattr(world, "grab_set", None) is not None and nb:  # an area grab: each held point to its target
-            idx, off, _, w = world.grab_set  # opacity 0.5 * w: the pull's strength, half max with dozens held
-            a, b = _px(world.P[:, idx] * zoom), _px((np.asarray(world.grab_target)[:, None] + off) * zoom)
-            k = len(idx)
+        if getattr(world, "grab_set", None) is not None and nb:  # an area grab: a line per held body
+            ca, cb, w = world.grab_lines()  # center to cursor; opacity 0.5 x the body's mean pull weight
+            a, b = _px(ca * zoom), _px(cb * zoom)
+            k = len(w)
             lines.append(np.stack([a[0], a[1], b[0], b[1], np.ones(k), np.full(k, pack_rgb([(255, 255, 255)])[0]),
                                    np.full(k, layer), np.round(255 * (1 - 0.5 * w))], axis=1))
         cat = lambda xs, w: np.concatenate(xs).astype(np.int64) if xs else np.zeros((0, w), np.int64)
