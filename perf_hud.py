@@ -107,6 +107,12 @@ class PerfHUD:
     def card_height(self, compact=False):
         return card_height(compact or self.collapsed)
 
+    card_title = "Compute"
+
+    def header_status(self):
+        """The collapsed card's title row: the frame rate."""
+        return f"{self.prof.stats()['fps']:.0f} fps"
+
     def place(self, rect):
         self.rect = rect
 
@@ -130,7 +136,7 @@ class PerfHUD:
         y = rect.top + pad - px(1)
 
         # title + fps
-        title = self._text(surface, "Compute", (x0, y), style="bold", size=H.TITLE_SIZE)
+        title = H.card_title(surface, rect, "Compute")
         fps = self._text(surface, f"{st['fps']:.0f} fps", (x1, y), color=ui.ACCENT, style="bold", size=H.TITLE_SIZE, align="right")
         label = backend_label(self.world)
         if label:  # small and dim, bottom-aligned with the title; "auto" is dropped when the fps leaves no room

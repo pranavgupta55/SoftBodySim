@@ -100,6 +100,13 @@ class _Card:
     def world(self):
         return self.get_editor().world
 
+    @property
+    def card_title(self):  # (the sidebar's name for it, hud_layer.py)
+        return self.title
+
+    def header_status(self):
+        return self.status()
+
     def place(self, rect):
         self.rect = pygame.Rect(rect)
 
@@ -242,7 +249,7 @@ class _Card:
         r = self.rect.move(-ox, -oy)
         HUD.draw_frame(surface, r)
         pad, px = HUD.CARD_PAD, HUD.px
-        HUD.text(surface, self.title, (r.x + pad, r.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
+        HUD.card_title(surface, r, self.title)
         status = self.status()
         if status:
             HUD.text(surface, status, (r.right - pad, r.y + pad), ui.ACCENT, "bold", align="right")
@@ -262,6 +269,7 @@ class _Card:
 class MaterialCard(_Card):
     """The Material card for the active editor's picked bodies (see the module docstring)."""
     title = "Material"
+    auto_open = True  # contextual: opens in the sidebar whenever it appears (hud_layer.py)
 
     def bodies(self):
         """The picked bodies (chains' boxes included), in world order; [] when nothing is picked."""
@@ -399,7 +407,7 @@ class LightsCard(_Card):
 
     def card_height(self, compact=False):
         px, pad, gap = HUD.px, HUD.CARD_PAD, HUD.px(GAP)
-        return (pad + px(CARD_TITLE_H) + 3 * (px(BTN_H) + gap) + (len(LIGHT_SLIDERS) + 1) * px(ROW_H) + gap
+        return (pad + px(CARD_TITLE_H) + 4 * (px(BTN_H) + gap) + (len(LIGHT_SLIDERS) + 1) * px(ROW_H) + gap
                 + px(BTN_H) + gap + self._grid_height(len(self.editor.colors)) + pad)
 
     # ---------------- the world's lights
@@ -519,7 +527,10 @@ class LightsCard(_Card):
             else:
                 out.append((rect, ("button", name, light is not None, False, None)))
         y += px(BTN_H) + gap
-        for rect, field in self._button_row(y, ["casts_shadows", "enabled", "gi", "lighting"]):
+        # two rows of two: four labels this long don't fit one row at the sidebar's legible scale
+        rows = self._button_row(y, ["casts_shadows", "enabled"])
+        y += px(BTN_H) + gap
+        for rect, field in rows + self._button_row(y, ["gi", "lighting"]):
             if field == "gi":  # the world's radiance-cascade GI (gl_sdf.GiEffect): glowing bodies light the room
                 on = bool(getattr(self.world, "gi", False))
                 out.append((rect, ("button", "GI", on, False, self.toggle_gi)))

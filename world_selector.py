@@ -487,6 +487,11 @@ class WorldSession:
         h = pad + px(CARD_TITLE_H) + px(CARD_BTN_H) + pad - px(1)
         return h if compact else h + 2 * (px(BTN_GAP) + px(CARD_BTN_H))
 
+    card_title = "Worlds"
+
+    def header_status(self):
+        return "paused" if self.editor.paused else "running"
+
     def place(self, rect):
         self.card_rect = pygame.Rect(rect)
 
@@ -529,7 +534,7 @@ class WorldSession:
         r = self.card_rect.move(-ox, -oy)
         HUD.draw_frame(surface, r)
         px, pad = HUD.px, HUD.CARD_PAD
-        HUD.text(surface, "Worlds", (r.x + pad, r.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
+        HUD.card_title(surface, r, "Worlds")
         HUD.text(surface, "paused" if self.editor.paused else "running", (r.right - pad, r.y + pad), ui.ACCENT, "bold",
                  align="right")
         lay = self._card_layout()

@@ -95,6 +95,7 @@ def palette_colors(name):
 class PaletteCard:
     """The sidebar's Palette card for the active world (`get_world()`): a button per palette, then a hide-panel
     button that calls `on_hide()`."""
+    card_title = "Palette"
 
     def __init__(self, get_world, on_hide=None):
         self.get_world, self.on_hide = get_world, on_hide
@@ -108,6 +109,10 @@ class PaletteCard:
 
     def place(self, rect):
         self.rect = pygame.Rect(rect)
+
+    def header_status(self):
+        """Shown on the collapsed card's title row: the world's palette."""
+        return getattr(self.get_world(), "palette", None) or ""
 
     def _buttons(self):
         """[(palette name, rect)], then (None, the hide-panel button's rect), in native screen px."""
@@ -135,7 +140,7 @@ class PaletteCard:
         r = self.rect.move(-ox, -oy)
         HUD.draw_frame(surface, r)
         px, pad = HUD.px, HUD.CARD_PAD
-        HUD.text(surface, "Palette", (r.x + pad, r.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
+        HUD.card_title(surface, r, "Palette")
         current = getattr(self.get_world(), "palette", None)
         for name, rect in self._buttons():
             local, on = rect.move(-ox, -oy), name == current

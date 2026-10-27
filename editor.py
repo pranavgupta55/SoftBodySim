@@ -1169,6 +1169,8 @@ class Editor(SelectionTools):
         return pygame.Rect(max(ui.CARD_MARGIN, area.centerx - w // 2), max(ui.CARD_MARGIN, area.centery - h // 2), w, h)
 
     # ---------------- The Controls card: a sidebar card provider (hud_layer.py)
+    card_title = "Controls"
+
     def card_height(self, compact=False):
         """Native px at the current HUD scale. The card has no compact form, and its height doesn't depend on the
         editor's state (the action row is always there), so the sidebar's cards never move."""
@@ -1845,7 +1847,7 @@ class Editor(SelectionTools):
         rect = lay.card.move(-ox, -oy)
         HUD.draw_frame(surface, rect)
         px, pad, line_h = HUD.px, HUD.CARD_PAD, HUD.px(KEY_LINE_H)
-        HUD.text(surface, "Controls", (rect.x + pad, rect.y + pad - px(1)), ui.WHITE, "bold", HUD.TITLE_SIZE)
+        HUD.card_title(surface, rect, "Controls")
         for area, _, spec in self._card_widgets():
             if spec[0] != "blocker":
                 self._draw_widget(surface, area.move(-ox, -oy), spec, area.collidepoint(mouse_px), HUD)

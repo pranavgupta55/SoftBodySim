@@ -323,6 +323,7 @@ def check_app(frames):
             seen["off"] = not ViewConfig.lighting and lights_card not in hud.cards
             key(pygame.K_l)  # on again
             key(pygame.K_h)  # the panel
+            hud.set_open(lights_card)  # (the sidebar starts with it collapsed, hud_layer.DEFAULT_OPEN)
         elif i == 6:
             seen["cards_on"] = lights_card in hud.cards and ViewConfig.lighting
             rect = next(r for r, spec in lights_card.widgets() if spec[0] == "button" and spec[1] == "+point")
