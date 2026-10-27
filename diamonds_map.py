@@ -318,7 +318,7 @@ def cluster_settings(clusters):
 
 def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, gap=0.0, max_width=None,
                   layout=None, layout_size=None, remove=0, add=0, add_seed=0, count=None, cups="pair", cup_log=None,
-                  near=30.0, clusters=None, cluster_log=None):
+                  near=30.0, clusters=None, cluster_log=None, remove_order=None, add_order=None, check=False):
     """A seeded random `fraction` (or `count`) of the diamonds (corners, rgb, face) lying wholly inside the world (0, 0, world_w,
     world_h), which wraps on every side (looping, no walls). A diamond that would form a cup with one already picked
     (forms_cup; corners up to `gap` apart count as touching) is skipped and the next random one tried, as is one that
@@ -341,7 +341,13 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     clusters: archetype cluster settings (see CLUSTER_DEFAULTS; None or share 0: all random) for a random layout and
     for `add`: that share of the new tiles is grown as round / line clusters of touching tiles, each decision based on
     the tiles actually picked. `cluster_log`: a list that gets {"kind": "round" | "line", "tiles": [index into the
-    returned list...], "angle": degrees from horizontal, + leaning right (lines only)} for each archetype cluster."""
+    returned list...], "angle": degrees from horizontal, + leaning right (lines only)} for each archetype cluster.
+    Optional steering (evolve_layout's targeted mutation and crossover; left out, nothing changes): `remove_order`:
+    tile keys, the order `remove` tries the layout's tiles in (instead of a seeded random one; those not in the layout
+    are skipped); `add_order`: tile keys, the order `add` tries tiles in (instead of a seeded random permutation;
+    archetype clusters are still grown first); `check`: True: `layout`'s tiles are not trusted but picked by the
+    rules in the given order (any a rule vetoes is left out); a list of tile keys: only those are, after all the
+    others (trusted)."""
     eps = 1e-6
     stack = _stack(diamonds)  # (n, 2, corners) when they all have the same corner count: whole-array tests
     if stack is None:
@@ -496,6 +502,17 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
         growing.clear()
         return placed
 
+    def key_index():  # tile_key -> index into `inside`
+        if corners is not None:  # tile_key of every diamond at once (the same means, rounded the same way)
+            mx, my = corners[:, 0].mean(axis=1).tolist(), corners[:, 1].mean(axis=1).tolist()
+            return {(round(x, 1), round(y, 1)): k for k, (x, y) in enumerate(zip(mx, my))}
+        return {tuple(tile_key(d[0])): k for k, d in enumerate(inside)}
+
+    def steered(keys, among=None):  # tile keys -> indices into `inside` (those in `among`, if given), in order
+        index = key_index()
+        out = list(dict.fromkeys(index[tuple(key)] for key in keys if tuple(key) in index))
+        return out if among is None else [k for k in out if k in among]
+
     if layout is None:
         target = max(1, int(round(fraction * len(inside))))
         if settings is not None:
@@ -505,13 +522,14 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
         else:
             fill(np.random.default_rng(seed).permutation(len(inside)), target)
     else:
-        if corners is not None:  # tile_key of every diamond at once (the same means, rounded the same way)
-            mx, my = corners[:, 0].mean(axis=1).tolist(), corners[:, 1].mean(axis=1).tolist()
-            index = {(round(x, 1), round(y, 1)): k for k, (x, y) in enumerate(zip(mx, my))}
-        else:
-            index = {tuple(tile_key(d[0])): k for k, d in enumerate(inside)}
+        index = key_index()
         order = [index[tuple(key)] for key in layout if tuple(key) in index]
-        fill(order, len(order), trusted=True)
+        if check is True or not check:
+            fill(order, len(order), trusted=not check)
+        else:  # re-check only those in `check`, after all the others (trusted)
+            recheck = set(steered(check))
+            fill([k for k in order if k not in recheck], len(order), trusted=True)
+            fill([k for k in order if k in recheck], len(order))
         if layout_size is not None:  # top up the area past the layout's world (right / bottom strips)
             lw, lh = layout_size
             extra = [k for k, d in enumerate(inside) if d[0][0].max() > lw + eps or d[0][1].max() > lh + eps]
@@ -522,7 +540,8 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
     rng = np.random.default_rng([seed, add_seed])
     if remove and outline:  # drop some whose removal leaves no cup (a third tile can fill one), re-pick the rest
         drop, kept_set = set(), set(chosen)
-        for k in rng.permutation(chosen).tolist():
+        tries = rng.permutation(chosen).tolist() if remove_order is None else steered(remove_order, kept_set)
+        for k in tries:
             if len(drop) == min(remove, len(chosen)):
                 break
             kept_set.discard(k)
@@ -540,7 +559,10 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
         fill(kept, len(kept), trusted=True)
         banned |= drop
     elif remove:  # drop some, then re-pick the rest (a subset of a valid layout is valid)
-        drop = set(rng.choice(chosen, size=min(remove, len(chosen)), replace=False).tolist())
+        if remove_order is None:
+            drop = set(rng.choice(chosen, size=min(remove, len(chosen)), replace=False).tolist())
+        else:
+            drop = set(steered(remove_order, set(chosen))[:remove])
         kept = [k for k in chosen if k not in drop]
         chosen.clear()
         cluster.clear()
@@ -551,7 +573,7 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
         if settings is not None:  # the same share of them as archetype clusters (stochastic rounding)
             want = settings["share"] * add
             grow(rng, target, int(want) + int(rng.random() < want - int(want)))
-        fill(rng.permutation(len(inside)), target)
+        fill(rng.permutation(len(inside)) if add_order is None else steered(add_order), target)
     out = sorted(chosen)
     if cluster_log is not None:
         pos = {k: i for i, k in enumerate(out)}
