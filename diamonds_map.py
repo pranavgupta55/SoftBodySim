@@ -303,7 +303,7 @@ def save_layout(path, diamonds, size, note="", spawn=None, keys=None, tiling=Non
 # either way: every step adds the touching tile past either end lying closest to the axis), "round_share" of them
 # round; target sizes are drawn from "round_size" / "line_size" (inclusive). Every tile still has to pass the rules; a
 # cluster stops growing after "max_fails" vetoed or missing candidates.
-CLUSTER_DEFAULTS = {"share": 0.0, "round_share": 0.5, "round_size": [4, 8], "line_size": [4, 7],
+CLUSTER_DEFAULTS = {"share": 0.0, "round_share": 0.75, "round_size": [4, 8], "line_size": [4, 7],
                     "line_min_angle": 45.0, "max_fails": 3}
 
 
