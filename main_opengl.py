@@ -564,9 +564,6 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     ViewConfig.trails = not ViewConfig.trails
                 if event.key == pygame.K_b:  # B: grab the nearest point, or every point in a circle
                     ViewConfig.grab_area = not ViewConfig.grab_area
-            if event.type == pygame.MOUSEWHEEL and ViewConfig.grab_area:  # the wheel resizes the grab circle
-                r = ViewConfig.grab_area_radius * GRAB_AREA_WHEEL ** event.y
-                ViewConfig.grab_area_radius = min(GRAB_AREA_MAX, max(GRAB_AREA_MIN, r))
                 if pygame.K_1 <= event.key <= pygame.K_4:
                     overlays.toggle(event.key - pygame.K_1)
                 if event.key == pygame.K_LEFTBRACKET:
@@ -575,6 +572,9 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                     time_ctl.faster()
                 if event.key == pygame.K_n and editor.can_frame_step():
                     time_ctl.request_step()
+            if event.type == pygame.MOUSEWHEEL and ViewConfig.grab_area:  # the wheel resizes the grab circle
+                r = ViewConfig.grab_area_radius * GRAB_AREA_WHEEL ** event.y
+                ViewConfig.grab_area_radius = min(GRAB_AREA_MAX, max(GRAB_AREA_MIN, r))
 
         # ---------------- Updating Screen
         profiler.switch("physics")

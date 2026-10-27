@@ -151,17 +151,17 @@ def build_looping(world_width, world_height):
     return world
 
 
-FLUID_COUNT = 675  # dodecagons in the "fluid" preset
-FLUID_SIDES = 12  # their side count (springs: every point to every other, the most a shape can have)
+FLUID_COUNT = 675  # octagons in the "fluid" preset
+FLUID_SIDES = 8  # their side count (springs: every point to every other, the most a shape can have)
 FLUID_DEPTH = 0.4  # the share of the world's height they fill, from the bottom
-FLUID_BLUES = ([18, 60, 130], [90, 200, 240])  # darkest and lightest shade: each dodecagon is a random mix
+FLUID_BLUES = ([18, 60, 130], [90, 200, 240])  # darkest and lightest shade: each octagon is a random mix
 FLUID_FRICTION = 0.05  # slippery, so the pile flows (this world's own setting, World.env)
 
 
 def build_fluid(world_width, world_height, count=FLUID_COUNT, seed=0):
-    """A few hundred small soft dodecagons in shades of blue, packed into the bottom FLUID_DEPTH of the world, with low
+    """A few hundred small soft octagons in shades of blue, packed into the bottom FLUID_DEPTH of the world, with low
     friction so they slosh around like a fluid. Left / right looping is on (no side walls), so the x axis is periodic
-    (looping.py): the pile is one continuous ring, dodecagons near one edge press on those near the other, and what
+    (looping.py): the pile is one continuous ring, octagons near one edge press on those near the other, and what
     flows out one side comes in the other at the same height and speed."""
     from scene import Endesga, INSET, add_world_box
     world = World()
@@ -173,9 +173,9 @@ def build_fluid(world_width, world_height, count=FLUID_COUNT, seed=0):
     x0, x1 = INSET, world_width - INSET
     y1 = world_height - INSET
     depth = FLUID_DEPTH * world_height
-    # hex packing of circles (radius R, one per dodecagon) that fits `count` in the box: rows sqrt(3) R apart
+    # hex packing of circles (radius R, one per octagon) that fits `count` in the box: rows sqrt(3) R apart
     R = math.sqrt((x1 - x0) * depth / (2 * math.sqrt(3) * count))
-    r = R - 3.0  # each dodecagon's circumradius: a 6 unit gap to its neighbours and the walls (> contact_radius)
+    r = R - 3.0  # each octagon's circumradius: a 6 unit gap to its neighbours and the walls (> contact_radius)
     lo, hi = np.array(FLUID_BLUES[0], dtype=float), np.array(FLUID_BLUES[1], dtype=float)
     cols = int((x1 - x0) // (2 * R))
     left = x0 + ((x1 - x0) - cols * 2 * R) / 2  # center the rows (looping sides: no walls to touch)
