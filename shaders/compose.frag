@@ -1,5 +1,5 @@
 // Compose (gl_lights.py, effect order 300): the lit scene into GLWorld.tex.
-//     out = albedo * (ambient + light + gi + caustics) + spec + emissive
+//     out = albedo * (ambient + light + gi + caustics) + spec + emissive (none on a body's black border: flag bit3)
 // Unlit pixels (flag bit2 clear: background, grid, trails, lit=False bodies) keep their albedo unchanged. Missing
 // inputs are bound to a black texture. With u_levels > 0 the light term is quantised to that many levels per unit
 // with a 4x4 Bayer dither (gl_lights.LIGHT_LEVELS).
@@ -37,6 +37,7 @@ void main() {
         light = floor(light * u_levels + bayer4(px)) / u_levels;
     }
     Mat m = mat_fetch(u_mat_table, texelFetch(u_mat, px, 0).r);
-    vec3 col = albedo.rgb * light + texelFetch(u_spec, px, 0).rgb + m.emissive * m.emissive_strength;
+    vec3 emit = (flags & 8u) == 0u ? m.emissive * m.emissive_strength : vec3(0.0);  // (not on black borders)
+    vec3 col = albedo.rgb * light + texelFetch(u_spec, px, 0).rgb + emit;
     f_color = vec4(clamp(col, 0.0, 1.0), 1.0);
 }

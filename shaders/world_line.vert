@@ -3,7 +3,8 @@ in ivec4 in_ends;   // x1, y1, x2, y2: whole pixels (pygame truncates float endp
 in ivec4 in_style;  // width px, packed 0xBBGGRR colour, depth layer,
                     // transparency 0..255 (0 = opaque)
 in ivec2 in_mat;    // material id (-1: an overlay, drawn after the lit effects), kind: 0 flat normal, +1 / -1 a
-                    // body's rim (no-outline view) with that winding (normal tilted outward like a bevel's edge)
+                    // body's rim (no-outline view) with that winding (normal tilted outward like a bevel's edge),
+                    // 2 a body's black border (flat normal, FLAG_NO_EMIT: an emissive body's glow stops at its fill)
 
 flat out ivec4 v_ends;
 flat out int v_width;
