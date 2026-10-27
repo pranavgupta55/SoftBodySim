@@ -612,7 +612,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
                 trails.update(world, dt / fps, stepped)
             with profiler.section("world gl"):  # grid, trails and bodies into the GPU world layer
                 gpu_world.render(world, view.get_size(), ViewConfig.filled, ViewConfig.zoom, background,
-                                 outlines=ViewConfig.outlines,
+                                 outlines=ViewConfig.outlines, lighting=ViewConfig.lighting,
                                  grid=grid_colors(world.background) if ViewConfig.show_grid else None,
                                  trails=trails if ViewConfig.trails else None)
         else:

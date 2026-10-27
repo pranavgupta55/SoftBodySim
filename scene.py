@@ -80,6 +80,7 @@ class ViewConfig:
     filled = False  # V: filled polygons instead of points + springs (starts on points: view mode 1)
     outlines = True  # with filled: black borders on the polygons (V cycles points -> filled -> no outlines)
     trails = False  # T: fading motion trails behind moving bodies (trails.py)
+    lighting = False
     zoom = 0.5  # render pixels per world unit: 0.5 shows twice as much world each way
     # share of the screen width taken by the right-hand sidebar (all the cards); the world fills the rest. The sidebar
     # is at least wide enough for legible cards (ui_style.sidebar_rect), e.g. 158 px (12%) on a 1280 px screen

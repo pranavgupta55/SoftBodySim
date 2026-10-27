@@ -2,12 +2,17 @@
 // err = (dx > dy ? dx : -dy) / 2; the pixel it plots at step k along the major axis is offset along the minor axis by
 // ceil((k * minor - major / 2) / major) (derived from that loop and checked against pygame for every width). Width
 // w > 1 repeats the line shifted along the minor axis by -(w / 2) + (1 - w % 2) .. w / 2 (pygame's draw_line_width).
+// Lighting on: the body's material (tint, flags); a flat normal except on rim lines.
 flat in ivec4 v_ends;
 flat in int v_width;
 flat in vec3 v_col;
 flat in float v_alpha;
+flat in ivec2 v_mat;
+uniform sampler2D u_materials;
 
-out vec4 f_color;
+layout(location = 0) out vec4 f_color;
+layout(location = 1) out vec4 f_normal;
+layout(location = 2) out uint f_mat;
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -35,5 +40,19 @@ void main() {
     if (off < -half_w + (1 - v_width % 2) || off > half_w) {
         discard;
     }
-    f_color = vec4(v_col, v_alpha);
+    if (!u_lit || v_mat.x <= 0) {  // (overlays: drawn after the effects, plain)
+        f_color = vec4(v_col, v_alpha);
+        f_normal = vec4(0.5, 0.5, 0.0, 0.0);
+        f_mat = 0u;
+        return;
+    }
+    Mat m = mat_fetch(u_materials, uint(v_mat.x));
+    vec2 n = vec2(0.0);
+    if (v_mat.y != 0 && (dx | dy) != 0) {  // a rim line: the outward perpendicular (draw_border's), at the edge's slope
+        vec2 e = normalize(vec2(x2 - x1, y2 - y1));
+        n = float(v_mat.y) * vec2(e.y, -e.x) * mat_slope(m, 0.5);
+    }
+    f_color = vec4(mat_tinted(m, v_col), v_alpha);
+    f_normal = gbuf_normal(normalize(vec3(n, 1.0)).xy, 0.0, mat_flags(m));
+    f_mat = uint(v_mat.x);
 }
