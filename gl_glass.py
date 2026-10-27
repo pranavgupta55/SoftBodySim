@@ -26,12 +26,13 @@ recovered.
 Fluid (FLUID_FILTER): FLUID-kind pixels are splatted into an R16F field, blurred (separable Gaussian, sigma
 FLUID_SIGMA_WORLD x zoom px, wrapping on periodic axes) and thresholded at FLUID_THRESHOLD, so neighbouring fluid
 bodies merge into one liquid surface (gaps bridged, corners rounded); the field's gradient is its normal and its
-value its thickness, feeding the same resolve.
+value its thickness, feeding the same resolve. Filled views only (frame.filled): in the points view a fluid body's
+points and springs resolve like any see-through pixels, so the mesh stays visible instead of melting into one blob.
 
 Caustics (CausticsEffect): each light shoots CAUSTIC_RAYS evenly spaced rays, each marched once in a geometry shader
 (caustics_rays.geom); the straight pieces of a ray's path in open air after it was refracted (/ reflected) are drawn
 as additive lines into shared["caustics"] (RGBA16F), then a separable blur. Continuous lines, not points sampled along
-the rays: no dotted / grainy rays, and deterministic, so stable from frame to frame.
+the rays: no dotted / grainy rays, and deterministic, so stable from frame to frame. Filled views only (frame.filled).
 """
 import os
 
@@ -388,7 +389,8 @@ class GlassEffect:
         timer.lap("floor")
         sdf = shared.get("sdf") if self.sdf_trace else None
         field = None
-        if self.fluid_filter and materials.FLUID in kinds:
+        # the points view shows each body's points and springs: no liquid merged over (and between) them
+        if self.fluid_filter and materials.FLUID in kinds and getattr(frame, "filled", True):
             field = self._fluid(frame)
             timer.lap("fluid")
         fill_ratio, fill_col = self._pushpull(frame, scene)
@@ -464,6 +466,8 @@ class CausticsEffect:
         world = getattr(frame, "world", None)
         if not (self.enabled or getattr(world, "caustics", False)):
             return
+        if not getattr(frame, "filled", True):  # points view: a wireframe of springs focuses no light (its 1 px
+            return  # lines, refracting on flat normals, would only fan the rays into streaks)
         kinds = self.kinds.of(world)
         if not kinds & {materials.GLASS, materials.MIRROR, materials.FLUID}:
             return

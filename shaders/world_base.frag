@@ -24,7 +24,8 @@ layout(location = 2) out uint f_mat;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec3 col = u_background;
-    if (p.x < u_clip.x && p.y < u_clip.y) {
+    bool inside = p.x < u_clip.x && p.y < u_clip.y;
+    if (inside) {
         if (u_grid) {
             ivec2 cx = texelFetch(u_xmap, ivec2(p.x, 0), 0).xy;
             ivec2 cy = texelFetch(u_ymap, ivec2(p.y, 0), 0).xy;
@@ -47,6 +48,10 @@ void main() {
         }
     }
     f_color = vec4(col / 255.0, 1.0);
-    f_normal = vec4(0.5, 0.5, 0.0, 4.0 / 255.0);  // background: flat, lit (material 0 = default), not an occluder
+    // background: flat, lit (material 0 = default), not an occluder. Past the clip (outside the world view, e.g.
+    // under the sidebar) not lit either: lights, shadows, GI and caustics leave it alone and compose keeps the plain
+    // background there, as with lighting off (on a periodic map the effects' wrapped lookups would otherwise light
+    // it as an image of the view's left / top edge, ghost bodies included)
+    f_normal = vec4(0.5, 0.5, 0.0, inside ? 4.0 / 255.0 : 0.0);
     f_mat = 0u;
 }

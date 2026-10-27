@@ -22,7 +22,8 @@ u_size and u_clip, to_clip, unpack_rgb, floordiv / ceildiv). FrameInfo.fullscree
 with prog into whatever framebuffer is bound.
 
 Additions beyond the contract (optional to use): FrameInfo.gw (the GLWorld), FrameInfo.ctx (the moderngl context)
-and FrameInfo.fbo (GLWorld.fbo: GLWorld.tex + the shared depth buffer, what compose / glass draw into).
+and FrameInfo.fbo (GLWorld.fbo: GLWorld.tex + the shared depth buffer, what compose / glass draw into), and
+FrameInfo.filled (the view mode: False in the points + springs view).
 Albedo note: with lighting on, gbuf["albedo"] is the unlit colour with the material's tint and procedural pattern
 applied (identical to the unlit pixels for a material with tint_strength 0 and no pattern).
 """
@@ -69,6 +70,7 @@ class FrameInfo:
     gw: object = None  # the GLWorld (helpers below)
     ctx: object = None
     fbo: object = None
+    filled: bool = True  # the view mode: False = points + springs (V's first mode), True = filled shapes
 
     def fullscreen(self, prog):
         """Draw a fullscreen triangle strip with prog into the bound framebuffer."""

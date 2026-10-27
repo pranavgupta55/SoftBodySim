@@ -587,7 +587,7 @@ class GLWorld:
         self.base_vao.render(moderngl.TRIANGLE_STRIP, vertices=4)
         overlays = self._bodies(world, filled, zoom, outlines, lit)
         if lit:
-            self._effects(world, clip, zoom)
+            self._effects(world, clip, zoom, filled)
             self._overlays(overlays)
         if prev is not None:
             prev.use()
@@ -655,7 +655,7 @@ class GLWorld:
         self._rest_topo = topo
         return self._rest_all
 
-    def _effects(self, world, clip, zoom):
+    def _effects(self, world, clip, zoom, filled=True):
         """The lit effects in order (gl_effects); none: the albedo as is."""
         ctx = self.ctx
         if self.effects is None:
@@ -670,7 +670,7 @@ class GLWorld:
         if period is not None:
             period = (float(period[0]) * zoom, float(period[1]) * zoom)
         self.frame = FrameInfo(self.size, clip, float(zoom), period, world, self.gbuf, self.material_tex,
-                               self.n_materials, {}, gw=self, ctx=ctx, fbo=self.fbo)
+                               self.n_materials, {}, gw=self, ctx=ctx, fbo=self.fbo, filled=bool(filled))
         for e in self.effects:
             e.run(self, self.frame)
         ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
