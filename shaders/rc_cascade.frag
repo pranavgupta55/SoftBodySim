@@ -35,11 +35,19 @@ vec4 march(vec2 o, vec2 dir, float a, float b, ivec2 size) {
 }
 
 // Cascade i+1's radiance along its group j (= this cascade's ray j) at probe-centre position o (texels).
+// On a periodic axis a 2x2 footprint that would leave the probe grid is taken one period over instead (the grid is
+// padded past the period for this, GiEffect._alloc; probes past the period see the wrapped world): no seam.
 vec4 upper(int j, vec2 o, ivec2 size) {
     int n2 = 2 << u_index;
     ivec2 tsize = size / n2;
     ivec2 origin = ivec2(j % n2, j / n2) * tsize;
     vec2 u = o / float(n2) - 0.5;
+    for (int a = 0; a < 2; a++) {
+        if (u_period[a] > 0.0) {
+            if (u[a] < 0.0) u[a] += u_period[a] / float(n2);
+            else if (u[a] + 1.0 > float(tsize[a] - 1)) u[a] -= u_period[a] / float(n2);
+        }
+    }
     vec2 i0 = floor(u);
     vec2 f = u - i0;
     ivec2 b = ivec2(i0);

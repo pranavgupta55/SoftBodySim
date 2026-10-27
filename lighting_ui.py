@@ -11,7 +11,8 @@ body; it shows the first body's effective value), and a colour grid (the editor'
 emissive (glow) colour. The last material set this way is what newly spawned bodies get (Editor.settings["material"]).
 
 Lights card: "on" (L), add a point / spot / directional light at the view centre, step through the lights (< >),
-delete the selected one, its shadows / on switches, sliders for its intensity, radius, falloff, softness, height and
+delete the selected one, its shadows / on switches, the world's GI switch ("GI": world.gi, glowing bodies light the
+room by radiance cascades, gl_sdf.GiEffect), sliders for the light's intensity, radius, falloff, softness, height and
 spot cone, the world's ambient strength, and a colour grid for the light's or the ambient colour (hue only: the
 brightness is the intensity / the ambient strength). Colours are the swatch's RGB / 255 (scaled so the brightest
 channel is 1), used as given (no sRGB decoding).
@@ -464,6 +465,10 @@ class LightsCard(_Card):
             self.before_change()
             setattr(light, field, not getattr(light, field))
 
+    def toggle_gi(self):
+        """The world's GI switch (world.gi, saved with the scene; gl_sdf.GiEffect also runs while GI_ENABLED)."""
+        self.world.gi = not bool(getattr(self.world, "gi", False))
+
     def set_field(self, field, value):
         if field == "ambient":
             amb = self.ambient()
@@ -514,8 +519,11 @@ class LightsCard(_Card):
             else:
                 out.append((rect, ("button", name, light is not None, False, None)))
         y += px(BTN_H) + gap
-        for rect, field in self._button_row(y, ["casts_shadows", "enabled", "lighting"]):
-            if field == "lighting":
+        for rect, field in self._button_row(y, ["casts_shadows", "enabled", "gi", "lighting"]):
+            if field == "gi":  # the world's radiance-cascade GI (gl_sdf.GiEffect): glowing bodies light the room
+                on = bool(getattr(self.world, "gi", False))
+                out.append((rect, ("button", "GI", on, False, self.toggle_gi)))
+            elif field == "lighting":
                 on = lighting_on(self.view, self.world)
                 out.append((rect, ("button", "[L] on" if on else "[L] off", on, self.toggle_lighting is None,
                                    self.toggle_lighting)))

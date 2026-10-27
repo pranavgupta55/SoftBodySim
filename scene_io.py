@@ -33,8 +33,9 @@ wall is out of the body list), pending walls, bounds and terminal velocity.
 
 Lit renderer data (research/lighting_contract.md; optional, absent in older files): a body's "material" (a
 materials.PRESETS name) and "material_over" ({Material field: value}), and in "state": "lights" (lights.Light.to_dict
-each, moved with the scene), "ambient" ([r, g, b] linear) and "lighting" (the world starts lit; written by
-scene_data / preset_data only, so an undo step never switches lighting).
+each, moved with the scene), "ambient" ([r, g, b] linear), the switches "lighting" (the world starts lit), "caustics"
+and "gi" (gl_glass caustics / gl_sdf radiance-cascade GI on for this world), and "gi_gain" (its GI brightness); the
+last four are written by scene_data / preset_data only, so an undo step never switches them.
 
 Every loaded state is validated (state_problems) before it replaces the world: the collision system assumes it starts
 from an intersection-free state, so no crossing edges and every point at least load_gap() from other bodies' edges
@@ -78,7 +79,7 @@ def current_env(world=None):
 DEFAULT_ENV = current_env()  # applied when a preset (which has no env of its own) is loaded
 _KINDS = ((SoftBody, "soft"), (RigidBody, "rigid"), (FixedBody, "fixed"), (Body, "body"))
 _CLASSES = {"soft": SoftBody, "rigid": RigidBody, "fixed": FixedBody, "body": Body}
-BODY_EXTRAS = ("restitution", "wall_side", "palette_role", "palette_pick", "palette_material")  # optional per-body settings (numbers / strings), saved when present
+BODY_EXTRAS = ("restitution", "wall_side", "palette_role", "palette_pick", "palette_material", "emissive_fill")  # optional per-body settings (numbers / strings), saved when present
 SIDES = ("left", "right", "top", "bottom")
 
 
@@ -271,9 +272,10 @@ def _with_contents(data, world, box):
     """data plus the world's contents; the world's own friction / damping / terminal velocity (World.env) go in
     data["env"] only (a load puts them back into World.env), so a file states each setting once."""
     data.update(capture(world, box))
-    for key in ("lighting", "caustics"):  # the lit renderer's switches (a file's, not an undo step's)
-        if isinstance(getattr(world, key, None), bool):
-            data.setdefault("state", {})[key] = getattr(world, key)
+    for key in ("lighting", "caustics", "gi", "gi_gain"):  # the lit renderer's switches (a file's, not an undo step's)
+        v = getattr(world, key, None)
+        if isinstance(v, bool) or (key == "gi_gain" and isinstance(v, (int, float))):
+            data.setdefault("state", {})[key] = v if isinstance(v, bool) else float(v)
     ids = {}  # chain ids numbered 1, 2, ... in order (a load gives them fresh ones anyway): stable save -> load -> save
     for d in data["bodies"] + data["ropes"]:
         if "chain_id" in d:
@@ -623,7 +625,7 @@ def install(world, bodies, ropes, hooks, state=None):
     world._rebuild()
 
 
-LIGHTING_KEYS = ("lights", "ambient", "lighting", "caustics")
+LIGHTING_KEYS = ("lights", "ambient", "lighting", "caustics", "gi", "gi_gain")
 
 
 def _install_lighting(world, key, value):
@@ -631,7 +633,9 @@ def _install_lighting(world, key, value):
         world.lights = list(value)
     elif key == "ambient":
         world.ambient = tuple(value)
-    else:  # "lighting" / "caustics": the lit renderer's switches
+    elif key == "gi_gain":  # the world's GI brightness (gl_sdf.GiEffect: times GI_GAIN)
+        world.gi_gain = float(value)
+    else:  # "lighting" / "caustics" / "gi": the lit renderer's switches
         setattr(world, key, bool(value))
 
 

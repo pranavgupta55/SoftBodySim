@@ -260,9 +260,11 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     are the obstacles, by the cluster rule and the PENROSE_CUPS cup rule; or a dict of those (see _layout_tiling).
     A layout file's own tiling ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap")
     overrides both. The diamonds tiling's cup rule is DIAMONDS_CUPS. cluster_log, remove_order, add_order, check: see
-    diamonds_map.pick_diamonds. shape_seed: the shapes' spawn seed (default `seed`): the same tiles, other shapes."""
-    from diamonds_map import (lattice_diamonds, layout_shift, load_layout, penrose_tiles, pick_diamonds,
-                              place_hexagons, shift_diamonds, steep_tiles)
+    diamonds_map.pick_diamonds. shape_seed: the shapes' spawn seed (default `seed`): the same tiles, other shapes.
+    A layout file's optional "lighting" block sets up the lit renderer (materials per role, GI, ambient, lights, the
+    starting palette and background; see apply_map_lighting)."""
+    from diamonds_map import (lattice_diamonds, layout_lighting, layout_shift, load_layout, penrose_tiles,
+                              pick_diamonds, place_hexagons, shift_diamonds, steep_tiles)
     from palettes import DEFAULT, apply_palette
 
     info = _layout_tiling(layout, tiling, pentagrid_seed)
@@ -310,8 +312,52 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     world.add_many(bodies)
     for wall in world.walls.values():
         wall.palette_role = "wall"
-    apply_palette(world, DEFAULT)
+    lighting = layout_lighting(layout) if isinstance(layout, str) else {}
+    apply_map_lighting(world, lighting)  # role materials first: palettes give theirs only to bodies without one
+    apply_palette(world, lighting.get("palette", DEFAULT))
+    if lighting.get("background") is not None:
+        world.background = [int(c) for c in lighting["background"]]
     return world
+
+
+def apply_map_lighting(world, lighting):
+    """A diamonds / penrose map's lit-renderer settings (its layout file's optional "lighting" block,
+    diamonds_map.layout_lighting) on a freshly built world, before its palette is applied. Keys, all optional:
+      "enabled": bool -> world.lighting (the world starts lit); "gi": bool -> world.gi (gl_sdf's radiance-cascade GI:
+      emissive bodies light the room); "gi_gain": float -> world.gi_gain (its GI brightness, times
+      gl_sdf.GI_GAIN); "ambient": [r, g, b] linear -> world.ambient; "lights": [Light dicts]
+      (lights.Light.to_dict) -> world.lights;
+      "materials": {palette role: materials.PRESETS name}: each body of that role gets it as its own `material`
+      (so palette switches keep it); "material_over": {palette role: {Material field: value}}: its `material_over`;
+      an "emissive" of "fill" there means "the body's own colour" (body.emissive_fill: palettes.sync_emissive keeps
+      it in step with the palette, so the body glows in whatever colour the Palette card gives it);
+      "palette": the palettes.PALETTES name the world starts with (default palettes.DEFAULT); "background": [r, g, b]
+      0-255 over the palette's (only at build time: a palette switch gives the palette's own)."""
+    if not lighting:
+        return
+    import lights as lights_mod
+    if "enabled" in lighting:
+        world.lighting = bool(lighting["enabled"])
+    if "gi" in lighting:
+        world.gi = bool(lighting["gi"])
+    if lighting.get("gi_gain") is not None:
+        world.gi_gain = float(lighting["gi_gain"])
+    if lighting.get("ambient") is not None:
+        world.ambient = tuple(float(c) for c in lighting["ambient"])
+    if lighting.get("lights"):
+        world.lights = [lights_mod.Light.from_dict(d) for d in lighting["lights"]]
+    roles = lighting.get("materials", {})
+    overs = lighting.get("material_over", {})
+    for body in world.bodies:
+        role = getattr(body, "palette_role", None)
+        if role in roles:
+            body.material = roles[role]
+        if role in overs:
+            over = dict(overs[role])
+            if over.get("emissive") == "fill":
+                del over["emissive"]
+                body.emissive_fill = 1.0  # (a number: scene_io saves BODY_EXTRAS as numbers / strings)
+            body.material_over = {k: (tuple(v) if isinstance(v, list) else v) for k, v in over.items()}
 
 
 # Preset scenes by name: builder(world_width, world_height) -> World. main_opengl.py --scene NAME picks one.

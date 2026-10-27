@@ -286,12 +286,21 @@ def shift_diamonds(diamonds, shift, world_w, world_h):
     return out
 
 
-def save_layout(path, diamonds, size, note="", spawn=None, keys=None, tiling=None):
+def layout_lighting(path):
+    """A saved layout's own lit-renderer settings ({} if it has none): its optional "lighting" block, see
+    scene.apply_map_lighting for the keys."""
+    with open(path) as f:
+        return dict(json.load(f).get("lighting", {}))
+
+
+def save_layout(path, diamonds, size, note="", spawn=None, keys=None, tiling=None, lighting=None):
     """Write the picked diamonds' tile keys ([(corners, rgb)] from pick_diamonds, or `keys` directly), the world size
-    they were picked for, (optional) the layout's own shape spawning settings and (optional) its tiling (a dict, see
-    layout_tiling; left out for the default diamonds tiling) to `path` as JSON."""
+    they were picked for, (optional) the layout's own shape spawning settings, (optional) its tiling (a dict, see
+    layout_tiling; left out for the default diamonds tiling) and (optional) its lit-renderer settings (a "lighting"
+    dict, see layout_lighting) to `path` as JSON."""
     keys = [tile_key(c) for c, _ in diamonds] if keys is None else [list(k) for k in keys]
-    data = {"note": note, "size": list(size), **(tiling or {}), **({"spawn": spawn} if spawn else {}), "tiles": keys}
+    data = {"note": note, "size": list(size), **(tiling or {}), **({"spawn": spawn} if spawn else {}),
+            **({"lighting": lighting} if lighting else {}), "tiles": keys}
     with open(path, "w") as f:
         json.dump(data, f, indent=0)
 

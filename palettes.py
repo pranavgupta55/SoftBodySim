@@ -10,7 +10,9 @@ while the active world has a palette: a button per palette, its name and a strip
 hides the panel (H; main_opengl.py floats the sidebar over its fullscreen worlds).
 
 A palette may also give roles a lit-renderer material (optional "materials": {role: materials.PRESETS name}); it goes
-only to bodies without a material of their own (see _palette_material).
+only to bodies without a material of their own (see _palette_material). A body with `emissive_fill` set (a glowing
+body of a map's "lighting" block, scene.apply_map_lighting) glows in its own colour: each recolour also sets its
+material_over "emissive" to the new fill colour (sync_emissive), so it keeps its material and glows in the new one.
 """
 import pygame
 
@@ -33,6 +35,11 @@ PALETTES = {
                "diamond": _hex("225a52", "163f36"), "hexagon": _hex("86ad95")},
     "sunset": {"background": _hex("0a1624")[0], "wall": _hex("1f3c4e"),
                "diamond": _hex("1f3c4e", "6e3746", "b84f48"), "hexagon": _hex("f5ce8c", "e88a55")},
+    # for lit maps whose shapes glow (maps/penrose/evolved 1 glow): a mid grey floor and pale tiles that show the
+    # light falling on them (the room's darkness comes from its low ambient), shapes in warm and cool lantern colours
+    "lanterns": {"background": _hex("5a5866")[0], "wall": _hex("5a5866"),
+                 "diamond": _hex("9a96a8", "8a8fa3", "a39a92"),
+                 "hexagon": _hex("feae34", "f77622", "fee761", "e43b44", "2ce8f5", "0099db", "63c74d", "b55088")},
 }
 DEFAULT = "forest"
 
@@ -47,10 +54,18 @@ def apply_palette(world, name):
             cols = pal[role]
             col = list(cols[int(getattr(body, "palette_pick", 0)) % len(cols)])
             body.point_col, body.stick_col, body.fill_col = col, col, col
+            sync_emissive(body)
         if role is not None:
             _palette_material(body, materials.get(role))
     world.background = list(pal["background"])
     world.palette = name
+
+
+def sync_emissive(body):
+    """A body with `emissive_fill` set glows in its own colour: its material_over "emissive" = fill_col / 255."""
+    if getattr(body, "emissive_fill", 0):
+        body.material_over = {**(getattr(body, "material_over", None) or {}),
+                              "emissive": tuple(round(c / 255, 4) for c in body.fill_col)}
 
 
 def _palette_material(body, preset):

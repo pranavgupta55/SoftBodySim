@@ -24,7 +24,9 @@ void main() {
                          dist_at(q + ivec2(0, 1), size) - dist_at(q - ivec2(0, 1), size));
         if (dot(grad, grad) > 0.0) pe += normalize(grad) * (-d + 2.0);
     }
-    if (u_period.x > 0.0) pe.x -= u_period.x * floor(pe.x / u_period.x);
-    if (u_period.y > 0.0) pe.y -= u_period.y * floor(pe.y / u_period.y);
+    // wrapped into [0.5, period + 0.5): the bilinear lookup always has both neighbours (the grid runs past the
+    // period, GiEffect._alloc), so there is no seam at the wrap
+    if (u_period.x > 0.0) pe.x -= u_period.x * floor((pe.x - 0.5) / u_period.x);
+    if (u_period.y > 0.0) pe.y -= u_period.y * floor((pe.y - 0.5) / u_period.y);
     f_gi = vec4(texture(u_c0, pe / vec2(size)).rgb * u_gain, 1.0);
 }

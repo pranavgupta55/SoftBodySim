@@ -12,9 +12,12 @@ shadow march lights use (sdf_shadow / sdf_at).
 
 GiEffect (radiance cascades, an experiment) publishes frame.shared["gi"]: RGBA16F at the render size, the light
 emissive bodies throw on everything around them (occluded by shadow casters), to add to the diffuse light. It
-runs only while GI_ENABLED is True (module flag, default False; the UI toggles gl_sdf.GI_ENABLED, read every
-frame), and then costs: a half-res scene pass, its own half-res jump flood (emitters + occluders), N_CASCADES
-cascade passes and an upsampling pass. GI_GAIN scales the result.
+runs while GI_ENABLED is True (module flag, default False, read every frame) or the world has `gi` set (a per-world
+switch, saved in scenes; the Lights card's GI button toggles it), and then costs: a half-res scene pass, its own
+half-res jump flood (emitters + occluders), N_CASCADES cascade passes and an upsampling pass. GI_GAIN, times the
+world's own `gi_gain` (if any; saved in scenes, set by a map's "lighting" block), scales the result. On periodic
+maps the GI wraps seamlessly: the probe grid runs two top-cascade probe spacings past the period, and cascade merges
+and the upsampling take any footprint that would leave the grid one period over.
 
 Periodic maps: frame.period (render px; an axis with 0 doesn't repeat) is assumed to start at pixel 0; lookups
 wrap into [0, period) and distances are minimum-image.
@@ -133,22 +136,26 @@ class SdfEffect:
 
 
 class GiEffect:
-    """shared["gi"] by radiance cascades, while GI_ENABLED."""
+    """shared["gi"] by radiance cascades, while GI_ENABLED or world.gi."""
     order = 150
 
     def __init__(self, ctx, size):
-        self.ctx, self.size = ctx, None
+        self.ctx, self.size, self.period = ctx, None, None
         self.progs = None
         self.textures = []
         self.stats = {}
 
-    def _alloc(self, size):
+    def _alloc(self, size, period):
         for o in self.textures:
             o.release()
         ctx = self.ctx
         m = 1 << (N_CASCADES - 1)
         half = ((size[0] + 1) // 2, (size[1] + 1) // 2)
-        self.grid = (-(-half[0] // m) * m, -(-half[1] // m) * m)  # E: half res padded to a multiple of 2^(n-1)
+        # E: half res padded to a multiple of 2^(n-1); on a periodic axis at least 2 top-cascade probe spacings more
+        # than the period, so every probe near a seam finds its upper cascade's 2x2 footprint whole one period over
+        # (probes past the period are valid: their marches wrap) and rc_out can wrap into [0.5, period + 0.5)
+        need = [max(h, int(math.ceil(p)) + 2 * m) if p > 0 else h for h, p in zip(half, period)]
+        self.grid = tuple(-(-n // m) * m for n in need)
         self.scene = _tex(ctx, self.grid, 4, "f2")
         self.scene_fbo = ctx.framebuffer([self.scene])
         self.casc = [_tex(ctx, self.grid, 4, "f2", linear=True) for _ in range(2)]
@@ -157,10 +164,11 @@ class GiEffect:
         self.out_fbo = ctx.framebuffer([self.out])
         self.jfa = JumpFlood(ctx, self.grid, linear=False)
         self.textures = [self.scene_fbo, self.scene, *self.casc_fbos, *self.casc, self.out_fbo, self.out]
-        self.size = size
+        self.size, self.period = size, period
 
     def run(self, gw, frame):
-        if not GI_ENABLED:
+        world = getattr(frame, "world", None)
+        if not (GI_ENABLED or getattr(world, "gi", False)):
             return
         size = tuple(frame.size)
         if self.progs is None:
@@ -169,13 +177,13 @@ class GiEffect:
                               scene=frame.load(FULLSCREEN_VERT, "rc_scene.frag", ["material.glsl", *inc]),
                               cascade=frame.load(FULLSCREEN_VERT, "rc_cascade.frag", inc),
                               out=frame.load(FULLSCREEN_VERT, "rc_out.frag", inc))
-        if self.size != size:
+        period = _period(frame.period, 2.0)
+        if self.size != size or self.period != period:
             if self.size is not None:
                 self.jfa.release()
-            self._alloc(size)
+            self._alloc(size, period)
         ctx = self.ctx
         ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
-        period = _period(frame.period, 2.0)
         p = self.progs
         # scene at half res
         g = frame.gbuf
@@ -211,7 +219,7 @@ class GiEffect:
         _set(o, "u_c0", 0)
         _set(o, "u_dist", 1)
         _set(o, "u_period", period)
-        _set(o, "u_gain", float(GI_GAIN))
+        _set(o, "u_gain", float(GI_GAIN) * float(getattr(world, "gi_gain", None) or 1.0))
         self.out_fbo.use()
         frame.fullscreen(o)
         frame.shared["gi"] = self.out
@@ -223,7 +231,7 @@ class GiEffect:
             self.jfa.release()
         for p in (self.progs or {}).values():
             p.release()
-        self.textures, self.progs, self.size = [], None, None
+        self.textures, self.progs, self.size, self.period = [], None, None, None
 
 
 def make(ctx, size):
