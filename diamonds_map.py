@@ -248,7 +248,7 @@ def layout_tiling(path):
     A penrose file without "cups" predates the outline rule: "pair"."""
     with open(path) as f:
         data = json.load(f)
-    keys = ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap")
+    keys = ("tiling", "pentagrid_seed", "edge", "rotation", "min_slope", "cups", "cup_gap", "bias")
     info = {k: data[k] for k in keys if k in data} or {"tiling": "diamonds"}
     if info["tiling"] == "penrose":
         info.setdefault("cups", "pair")
@@ -281,8 +281,53 @@ def save_layout(path, diamonds, size, note="", spawn=None, keys=None, tiling=Non
         json.dump(data, f, indent=0)
 
 
+def tile_neighbours(tiles, reach=30.0):
+    """For each tile, the indices of the tiles with a corner within `reach` of one of its corners (sharing a corner
+    or nearly)."""
+    cs = [np.asarray(t[0], float) for t in tiles]
+    centers = np.array([c.mean(axis=1) for c in cs])
+    radius = max(float(np.hypot(*(c - c.mean(axis=1, keepdims=True))).max()) for c in cs)
+    adj = np.zeros((len(tiles), len(tiles)), bool)
+    for i, j in zip(*np.nonzero(np.triu(np.hypot(*(centers[:, None] - centers[None]).transpose(2, 0, 1))
+                                        <= 2 * radius + reach, 1))):
+        d = cs[i][:, :, None] - cs[j][:, None, :]
+        adj[i, j] = adj[j, i] = bool((np.hypot(d[0], d[1]) <= reach).any())
+    return adj
+
+
+def clustered_order(tiles, seed, bias, target=None, rounds=5, first=0.4, reach=30.0):
+    """A pick order (a permutation of tile indices) that mildly favours clusters: round 1 draws `first` of `target`
+    (default: all tiles) uniformly at random; each later round draws (target - round 1) / (rounds - 1) more with
+    weights 1 + bias * (number of already-drawn neighbours, see tile_neighbours), until every tile is drawn
+    (pick_diamonds' rules may veto some, so the order runs past the target)."""
+    n = len(tiles)
+    rng = np.random.default_rng([seed, 3])
+    target = n if target is None else min(n, target)
+    adj = tile_neighbours(tiles, reach).astype(float)
+    first_n = max(1, int(round(first * target)))
+    step = max(1, int(math.ceil((target - first_n) / max(1, rounds - 1))))
+    order = rng.choice(n, size=min(first_n, n), replace=False).tolist()
+    drawn = np.zeros(n, bool)
+    drawn[order] = True
+    while len(order) < n:
+        w = (1.0 + bias * (adj @ drawn)) * ~drawn
+        k = min(step, n - len(order))
+        pick = rng.choice(n, size=k, replace=False, p=w / w.sum()).tolist()
+        order += pick
+        drawn[pick] = True
+    return order
+
+
+def _random_order(tiles, seed, bias, target):
+    """pick_diamonds' order: a plain seeded permutation, or clustered_order when `bias` is set."""
+    if not bias:
+        return np.random.default_rng(seed).permutation(len(tiles))
+    return clustered_order(tiles, seed, bias, target)
+
+
 def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, gap=0.0, max_width=None,
-                  layout=None, layout_size=None, remove=0, add=0, add_seed=0, count=None, cups="pair", cup_log=None):
+                  layout=None, layout_size=None, remove=0, add=0, add_seed=0, count=None, cups="pair", cup_log=None,
+                  bias=0.0):
     """A seeded random `fraction` (or `count`) of the diamonds (corners, rgb, face) lying wholly inside the world (0, 0, world_w,
     world_h), which wraps on every side (looping, no walls). A diamond that would form a cup with one already picked
     (forms_cup; corners up to `gap` apart count as touching) is skipped and the next random one tried, as is one that
@@ -377,7 +422,8 @@ def pick_diamonds(diamonds, world_w, world_h, seed=7, fraction=0.15, size=None, 
             chosen.append(int(k))
 
     if layout is None:
-        fill(np.random.default_rng(seed).permutation(len(inside)), max(1, int(round(fraction * len(inside)))))
+        target = max(1, int(round(fraction * len(inside))))
+        fill(_random_order(inside, seed, bias, target), target)
     else:
         if corners is not None:  # tile_key of every diamond at once (the same means, rounded the same way)
             mx, my = corners[:, 0].mean(axis=1).tolist(), corners[:, 1].mean(axis=1).tolist()

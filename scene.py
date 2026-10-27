@@ -198,6 +198,7 @@ def _layout_tiling(layout, tiling=None, pentagrid_seed=None):
     "cup_gap": ...} a diamonds world is built on: the layout file's own (if `layout` is one; a penrose file without
     "cups" is "pair"), else `tiling` (a name, "diamonds" by default, or such a dict) and, for "penrose",
     `pentagrid_seed` (PENROSE_SEED) and the PENROSE_* defaults where not given ("cup_gap" only for the "pair" rule).
+    An optional "bias" (diamonds_map.clustered_order) makes a random layout's pick order favour clusters.
     The diamonds tiling gets no "cups" key (build_diamonds_scene uses DIAMONDS_CUPS)."""
     from diamonds_map import layout_tiling
     if isinstance(layout, str):
@@ -273,7 +274,8 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     cups = info.get("cups", DIAMONDS_CUPS)
     diamonds = pick_diamonds(tiles, world_width, world_height, seed=seed, size=side, gap=gap, cups=cups,
                              max_width=DIAMOND_CHAIN_WIDTH, layout=keys, layout_size=size, remove=remove, add=add,
-                             add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)))
+                             add_seed=add_seed, count=int(round(spawn["density"] * world_width * world_height)),
+                             bias=float(info.get("bias", 0.0)))
     if isinstance(layout, str):  # the layout file's own offset (diamonds_map.layout_shift), if any
         diamonds = shift_diamonds(diamonds, layout_shift(layout), world_width, world_height)
     rng = np.random.default_rng(seed + 2)  # each body's palette_pick: which of its role's colors it gets
