@@ -12,7 +12,8 @@ hides the panel (H; main_opengl.py floats the sidebar over its fullscreen worlds
 A palette may also give roles a lit-renderer material (optional "materials": {role: materials.PRESETS name}); it goes
 only to bodies without a material of their own (see _palette_material). A body with `emissive_fill` set (a glowing
 body of a map's "lighting" block, scene.apply_map_lighting) glows in its own colour: each recolour also sets its
-material_over "emissive" to the new fill colour (sync_emissive), so it keeps its material and glows in the new one.
+material_over "emissive" (and a lit-only tint) from the new fill colour (sync_emissive), so it keeps its material and
+glows in the new one, equally bright in every palette.
 """
 import pygame
 
@@ -35,7 +36,7 @@ PALETTES = {
                "diamond": _hex("225a52", "163f36"), "hexagon": _hex("86ad95")},
     "sunset": {"background": _hex("0a1624")[0], "wall": _hex("1f3c4e"),
                "diamond": _hex("1f3c4e", "6e3746", "b84f48"), "hexagon": _hex("f5ce8c", "e88a55")},
-    # for lit maps whose shapes glow (maps/penrose/evolved 1 glow): a mid grey floor and pale tiles that show the
+    # made for lit maps whose shapes glow (maps/penrose/evolved 1 glow, which follows any palette): a mid grey floor and pale tiles that show the
     # light falling on them (the room's darkness comes from its low ambient), shapes in warm and cool lantern colours
     "lanterns": {"background": _hex("5a5866")[0], "wall": _hex("5a5866"),
                  "diamond": _hex("9a96a8", "8a8fa3", "a39a92"),
@@ -45,7 +46,9 @@ DEFAULT = "forest"
 
 
 def apply_palette(world, name):
-    """Recolor every body with a palette_role, and the background, from PALETTES[name]; remember it on the world."""
+    """Recolor every body with a palette_role, and the background, from PALETTES[name]; remember it on the world.
+    A world with `palette_background` set (a lit map's "background" rule, scene.apply_map_lighting) gets its
+    background from lit_background instead of the palette's own."""
     pal = PALETTES[name]
     materials = pal.get("materials", {})
     for body in world.bodies:
@@ -57,15 +60,73 @@ def apply_palette(world, name):
             sync_emissive(body)
         if role is not None:
             _palette_material(body, materials.get(role))
-    world.background = list(pal["background"])
+    rule = getattr(world, "palette_background", None)
+    world.background = lit_background(pal["background"], **rule) if rule else list(pal["background"])
     world.palette = name
 
 
+# A glowing body's (emissive_fill) albedo under the lit renderer, a grey. GI emission is albedo x emissive
+# (shaders/rc_scene.frag) and the drawn colour albedo x light + emissive (shaders/compose.frag), so a grey albedo
+# makes the light it throws exactly its emissive hue, and a low one keeps its own GI from washing it out to white.
+# It is scaled by sqrt(GLOW_LUMA / the glow colour's luma) (clamped to GLOW_LUMA_RANGE) so that deep reds and blues
+# light the room about as much as pale yellows and greens do.
+GLOW_ALBEDO = 0.35
+GLOW_LUMA = 0.65
+GLOW_LUMA_RANGE = (0.6, 1.6)
+
+
+def _luma(c):
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def glow_colour(rgb, peak=1.0):
+    """An RGB 0-255 colour as a linear 0..1 emissive of the same hue whose brightest channel is `peak`, so dark and
+    light palette colours glow equally bright (black: no glow)."""
+    top = max(rgb)
+    return tuple(round(peak * c / top, 4) if top > 0 else 0.0 for c in rgb)
+
+
+def glow_tint(rgb, albedo=GLOW_ALBEDO):
+    """The material tint that makes an RGB 0-255 fill colour a grey under the lit renderer (tint is multiplied into
+    the fill colour, shaders/material.glsl mat_tinted): `albedo` times the luma compensation above. Channels at 0
+    stay 0 (they don't glow)."""
+    luma = _luma(glow_colour(rgb))
+    lo, hi = GLOW_LUMA_RANGE
+    grey = albedo * (min(max((GLOW_LUMA / luma) ** 0.5, lo), hi) if luma > 0 else 1.0)
+    return tuple(round(min(grey * 255 / c, 255.0), 4) if c > 0 else 1.0 for c in rgb)
+
+
 def sync_emissive(body):
-    """A body with `emissive_fill` set glows in its own colour: its material_over "emissive" = fill_col / 255."""
-    if getattr(body, "emissive_fill", 0):
-        body.material_over = {**(getattr(body, "material_over", None) or {}),
-                              "emissive": tuple(round(c / 255, 4) for c in body.fill_col)}
+    """A body with `emissive_fill` set (a peak brightness, e.g. 1.0) glows in its own colour: its material_over gets
+    "emissive" = glow_colour(fill_col, peak), the palette colour's hue at full brightness, and "tint" =
+    glow_tint(fill_col) at "tint_strength" 1, so it is lit as a grey and the light it throws on the room
+    (GI) is that same hue, as bright in every palette. The unlit renderer still draws fill_col.
+    Hand-set overrides win: a field whose value is no longer the one this last wrote (the Material card's glow /
+    tint colour) is left alone from then on; one that was cleared (the card's reset) is set again."""
+    peak = float(getattr(body, "emissive_fill", 0) or 0)
+    if not peak:
+        return
+    over = dict(getattr(body, "material_over", None) or {})
+    for field, value in (("emissive", glow_colour(body.fill_col, peak)), ("tint", glow_tint(body.fill_col))):
+        own, given = over.get(field), getattr(body, "palette_" + field, None)
+        if own is not None and given is not None and tuple(own) != tuple(given):
+            continue  # set by hand: kept
+        over[field] = value
+        setattr(body, "palette_" + field, value)
+        if field == "tint":
+            over["tint_strength"] = 1.0
+    body.material_over = over
+
+
+def lit_background(rgb, lightness=0.4, saturation=0.3):
+    """A lit map's floor from a palette's background: its hue, `saturation` times as saturated (0: grey), scaled so
+    its brightest channel is `lightness` (0..1). A mid-tone floor shows the light that falls on it in the light's
+    own colour; the room's darkness comes from the map's low ambient instead (scene.apply_map_lighting)."""
+    c = [v / 255 for v in rgb]
+    grey = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    c = [grey + (v - grey) * saturation for v in c]
+    top = max(c)
+    return [int(round(255 * lightness * v / top)) if top > 0 else int(round(255 * lightness)) for v in c]
 
 
 def _palette_material(body, preset):

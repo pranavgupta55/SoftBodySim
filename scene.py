@@ -315,7 +315,7 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     lighting = layout_lighting(layout) if isinstance(layout, str) else {}
     apply_map_lighting(world, lighting)  # role materials first: palettes give theirs only to bodies without one
     apply_palette(world, lighting.get("palette", DEFAULT))
-    if lighting.get("background") is not None:
+    if isinstance(lighting.get("background"), list):
         world.background = [int(c) for c in lighting["background"]]
     return world
 
@@ -330,9 +330,13 @@ def apply_map_lighting(world, lighting):
       "materials": {palette role: materials.PRESETS name}: each body of that role gets it as its own `material`
       (so palette switches keep it); "material_over": {palette role: {Material field: value}}: its `material_over`;
       an "emissive" of "fill" there means "the body's own colour" (body.emissive_fill: palettes.sync_emissive keeps
-      it in step with the palette, so the body glows in whatever colour the Palette card gives it);
-      "palette": the palettes.PALETTES name the world starts with (default palettes.DEFAULT); "background": [r, g, b]
-      0-255 over the palette's (only at build time: a palette switch gives the palette's own)."""
+      it in step with the palette, so the body glows in whatever colour the Palette card gives it, as brightly in
+      every palette, and throws light of that same hue);
+      "palette": the palettes.PALETTES name the world starts with (default palettes.DEFAULT; leave it out to follow
+      the user's palette); "background": [r, g, b] 0-255 over the palette's (only at build time: a palette switch
+      gives the palette's own), or {"lightness": 0..1, "saturation": 0..1} -> world.palette_background: every
+      palette's background made a floor of that lightness (palettes.lit_background), so a dark room (low "ambient")
+      still shows the light falling on its floor, in the palette's hue."""
     if not lighting:
         return
     import lights as lights_mod
@@ -346,7 +350,10 @@ def apply_map_lighting(world, lighting):
         world.ambient = tuple(float(c) for c in lighting["ambient"])
     if lighting.get("lights"):
         world.lights = [lights_mod.Light.from_dict(d) for d in lighting["lights"]]
-    roles = lighting.get("materials", {})
+    if isinstance(lighting.get("background"), dict):
+        world.palette_background = {k: float(v) for k, v in lighting["background"].items()
+                                    if k in ("lightness", "saturation")}
+    roles =lighting.get("materials", {})
     overs = lighting.get("material_over", {})
     for body in world.bodies:
         role = getattr(body, "palette_role", None)

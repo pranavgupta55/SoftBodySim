@@ -73,8 +73,11 @@
 "lighting": {
 "enabled": true,
 "gi": true,
-"gi_gain": 3.5,
-"palette": "lanterns",
+"gi_gain": 6.5,
+"background": {
+"lightness": 0.4,
+"saturation": 0.3
+},
 "ambient": [
 0.06,
 0.06,
