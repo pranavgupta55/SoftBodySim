@@ -1,5 +1,5 @@
 {
-"note": "evolved 1 halloween: the tiles and spawn of evolved 1 (same file otherwise), a third of its shapes pumpkins (half widths 10-11: the mean area of evolved 1's shapes; the shapes' total area is 3% over evolved 1's, from the other shapes' draws), starting in the halloween palette. evolved 1 (2026-10-27): penrose tiling, base blobs C 7; 28 rounds (deadline 2026-10-27 12:00: stopped after 28) of 100 remove-3/add-3 variants run 60 s (top 10 kept per round; targeted 0.5, halving 10/30/60 s, paired seeds + elite re-scoring, crossover 0.25), score 0.7 spread + 0.2 unstuck (worst 4 of 4x4 cells) + 0.1 tile evenness; last round's top 8 + base re-run 180 s: r27.1.5 0.8803 vs base 0.7247",
+"note": "evolved 1 halloween: the tiles and spawn of evolved 1 (same file otherwise), a third of its shapes pumpkins (half widths 15.8-16.8: the smallest a little bigger than the largest heptagons, 1.13x their half width and 1.05x their height; the shapes' total area is 1.53x evolved 1's), starting in the halloween palette, lit as evolved 1 glow: the shapes and pumpkins glow (light sources by GI), glass tiles, a dark room; the pumpkins' eyes stay black. evolved 1 (2026-10-27): penrose tiling, base blobs C 7; 28 rounds (deadline 2026-10-27 12:00: stopped after 28) of 100 remove-3/add-3 variants run 60 s (top 10 kept per round; targeted 0.5, halving 10/30/60 s, paired seeds + elite re-scoring, crossover 0.25), score 0.7 spread + 0.2 unstuck (worst 4 of 4x4 cells) + 0.1 tile evenness; last round's top 8 + base re-run 180 s: r27.1.5 0.8803 vs base 0.7247",
 "size": [
 1800.0,
 1169.0
@@ -71,11 +71,41 @@
 "density": 0.0007307255428179993,
 "pumpkin_share": 0.3333333333333333,
 "pumpkin_sizes": [
-10.0,
-11.0
+15.8,
+16.8
 ]
 },
 "lighting": {
+"enabled": true,
+"gi": true,
+"gi_gain": 6.5,
+"background": {
+"lightness": 0.4,
+"saturation": 0.3
+},
+"ambient": [
+0.06,
+0.06,
+0.08
+],
+"materials": {
+"hexagon": "glow",
+"diamond": "glass",
+"wall": "matte"
+},
+"material_over": {
+"hexagon": {
+"emissive": "fill",
+"emissive_strength": 1.0
+},
+"diamond": {
+"transparency": 0.97,
+"absorption": 0.0,
+"reflectivity": 0.04,
+"emissive": "hue",
+"emissive_strength": 0.12
+}
+},
 "palette": "halloween"
 },
 "tiles": [
