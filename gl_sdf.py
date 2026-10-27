@@ -216,8 +216,10 @@ class GiEffect:
         o = p["out"]
         top.use(0)
         dist.use(1)
+        g["mat"].use(2)
         _set(o, "u_c0", 0)
         _set(o, "u_dist", 1)
+        _set(o, "u_mat", 2)
         _set(o, "u_period", period)
         _set(o, "u_gain", float(GI_GAIN) * float(getattr(world, "gi_gain", None) or 1.0))
         self.out_fbo.use()
