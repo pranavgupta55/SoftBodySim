@@ -111,14 +111,16 @@ def sync_emissive(body):
     (GI) is that same hue, as bright in every palette. The unlit renderer still draws fill_col.
     Hand-set overrides win: a field whose value is no longer the one this last wrote (the Material card's glow /
     tint colour) is left alone from then on; one that was cleared (the card's reset) is set again. With
-    `emissive_keep_colour` set, only the emissive is synced: the body keeps its own colour and glows in its hue."""
+    `emissive_keep_colour` set, only the emissive is synced: the body keeps its own colour and glows in its hue.
+    An `emissive_albedo` on the body (visual_tune.py's "shape albedo" slider) replaces GLOW_ALBEDO in its tint."""
     peak = float(getattr(body, "emissive_fill", 0) or 0)
     if not peak:
         return
     over = dict(getattr(body, "material_over", None) or {})
     fields = [("emissive", glow_colour(body.fill_col, peak))]
     if not getattr(body, "emissive_keep_colour", 0):  # (else it keeps its own colour: a faint glow on top)
-        fields.append(("tint", glow_tint(body.fill_col)))
+        albedo = getattr(body, "emissive_albedo", None)
+        fields.append(("tint", glow_tint(body.fill_col, GLOW_ALBEDO if albedo is None else float(albedo))))
     for field, value in fields:
         own, given = over.get(field), getattr(body, "palette_" + field, None)
         if own is not None and given is not None and tuple(own) != tuple(given):
