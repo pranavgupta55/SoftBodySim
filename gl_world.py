@@ -15,7 +15,9 @@ The grid and the trails are one fullscreen base pass under the bodies, in whole 
 
 Per frame the CPU work is numpy over the World's packed arrays (P, edges, offsets): one upload of truncated /
 rounded pixel coordinates per primitive kind. Per-body topology (which points form each fill loop, spring lists) is
-cached until the World repacks. Body colours, radii and widths are read every frame (palettes recolour in place).
+cached until the World repacks. Body colours, radii and widths are packed into arrays once and again only after a
+body's style changes (entities.style_version: any assignment to a colour, width, radius or material, as palettes
+make), and the rows of the bodies that don't move are kept between frames (WorldPacker: only movers are repacked).
 
 Lighting (research/lighting_contract.md): render(lighting=True), or a world with `lighting` set, draws the same
 passes into a G-buffer (albedo / normal / material id MRT sharing the depth buffer; every world program writes all
@@ -46,6 +48,7 @@ Anything not handled here falls back to pygame: World.draw / draw_grid / Trails.
 (the --basic pipeline and the editor tests use them).
 """
 import dataclasses
+import functools
 import inspect
 import os
 import weakref
@@ -55,7 +58,7 @@ import moderngl
 import numpy as np
 import pygame
 
-from entities import FILL_EXPAND, Body, EnvConfig
+from entities import FILL_EXPAND, Body, EnvConfig, style_version
 from gl_effects import FrameInfo, make_effects
 import looping
 import materials
@@ -164,6 +167,58 @@ class _Topology:
                                seg_bodies=self.seg_bodies[seg], seg_first=self.seg_first[seg])
 
 
+class _Attrs:
+    """A World's per-body drawing attributes as arrays (WorldPacker.attrs), each made on first use and kept until a
+    body's style changes (entities.style_version) or the World repacks."""
+
+    def __init__(self, bodies):
+        self.bodies = bodies
+
+    @functools.cached_property
+    def fill_c(self):
+        return pack_rgb([b.fill_col for b in self.bodies])
+
+    @functools.cached_property
+    def stick_c(self):
+        return pack_rgb([b.stick_col for b in self.bodies])
+
+    @functools.cached_property
+    def point_c(self):
+        return pack_rgb([b.point_col for b in self.bodies])
+
+    @functools.cached_property
+    def wind(self):
+        return np.array([b.winding for b in self.bodies]).astype(np.int64)
+
+    @functools.cached_property
+    def stick_w(self):
+        return np.array([b.stick_width for b in self.bodies], dtype=np.int64)
+
+    @functools.cached_property
+    def point_r(self):
+        return np.array([float(b.point_radius) for b in self.bodies])
+
+
+class _Still:
+    """One pack mode's cache (WorldPacker._still): the fill / point rows of every body that doesn't move (all its
+    points fixed: inverse mass 0), packed once, plus where the moving bodies' rows go among them. Valid while the
+    topology, the bodies' style, the zoom and the material ids are the ones it was made with and the still bodies'
+    points are where they were (compared every frame with a copy, so an editor move or an undo is seen)."""
+
+    def __init__(self, key, body_mat, world, t, moving):
+        self.key, self.body_mat = key, body_mat  # (body_mat held: compared by identity)
+        self.moving = moving  # bool per body
+        self.pts = np.flatnonzero(~moving[t.point_body])  # the still bodies' points
+        self.snap = world.P[:, self.pts].copy()
+        self.fills = None  # (fills, verts, [border / rim line pieces]) of every fill body, made on first use
+        self.points = None  # (spring lines or None, dot stamps or None, their radii or None), made on first use
+
+    def valid(self, key, body_mat, world):
+        k = self.key
+        return (k[0] is key[0] and k[1:] == key[1:] and self.body_mat is body_mat
+                and np.array_equal(world.P[:, self.pts], self.snap))
+
+
 class WorldPacker:
     """World -> instance arrays for the three draw calls (pure numpy, no GL: testable on its own).
 
@@ -175,10 +230,23 @@ class WorldPacker:
     material: the id from body_mat (per body; base_mat for ropes and hooks, -1 for the grab lines: overlays drawn
     after the lit effects); kind: 0, +1 / -1 (the body's winding) for the rim lines of the no-outline view, 2 for a
     filled body's black border (no emission). Both only matter with lighting on (gl_world draws the same pixels
-    without them)."""
+    without them).
+    Caches (the output is the same, array for array, as packing from scratch): the per-body colours, widths, radii
+    and windings (attrs: until a body's style changes, entities.style_version, or the World repacks) and, per mode
+    (filled, outlines), the rows of the bodies that don't move (_Still), so a frame repacks only the moving bodies'
+    fills, borders, springs and dots and copies the rest (both modes of the lit points view stay warm)."""
 
     def __init__(self):
         self.topo = None
+        self._attrs, self._attrs_key = None, None
+        self._still = {}  # (filled, outlines) -> _Still
+
+    def attrs(self, world):
+        """The world's _Attrs (call after pack: for self.topo's world)."""
+        v = style_version()
+        if self._attrs is None or self._attrs_key[0] is not self.topo or self._attrs_key[1] != v:
+            self._attrs, self._attrs_key = _Attrs(world.bodies), (self.topo, v)
+        return self._attrs
 
     def pack(self, world, filled, zoom, outlines=True, body_mat=None, base_mat=0, eye_mat=0):
         bodies = world.bodies
@@ -191,21 +259,24 @@ class WorldPacker:
         if nb:
             if self.topo is None or not self.topo.valid(world):
                 self.topo = _Topology(world)
+                self._still.clear()
             t = self.topo
+            a = self.attrs(world)
             P = world.P * zoom
             body_layer = 2 * np.arange(nb, dtype=np.int64)  # +1 for a segment's inner line
+            still = self._still_rows(world, t, filled, zoom, outlines, body_mat)
             if filled:
-                fill_c = pack_rgb([b.fill_col for b in bodies])
+                fill_c = a.fill_c
                 if t.fill_bodies.size:
-                    fills, verts = self._fills(t, P, fill_c, body_layer, lines, bodies, outlines, mat)
+                    fills, verts = self._fills_cached(still, t, P, a, body_layer, lines, outlines, mat)
                     vert_pt = t.loop_idx
                 if t.seg_bodies.size:
-                    self._segments(t, P, fill_c, body_layer, bodies, lines, stamps, radii, outlines, mat)
+                    self._segments(t, P, fill_c, body_layer, a, lines, stamps, radii, outlines, mat)
                 dots = t.dot
             else:
                 dots = np.ones(nb, dtype=bool)  # the points view: Body.draw for every body
             if dots.any():
-                self._points(t, P, dots, body_layer, bodies, lines, stamps, radii, mat)
+                self._points_cached(still, t, P, dots, body_layer, a, lines, stamps, radii, mat)
             _eye_stamps(world, P, zoom, body_layer, stamps, radii, eye_mat)
             # bodies sticking out past a periodic edge also draw one period over (World.draw does the same), on
             # their own layers, so a body straddling the seam shows on both sides
@@ -219,23 +290,24 @@ class WorldPacker:
                 if filled:
                     sub = t.subset(mask)
                     if sub.fill_bodies.size:
-                        f2, v2 = self._fills(sub, Ps, fill_c, body_layer, lines, bodies, outlines, mat)
+                        f2, v2 = self._fills(sub, Ps, fill_c, body_layer, lines, a, outlines, mat)
                         f2[:, 0] += len(verts)
                         fills, verts = np.concatenate([fills, f2]), np.concatenate([verts, v2])
                         vert_pt = np.concatenate([vert_pt, sub.loop_idx])
                     if sub.seg_bodies.size:
-                        self._segments(sub, Ps, fill_c, body_layer, bodies, lines, stamps, radii, outlines, mat)
+                        self._segments(sub, Ps, fill_c, body_layer, a, lines, stamps, radii, outlines, mat)
                     d = dots & mask
                 else:
                     d = mask
                 if d.any():
-                    self._points(t, Ps, d, body_layer, bodies, lines, stamps, radii, mat)
+                    self._points(t, Ps, d, body_layer, a, lines, stamps, radii, mat)
                 _eye_stamps(world, Ps, zoom, body_layer, stamps, radii, eye_mat, mask)
         layer = 2 * nb
         for r in world.ropes:
             if r.width >= 1:
-                a, b = _px(r.end_pos(0) * zoom), _px(r.end_pos(1) * zoom)
-                lines.append(np.array([[a[0], a[1], b[0], b[1], r.width, pack_rgb([r.col])[0], layer, 0, base_mat, 0]]))
+                a_, b_ = _px(r.end_pos(0) * zoom), _px(r.end_pos(1) * zoom)
+                lines.append(np.array([[a_[0], a_[1], b_[0], b_[1], r.width, pack_rgb([r.col])[0], layer, 0, base_mat,
+                                        0]]))
             layer += 1
         black = pack_rgb([(0, 0, 0)])[0]  # Hook.draw's own black
         for hk in world.hooks:
@@ -251,13 +323,13 @@ class WorldPacker:
                 radii.append(np.array([float(rad)]))
             layer += 3
         if world.grabbed is not None and nb:
-            a, b = _px(world.P[:, world.grabbed] * zoom), _px(np.asarray(world.grab_target) * zoom)
-            lines.append(np.array([[a[0], a[1], b[0], b[1], 1, pack_rgb([(255, 255, 255)])[0], layer, 0, -1, 0]]))
+            a_, b_ = _px(world.P[:, world.grabbed] * zoom), _px(np.asarray(world.grab_target) * zoom)
+            lines.append(np.array([[a_[0], a_[1], b_[0], b_[1], 1, pack_rgb([(255, 255, 255)])[0], layer, 0, -1, 0]]))
         if getattr(world, "grab_set", None) is not None and nb:  # an area grab: a line per held body
             ca, cb, w = world.grab_lines()  # center to cursor; opacity 0.5 x the body's mean pull weight
-            a, b = _px(ca * zoom), _px(cb * zoom)
+            a_, b_ = _px(ca * zoom), _px(cb * zoom)
             k = len(w)
-            lines.append(np.stack([a[0], a[1], b[0], b[1], np.ones(k), np.full(k, pack_rgb([(255, 255, 255)])[0]),
+            lines.append(np.stack([a_[0], a_[1], b_[0], b_[1], np.ones(k), np.full(k, pack_rgb([(255, 255, 255)])[0]),
                                    np.full(k, layer), np.round(255 * (1 - 0.5 * w)), np.full(k, -1), np.zeros(k)],
                                   axis=1))
         cat = lambda xs, w: np.concatenate(xs).astype(np.int64) if xs else np.zeros((0, w), np.int64)
@@ -265,16 +337,86 @@ class WorldPacker:
         return dict(fills=fills, verts=verts, vert_pt=vert_pt, lines=lines[lines[:, 4] >= 1].astype(np.int32),
                     stamps=cat(stamps, 6), radii=np.concatenate(radii) if radii else np.zeros(0))
 
+    # ---------------- the still bodies' rows (_Still)
+    def _still_rows(self, world, t, filled, zoom, outlines, body_mat):
+        """This mode's _Still, made anew when it doesn't hold for this frame; None when every body moves (nothing to
+        keep: everything is packed from scratch)."""
+        mode = (bool(filled), bool(outlines))
+        key = (t, style_version(), float(zoom))
+        st = self._still.get(mode)
+        if st is not None and st.valid(key, body_mat, world):
+            return st
+        moving = np.zeros(len(world.bodies), bool)
+        moving[t.point_body[np.asarray(world.W) > 0]] = True
+        if moving.all():
+            self._still.pop(mode, None)
+            return None
+        st = self._still[mode] = _Still(key, body_mat, world, t, moving)
+        return st
+
+    def _fills_cached(self, st, t, P, a, body_layer, lines, outlines, mat):
+        """_fills over every fill body, the still ones' rows from `st` (packed on its first frame)."""
+        if st is None:
+            return self._fills(t, P, a.fill_c, body_layer, lines, a, outlines, mat)
+        if st.fills is None:
+            pieces = []
+            f, v = self._fills(t, P, a.fill_c, body_layer, pieces, a, outlines, mat)
+            st.fills = (f, v, pieces)
+            st.fill_sub = t.subset(st.moving)
+            st.fill_rows = np.flatnonzero(st.moving[t.fill_bodies])  # the moving bodies' fill rows
+            st.fill_verts = np.flatnonzero(st.moving[t.loop_body])  # and their vertices (a line row each)
+        f, v, pieces = st.fills
+        f, v, pieces = f.copy(), v.copy(), [p.copy() for p in pieces]
+        sub = st.fill_sub
+        if sub.fill_bodies.size:
+            new = []
+            f2, v2 = self._fills(sub, P, a.fill_c, body_layer, new, a, outlines, mat)
+            f2[:, 0] = t.loop_start[st.fill_rows]  # (the subset's starts count from its own first vertex)
+            f[st.fill_rows], v[st.fill_verts] = f2, v2
+            for p, p2 in zip(pieces, new):
+                p[st.fill_verts] = p2
+        lines += pieces
+        return f, v
+
+    def _points_cached(self, st, t, P, which, body_layer, a, lines, stamps, radii, mat):
+        """_points for the bodies in `which`, the still ones' rows from `st` (packed on its first frame)."""
+        if st is not None and st.points is not None and not np.array_equal(st.which, which):
+            st = None  # (`which` is fixed per mode and topology: not expected)
+        if st is None:
+            self._points(t, P, which, body_layer, a, lines, stamps, radii, mat)
+            return
+        if st.points is None:
+            ln, sp, rd = [], [], []
+            self._points(t, P, which, body_layer, a, ln, sp, rd, mat)
+            st.points = (ln[0] if ln else None, sp[0] if sp else None, rd[0] if rd else None)
+            st.which = which.copy()
+            st.spring_rows = np.flatnonzero(st.moving[t.spring_body[which[t.spring_body]]])
+            st.dot_rows = np.flatnonzero(st.moving[t.point_body[which[t.point_body]]])
+        ln, sp, rd = st.points
+        ln2, sp2, rd2 = [], [], []
+        self._points(t, P, which & st.moving, body_layer, a, ln2, sp2, rd2, mat)
+        if ln is not None:
+            ln = ln.copy()
+            if ln2:
+                ln[st.spring_rows] = ln2[0]
+            lines.append(ln)
+        if sp is not None:
+            sp = sp.copy()
+            if sp2:
+                sp[st.dot_rows] = sp2[0]
+            stamps.append(sp)
+            radii.append(rd.copy())
+
     @staticmethod
-    def _fills(t, P, fill_c, body_layer, lines, bodies, outlines=True, mat=None):
+    def _fills(t, P, fill_c, body_layer, lines, a, outlines=True, mat=None):
         """Closed polygons: draw_filled rounds the loop to whole pixels, fills it, then draw_border (entities.py):
-        the 1px outline plus BORDER_WIDTH - 1 copies shifted 1px outward along each edge's minor axis."""
+        the 1px outline plus BORDER_WIDTH - 1 copies shifted 1px outward along each edge's minor axis. a: _Attrs."""
         loop = np.round(P[:, t.loop_idx])  # (2, m) whole pixels, rounded like draw_filled
         loop = np.clip(np.nan_to_num(loop, nan=-COORD_LIMIT), -COORD_LIMIT, COORD_LIMIT).astype(np.int64)
         fb, starts = t.fill_bodies, t.loop_start
         lo = np.minimum.reduceat(loop, starts, axis=1)
         hi = np.maximum.reduceat(loop, starts, axis=1)
-        wind_b = np.array([b.winding for b in bodies]).astype(np.int64)
+        wind_b = a.wind
         fills = np.stack([starts, t.loop_len, fill_c[fb], body_layer[fb], lo[0], lo[1], hi[0], hi[1], mat[fb],
                           wind_b[fb]], axis=1)
         nxt = loop[:, t.loop_next]
@@ -296,42 +438,40 @@ class WorldPacker:
         return fills.astype(np.int32), loop.T.astype(np.int32)
 
     @staticmethod
-    def _segments(t, P, fill_c, body_layer, bodies, lines, stamps, radii, outlines=True, mat=None):
+    def _segments(t, P, fill_c, body_layer, a, lines, stamps, radii, outlines=True, mat=None):
         """Two-point bodies in the filled view: a thick border-coloured line with round ends, the fill line on top."""
         sb = t.seg_bodies
-        a, b = _px(P[:, t.seg_first]), _px(P[:, t.seg_first + 1])
-        sw = np.maximum(np.array([bodies[k].stick_width for k in sb], dtype=np.int64), 1)
+        p, q = _px(P[:, t.seg_first]), _px(P[:, t.seg_first + 1])
+        sw = np.maximum(a.stick_w[sb], 1)
         outer = sw + 2 * BORDER_WIDTH
         border = np.full(sb.size, pack_rgb([BORDER_COL])[0])
         layer, zero, m = body_layer[sb], np.zeros(sb.size, np.int64), mat[sb]
         if outlines:
-            lines.append(np.stack([a[0], a[1], b[0], b[1], outer, border, layer, zero, m, zero + 2], axis=1))
-            for end in (a, b):  # round caps: border parts
+            lines.append(np.stack([p[0], p[1], q[0], q[1], outer, border, layer, zero, m, zero + 2], axis=1))
+            for end in (p, q):  # round caps: border parts
                 stamps.append(np.stack([end[0], end[1], border, layer, zero, m + STAMP_BORDER], axis=1))
                 radii.append(outer / 2)
         fw = sw if outlines else sw + 2 * FILL_EXPAND
-        lines.append(np.stack([a[0], a[1], b[0], b[1], fw, fill_c[sb], layer + 1, zero, m, zero], axis=1))
+        lines.append(np.stack([p[0], p[1], q[0], q[1], fw, fill_c[sb], layer + 1, zero, m, zero], axis=1))
 
     @staticmethod
-    def _points(t, P, which, body_layer, bodies, lines, stamps, radii, mat=None):
+    def _points(t, P, which, body_layer, a, lines, stamps, radii, mat=None):
         """Body.draw for the bodies in `which`: springs (draw_edges) in stick_col, then a disc per point."""
-        stick_c = pack_rgb([b.stick_col for b in bodies])
-        point_c = pack_rgb([b.point_col for b in bodies])
         sel = which[t.spring_body]
         if sel.any():
             i, j = t.springs[:, sel]
             sb = t.spring_body[sel]
-            a, b = _px(P[:, i]), _px(P[:, j])
-            sw = np.array([bd.stick_width for bd in bodies], dtype=np.int64)[sb]
-            lines.append(np.stack([a[0], a[1], b[0], b[1], sw, stick_c[sb], body_layer[sb], 0 * sw, mat[sb], 0 * sw],
+            p, q = _px(P[:, i]), _px(P[:, j])
+            sw = a.stick_w[sb]
+            lines.append(np.stack([p[0], p[1], q[0], q[1], sw, a.stick_c[sb], body_layer[sb], 0 * sw, mat[sb], 0 * sw],
                                   axis=1))
         sel = np.flatnonzero(which[t.point_body])
         if sel.size:
             pb = t.point_body[sel]
             c = _px(P[:, sel])
             zero = np.zeros(sel.size, np.int64)
-            stamps.append(np.stack([c[0], c[1], point_c[pb], body_layer[pb], zero, mat[pb]], axis=1))
-            radii.append(np.array([float(b.point_radius) for b in bodies])[pb])
+            stamps.append(np.stack([c[0], c[1], a.point_c[pb], body_layer[pb], zero, mat[pb]], axis=1))
+            radii.append(a.point_r[pb])
 
 
 # ---------------- the pumpkins' eyes (pumpkin_eyes.py): circle stamps over their bodies
@@ -769,14 +909,15 @@ class GLWorld:
         self.gbuf_fbo = ctx.framebuffer([self.gbuf["albedo"], self.gbuf["normal"], self.gbuf["mat"]], self.depth)
 
     def _materials(self, world):
-        """Material ids per body (self.body_mat) and the material table, redone only when a body's material or
-        material_over changed (or bodies were added / removed): per frame this is one comparison per body."""
+        """Material ids per body (self.body_mat) and the material table, redone only when some body's style changed
+        (entities.style_version: its material, material_over or fill_col, whose hue an unset glow colour takes; a
+        palette switch sets those) or bodies were added / removed (the World repacked: a new P). _mat_sig is a new
+        object whenever it is redone (gl_sdf / gl_glass key their own caches on it)."""
         bodies = world.bodies
-        sig = [(getattr(b, "material", None), getattr(b, "material_over", None) or None,  # (+ fill_col: of_body's
-                tuple(() if getattr(b, "fill_col", None) is None else b.fill_col)) for b in bodies]  # glow hue)
-        if sig == self._mat_sig:
+        k = self._mat_sig
+        if k is not None and k[0] == style_version() and k[1] is world.P and k[2] == len(bodies):
             return
-        self._mat_sig = [(m, dict(o) if o else None, c) for m, o, c in sig]  # copies: in-place edits show up too
+        self._mat_sig = (style_version(), world.P, len(bodies))
         table = [None, materials.resolve()]
         ids = {table[1]: 1}
 
@@ -1032,7 +1173,7 @@ class GLWorld:
             lines = lines.copy()
             border = (lines[:, 9] == 2) & (lines[:, 6] < 2 * len(world.bodies))
             if border.any():
-                fill_c = pack_rgb([b.fill_col for b in world.bodies])
+                fill_c = self.packer.attrs(world).fill_c
                 lines[border, 5] = fill_c[lines[border, 6] // 2]
         n_lines = self.lines.write(lines) if len(lines) else 0
         n_stamps = self.stamps.write(inst) if len(inst) else 0

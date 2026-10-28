@@ -108,6 +108,48 @@ def polygon_points(cx, cy, radius, n, angle=-math.pi / 2):
 
 FILL_EXPAND = 1  # px the no-outline filled view grows each shape outward (Body.draw_filled, gl_world)
 
+# How bodies look: every assignment to one of these on any Body bumps a global counter (style_version), which the GPU
+# renderer's caches key on (gl_world: the material table, the packed per-body colours / widths / radii and the rows of
+# the bodies that don't move). Assign a new value to change one (palettes, the Material card and scene_io all do);
+# mutating one in place (a colour list, the material_over dict) isn't seen: call bump_style_version() after that.
+STYLE_FIELDS = ("point_col", "stick_col", "fill_col", "point_radius", "stick_width", "material", "material_over",
+                "winding")
+_STYLE_VERSION = [0]
+_NO_DEFAULT = object()
+
+
+def style_version():
+    """The count of style field assignments so far (STYLE_FIELDS): unchanged means no body's look changed."""
+    return _STYLE_VERSION[0]
+
+
+def bump_style_version():
+    """Mark every body's look as changed (for a change made some other way than assigning a STYLE_FIELDS field)."""
+    _STYLE_VERSION[0] += 1
+
+
+def _style_field(name, default=_NO_DEFAULT):
+    """A Body property stored in the instance dict that bumps style_version on every set (and delete)."""
+    key = "_style_" + name
+
+    def get(self):
+        try:
+            return self.__dict__[key]
+        except KeyError:
+            if default is _NO_DEFAULT:
+                raise AttributeError(name) from None
+            return default
+
+    def set(self, value):
+        self.__dict__[key] = value
+        _STYLE_VERSION[0] += 1
+
+    def delete(self):
+        self.__dict__.pop(key, None)
+        _STYLE_VERSION[0] += 1
+
+    return property(get, set, delete, f"Body.{name} (bumps style_version when set)")
+
 
 class Body:
     """A closed polygon of points. Collision outline is the loop 0 -> 1 -> ... -> n-1 -> 0."""
@@ -120,8 +162,15 @@ class Body:
     # How the lit renderer draws it (materials.py; research/lighting_contract.md): a materials.PRESETS name (None:
     # materials.DEFAULT) and a dict of Material fields overriding it. Nothing else reads them; other code uses
     # getattr defaults (materials.of_body), so objects without them still work.
-    material = None
-    material_over = None
+    material = _style_field("material", None)
+    material_over = _style_field("material_over", None)
+    # drawing style (set in __init__; scene_io sets winding on load): see STYLE_FIELDS
+    point_col = _style_field("point_col")
+    stick_col = _style_field("stick_col")
+    fill_col = _style_field("fill_col")
+    point_radius = _style_field("point_radius")
+    stick_width = _style_field("stick_width")
+    winding = _style_field("winding")
 
     def __init__(self, points=None, vels=None, mass=1.0, point_col=None, stick_col=None, point_radius=2, stick_width=1,
                  fill_col=None):
