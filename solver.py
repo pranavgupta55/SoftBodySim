@@ -23,16 +23,20 @@ def _jit():
 
 # EnvConfig.backend = "auto": a world runs on the GPU once it has AUTO_GPU_POINTS movable points (inverse mass > 0),
 # and goes back to the CPU only below AUTO_CPU_POINTS (hysteresis, so spawning / deleting near the line doesn't flip
-# it). Re-measured 2026-10-24 with the numba CPU path (solver_jit.py) and frame-level CCD on both backends, Apple M4
-# (10-core GPU), world 2244x1440, physics ms/frame CPU / GPU (best of 2 interleaved runs, 120 frames from 0.5 s in;
-# fluidN = the fluid preset with N hexagons):
-#   random walls 35 movable pts 0.55 / 2.16, fluid30 114 0.68 / 2.11, fluid60 324 1.12 / 2.23, fluid100 528
-#   1.55 / 2.63, fluid150 774 2.16 / 2.40, diamonds 840 4.15 / 3.27, fluid450 2478 9.5 / 4.4, fluid1000 5766
-#   45.6 / 11.4, fluid2000 11592 191 / 44
-# The GPU has a ~2 ms floor per frame; it pulls ahead between ~780 and ~840 movable points and wins 2-4x on big
-# scenes. (The first numpy-vs-GPU measurement put the line at 900: dense piles crossed at ~550, diamonds lost.)
-AUTO_GPU_POINTS = 800
-AUTO_CPU_POINTS = 650
+# it). Re-measured 2026-10-27 in the app (main_opengl, headless 1800x1169, normal priority, Apple M4), after the
+# per-frame GPU sync went: CPU physics now overlaps the GPU's rendering, while MLX physics queues behind it, and a
+# frame runs only 1.5-6 ticks at 1x-4x. In-app physics ms/tick CPU / GPU at 2x (unlit / lit; fluidN = the fluid
+# preset with N octagons, diamondsN = the diamonds map with N shapes):
+#   fluid260 1824 movable 0.79 / 1.17, lit 0.90 / 1.36; diamonds350 2275 1.12 / 1.32, lit 1.06 / 1.23; fluid330
+#   2344 1.09 / 1.02, lit 1.20 / 1.38; diamonds420 2730 1.37 / 1.16, lit 1.31 / 1.25; fluid380 2760 1.39 / 1.34, lit
+#   1.43 / 1.36; fluid420 3216 1.51 / 1.16, lit 1.54 / 1.28; diamonds500 3250 1.54 / 1.19, lit 1.64 / 1.34
+# and at 1x the CPU still wins at 2275-2344 points; at 4x (20-30 ticks a frame) the GPU wins from ~2300 (0.7-0.8 vs
+# 1.0 ms/tick). The tiled maps (halloween 1330 movable, penrose / diamonds evolved 1 1092) run faster on the CPU:
+# halloween 109 vs 96 fps at 1x, 73-92 vs 63-67 at 2x. Headless (step(1/60) x 120, 4 ticks a call, no rendering) the
+# GPU pulls ahead much earlier, at ~1400 (fluid200 1376 movable 0.50 / 0.49 ms/tick, halloween 0.86 / 0.70): that
+# is not what the app sees. Crossover in the app: ~2300-2700 movable points.
+AUTO_GPU_POINTS = 2500
+AUTO_CPU_POINTS = 2000
 
 
 # XPBD spring compliance from a SoftBody's PBD stiffness (EnvConfig.xpbd). A PBD spring in a Jacobi pass removes

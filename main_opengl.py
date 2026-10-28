@@ -352,7 +352,7 @@ class GpuTimer:
 
 def preload_gpu_backend():
     """Import gpu_backend (and with it MLX, tens of ms) on a background thread, so the first world that runs on the
-    GPU (backend "auto" picks it for big scenes such as diamonds and fluid) doesn't pay for it when it's opened.
+    GPU (backend "auto" picks it for big scenes such as fluid) doesn't pay for it when it's opened.
     Only the import: kernels are still built on first use, on the main thread. Without MLX this does nothing (World
     then imports it, and fails, exactly as before). Skipped when every world is forced onto the CPU."""
     if EnvConfig.backend == "cpu" or "gpu_backend" in sys.modules:
