@@ -41,8 +41,8 @@ the GI doesn't have.
 GiEffect (radiance cascades, an experiment) publishes frame.shared["gi"]: RGBA16F at the render size, the light
 emissive bodies throw on everything around them (occluded by shadow casters), to add to the diffuse light. It
 runs while GI_ENABLED is True (module flag, default False, read every frame) or the world has `gi` set (a per-world
-switch, saved in scenes; the Lights card's GI button toggles it), and then costs: a half-res scene pass, its own
-half-res jump flood (emitters + occluders), N_CASCADES cascade passes and an upsampling pass. GI_GAIN, times the
+switch, saved in scenes; the Lights card's GI button toggles it), and then costs: a half-res scene pass (+ its medium's mip
+levels), its own half-res jump flood (emitters + opaque occluders), N_CASCADES cascade passes and an upsampling pass. GI_GAIN, times the
 world's own `gi_gain` (if any; saved in scenes, set by a map's "lighting" block), scales the result (gi_gain():
 clamped to [0, MAX_GAIN], a non-finite gain counts as 1; GI_EMIT_GAIN likewise). Unlit materials emit nothing.
 On periodic maps the GI wraps seamlessly: the probe grid runs two top-cascade probe spacings past the period, and
@@ -50,8 +50,11 @@ cascade merges and the upsampling take any footprint that would leave the grid o
 The top GI_FAR_CASCADES cascades (the far field) are redone a band of 1 / GI_FAR_EVERY of their rows per frame and
 reused in between; a still scene renders exactly the same, and any whole-scene change redoes them at once
 (GiEffect._far_key).
-Translucent casters (FLAG_TRANSLUCENT) are partial occluders for GI: rc_scene stores their transmittance in the
-scene texel (a = 1 + T) and a cascade ray entering one goes on through it with its radiance x T (rc_cascade).
+Translucent casters (FLAG_TRANSLUCENT) are a participating medium for GI (after DexRT, arxiv.org/abs/2511.08498):
+rc_scene writes their extinction and emission per half-res texel (GI_GLASS_CHORD), mipmapped each frame, and leaves
+them out of the opaque scene the GI's jump flood seeds from; a cascade ray steps by the distance to opaque texels and
+each step multiplies its visibility by exp(-sigma x step), sigma read at the mip level of the step's length capped per
+cascade (GI_GLASS_LOD_CAPS). A ray that runs out of steps crosses the rest of its interval in one coarse look.
 
 Periodic maps: frame.period (render px; an axis with 0 doesn't repeat) is assumed to start at pixel 0; lookups
 wrap into [0, period) and distances are minimum-image.
@@ -66,7 +69,7 @@ import lights as lights_mod
 import materials
 
 # Reuse SdfEffect's fields from the last frame while every shadow caster is a fixed body and nothing they depend on
-# changed (SdfEffect._static_key: the casters' points, materials and colours, the world, view mode, zoom, size,
+# changed (_StaticSet: the casters' points, materials and colours, the world, view mode, zoom, size,
 # period). Not exact: a body that casts no shadow but is drawn over a caster's edge (a glowing shape resting on a
 # glass tile) un-flags those px of the caster mask every frame it is there; the reused fields keep the mask of the
 # frame they were built on. On penrose/evolved 1 halloween that is at most 6/255 on ~0.01% of px.
@@ -91,9 +94,17 @@ N_CASCADES = 6
 # GI_FAR_EVERY 1 (or GI_FAR_CASCADES 0): every cascade every frame.
 GI_FAR_CASCADES = 3
 GI_FAR_EVERY = 2
-# The least march step inside a translucent body, half-res texels (rc_cascade u_min_in). 1.0 (was 0.5): -0.3 ms on
-# halloween (after the far-band and SDF caches), 0.9% of px change by more than 2/255, max 7.
-RC_MIN_STEP_IN = 1.0
+# See-through bodies in the GI: a participating medium (rc_scene's mipmapped glass texture). A px of transmittance T
+# has extinction -ln T / GI_GLASS_CHORD per world unit, so a ray crossing GI_GLASS_CHORD of it keeps T (the
+# reference: Cauchy's mean chord pi A / P of the penrose maps' rhombi, edge 20.16: 15.1 thick, 9.3 thin, 12.9 for
+# their 1.618 : 1 mix). A body of about that size passes what one crossing passed when GI counted a factor T per body;
+# a thick slab now passes less (T^(chord / GI_GLASS_CHORD)) and a thin sliver more, and two touching bodies count
+# twice (they counted once). Cascade i reads the medium at mip level min(log2(step), GI_GLASS_LOD_CAPS[i]) (its last
+# entry for any cascade past the list). On the penrose glow / halloween maps the clusters of touching tiles came out
+# darker inside and the room ~18% dimmer: their gi_gain went up 1.28x to match the mean; GI_GLASS_CHORD 26 at the old
+# gains is the closest match to how they looked before (mean luma -0.3, the clusters less dark).
+GI_GLASS_CHORD = 13.0
+GI_GLASS_LOD_CAPS = (0, 0, 1, 2, 3, 4)  # ((1, 1, 2, 3, 4, 5): -0.37 ms, but a 1-chord wall passed 0.51, 2 chords 0.22)
 GI_L0 = 1.0  # cascade 0's ray interval, half-res texels (cascade i's is 4^i times longer)
 
 FULLSCREEN_VERT = "world_base.vert"  # gl_world's fullscreen triangle strip from gl_VertexID
@@ -318,6 +329,63 @@ def _shadow_lights(world):
         return False
 
 
+class _StaticSet:
+    """Reuse across frames of work that depends on one kind of body only (a bool per material id on gl_world, e.g.
+    mat_casts: shadow casters): key() is (key, the points of those bodies) when every one of them is a fixed body (so
+    only an edit, a material, colour or view change or a world swap changes them), else None; same() says whether the
+    last remembered frame had it. The key holds the world, its topology and material signature (gl_world: replaced on
+    any change), the palette, the view mode and outlines, plus the caller's `extra`; the points are compared too (an
+    editor drag of a fixed body). Other bodies are not in it: a moving one drawn over one of these changes what the
+    G-buffer shows of it by the px it covers, which the reused work then misses."""
+
+    def __init__(self, attr):
+        self.attr = attr
+        self.key, self.pos = None, None
+        self._fixed_of = (None, None, None)  # (topology, material signature, the bodies' point indices or None)
+
+    def of(self, gw, frame, extra):
+        world = frame.world
+        topo = getattr(getattr(gw, "packer", None), "topo", None)
+        mats, kind = getattr(gw, "body_mat", None), getattr(gw, self.attr, None)
+        bodies = getattr(world, "bodies", None)
+        if topo is None or mats is None or kind is None or bodies is None or len(mats) != len(bodies) \
+                or getattr(world, "P", None) is None:
+            return None
+        if getattr(world, "ropes", None) and len(kind) > 1 and kind[1]:  # (ropes draw in the default material)
+            return None
+        sig = getattr(gw, "_mat_sig", None)
+        if self._fixed_of[0] is not topo or self._fixed_of[1] is not sig:
+            fixed = np.array([bool(getattr(b, "fixed", False)) for b in bodies], bool)
+            mine = kind[np.clip(mats, 0, len(kind) - 1)]
+            idx = None
+            if not (mine & ~fixed).any():
+                pb = getattr(world, "point_body", None)
+                idx = None if pb is None or len(pb) != world.P.shape[1] else np.flatnonzero(mine[pb])
+            self._fixed_of = (topo, sig, idx)
+        idx = self._fixed_of[2]
+        if idx is None:
+            return None
+        hooks = tuple(tuple(float(v) for v in getattr(h, "pos", ())) for h in getattr(world, "hooks", ()) or ())
+        key = (world, topo, sig, getattr(world, "palette", None), bool(getattr(frame, "filled", True)),
+               getattr(gw, "last_outlines", None), float(frame.zoom), tuple(frame.clip), hooks, "tr" in frame.gbuf,
+               *extra)
+        return key, world.P[:, idx]
+
+    def same(self, k):
+        """Is k (from of()) the remembered frame's?"""
+        if k is None or self.key is None or len(k[0]) != len(self.key):
+            return False
+        return (all(a is b or (type(a) is type(b) and a == b) for a, b in zip(k[0], self.key))
+                and k[1].shape == self.pos.shape and np.array_equal(k[1], self.pos))
+
+    def remember(self, k):
+        self.key, self.pos = (None, None) if k is None else (k[0], k[1].copy())
+
+    def forget(self):
+        self.remember(None)
+        self._fixed_of = (None, None, None)
+
+
 class SdfEffect:
     """shared["sdf"] from the G-buffer's shadow-casting occluders; with translucent casters on screen also
     shared["sdf_opaque"], shared["sdf_tr"] and shared["sdf_tint"] (module docs)."""
@@ -334,54 +402,11 @@ class SdfEffect:
         # out of the margin doesn't reallocate every frame
         self.jfas, self.splits = {}, {}
         self.stats = {}
-        # the static cache (SDF_CACHE): the last frame's key (_static_key), the fixed casters' points then, what it
-        # published; the per-topology fixed-caster point indices
-        self._key, self._key_pos, self._pub = None, None, None
-        self._fixed_of = (None, None, None)
+        # the static cache (SDF_CACHE): every shadow caster fixed and unchanged since the last frame, which
+        # published _pub
+        self.static, self._pub = _StaticSet("mat_casts"), None
 
     CACHE = 4
-
-    def _static_key(self, gw, frame, size, origin, period, tr):
-        """(key, positions) when every shadow caster on the frame is a fixed body (so only an edit, a material or
-        view change or a world swap changes the caster mask), else None. The fields of the last frame are reused
-        while both are the same (run). Bodies that don't cast shadows are not in the key: moving ones drawn over a
-        caster's edge do change its mask by a few px (a pumpkin over a tile's rim un-flags those px), which the
-        reused fields then miss (see SDF_CACHE)."""
-        world = frame.world
-        topo = getattr(getattr(gw, "packer", None), "topo", None)
-        mats, casts = getattr(gw, "body_mat", None), getattr(gw, "mat_casts", None)
-        bodies = getattr(world, "bodies", None)
-        if not SDF_CACHE or topo is None or mats is None or casts is None or bodies is None \
-                or len(mats) != len(bodies) or getattr(world, "P", None) is None:
-            return None
-        if getattr(world, "ropes", None) and len(casts) > 1 and casts[1]:  # (ropes draw in the default material)
-            return None
-        sig = getattr(gw, "_mat_sig", None)
-        if self._fixed_of[0] is not topo or self._fixed_of[1] is not sig:
-            fixed = np.array([bool(getattr(b, "fixed", False)) for b in bodies], bool)
-            casting = casts[np.clip(mats, 0, len(casts) - 1)]
-            if (casting & ~fixed).any():
-                idx = None
-            else:
-                pb = getattr(world, "point_body", None)
-                idx = None if pb is None or len(pb) != world.P.shape[1] else np.flatnonzero((casting & fixed)[pb])
-            self._fixed_of = (topo, sig, idx)
-        idx = self._fixed_of[2]
-        if idx is None:
-            return None
-        pos = world.P[:, idx]
-        hooks = tuple(tuple(float(v) for v in getattr(h, "pos", ())) for h in getattr(world, "hooks", ()) or ())
-        key = (world, topo, sig, getattr(world, "palette", None), bool(getattr(frame, "filled", True)),
-               getattr(gw, "last_outlines", None), float(frame.zoom), tuple(frame.clip), size, origin, period, tr,
-               hooks, "tr" in frame.gbuf)
-        return key, pos
-
-    def _same(self, key):
-        """Is key (with its positions) the last frame's?"""
-        if key is None or self._key is None or len(key[0]) != len(self._key):
-            return False
-        return (all(a is b or (type(a) is type(b) and a == b) for a, b in zip(key[0], self._key))
-                and key[1].shape == self._key_pos.shape and np.array_equal(key[1], self._key_pos))
 
     def _cached(self, cache, size, make):
         obj = cache.pop(size, None)
@@ -440,13 +465,13 @@ class SdfEffect:
         period = _period(frame.period)
         frame.shared["sdf_origin"] = origin
         tr = self._wants_tr(gw, frame)
-        key = self._static_key(gw, frame, size, origin, period, tr)
-        hit = self._same(key) and self._pub is not None
+        key = self.static.of(gw, frame, (size, origin, period, tr)) if SDF_CACHE else None
+        hit = self.static.same(key) and self._pub is not None
         self.stats["cached"] = hit
         if hit:
             frame.shared.update(self._pub)
             return
-        self._key, self._key_pos = (None, None) if key is None else (key[0], key[1].copy())
+        self.static.remember(key)
         self._pub = None
         before = set(frame.shared)
         # with translucent fields shared["sdf"] is their union (SplitFlood), no flood of its own; the points view
@@ -476,8 +501,8 @@ class SdfEffect:
             p.release()
         self.jfas, self.splits = {}, {}
         self.jfa = self.progs = self.split = self.split_progs = None
-        self._key, self._key_pos, self._pub = None, None, None
-        self._fixed_of = (None, None, None)
+        self.static.forget()
+        self._pub = None
 
 
 class GiEffect:
@@ -524,13 +549,20 @@ class GiEffect:
         need = [max(h, int(math.ceil(p)) + 2 * m) if p > 0 else h for h, p in zip(half, period)]
         self.grid = tuple(-(-n // m) * m for n in need)
         self.scene = _tex(ctx, self.grid, 4, "f2")
-        self.scene_fbo = ctx.framebuffer([self.scene])
+        # the see-through medium (rc_scene): extinction and emission, mipmapped each frame; bilinear within the
+        # nearest mip level (trilinear changed at most 1/255 for +0.9 ms on halloween)
+        self.sigma = _tex(ctx, self.grid, 1, "f2", linear=True)
+        self.glow = _tex(ctx, self.grid, 4, "f2", linear=True)
+        for t in (self.sigma, self.glow):
+            t.filter = (moderngl.LINEAR_MIPMAP_NEAREST, moderngl.LINEAR)
+            t.build_mipmaps()
+        self.scene_fbo = ctx.framebuffer([self.scene, self.sigma, self.glow])
         self.casc = [_tex(ctx, self.grid, 4, "f2", linear=True) for _ in range(2)]
         self.casc_fbos = [ctx.framebuffer([t]) for t in self.casc]
         self.out = _tex(ctx, size, 4, "f2", linear=True)
         self.out_fbo = ctx.framebuffer([self.out])
         self.jfa = JumpFlood(ctx, self.grid, linear=False)
-        self.textures = [self.scene_fbo, self.scene, *self.casc_fbos, *self.casc, self.out_fbo, self.out]
+        self.textures = [self.scene_fbo, self.scene, self.sigma, self.glow, *self.casc_fbos, *self.casc, self.out_fbo, self.out]
         self.size, self.period = size, period
 
     def run(self, gw, frame):
@@ -562,19 +594,32 @@ class GiEffect:
             _set(p["scene"], name, unit)
         _set(p["scene"], "u_has_tr", tr is not None)
         _set(p["scene"], "u_emit_gain", _gain(GI_EMIT_GAIN))
+        _set(p["scene"], "u_chord", max(float(GI_GLASS_CHORD) * float(frame.zoom) / 2.0, 1e-3))  # (world -> texels)
+        _set(p["scene"], "u_period", period)
+        # (every frame: keeping the medium while all see-through bodies are fixed saved 0.15 ms of the pass's 0.7 on
+        # halloween, most of it being the px classification the opaque scene needs anyway, for up to 12/255 where a
+        # moving body had covered a tile's edge)
         self.scene_fbo.use()
         frame.fullscreen(p["scene"])
+        self.sigma.build_mipmaps()
+        self.glow.build_mipmaps()
         dist = self.jfa.build(frame, p, self.scene, 1, period, int(GI_JFA_START))
         # cascades, top down, ping-ponging between two textures
         c = p["cascade"]
         self.scene.use(0)
         dist.use(1)
+        self.sigma.use(3)
+        self.glow.use(4)
         _set(c, "u_scene", 0)
         _set(c, "u_dist", 1)
         _set(c, "u_upper", 2)
+        _set(c, "u_sigma", 3)
+        _set(c, "u_glow", 4)
         _set(c, "u_l0", float(GI_L0))
-        _set(c, "u_min_in", float(RC_MIN_STEP_IN))
         _set(c, "u_period", period)
+        # (medium lookups wrap into [m, period + m): their mip footprint stays on the grid, which runs 2 m past it)
+        _set(c, "u_wrap0", float(1 << (N_CASCADES - 1)))
+        caps = tuple(GI_GLASS_LOD_CAPS) or (0,)
         # the far cascades (GI_FAR_CASCADES, the top ones): kept in their own textures, a band of 1 / GI_FAR_EVERY of
         # their rows redone per frame (each cascade's band reads the one above as it stands: half fresh), all of them
         # when anything that changes the whole scene changed (_far_key) or a frame was skipped
@@ -603,6 +648,7 @@ class GiEffect:
             (upper if upper is not None else self.casc[0]).use(2)
             _set(c, "u_has_upper", i < N_CASCADES - 1)
             _set(c, "u_index", i)
+            _set(c, "u_lod_cap", float(caps[min(i, len(caps) - 1)]))
             fbo = self.far_fbos[k]
             if band is not None:
                 fbo.scissor = (0, band[0], self.grid[0], band[1] - band[0])
@@ -618,6 +664,7 @@ class GiEffect:
             (upper if upper is not None and i == N_CASCADES - 1 - n_far else self.casc[1 - cur]).use(2)
             _set(c, "u_has_upper", i < N_CASCADES - 1)
             _set(c, "u_index", i)
+            _set(c, "u_lod_cap", float(caps[min(i, len(caps) - 1)]))
             self.casc_fbos[cur].use()
             frame.fullscreen(c)
             cur = 1 - cur

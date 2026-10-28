@@ -1,5 +1,6 @@
 // Radiance cascades, output pass (gl_sdf.py GiEffect): cascade 0 (per-texel fluence on the half-res grid E)
-// upsampled to the render size as shared["gi"]. Solid texels (bodies) have no light inside them in the cascades:
+// upsampled to the render size as shared["gi"]. Solid texels (opaque bodies and emitters; see-through ones are a
+// medium the cascades see inside of, open here) have no light inside them in the cascades:
 // - the upsampling is bilinear over the open texels only (a solid one blended in would darken the light next to a
 //   body: a dark rim 1-2 px out around every body, emitters included);
 // - a body px takes the GI just outside its nearest edge (stepping out along the distance field's gradient): a body
