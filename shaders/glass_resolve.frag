@@ -300,6 +300,9 @@ void main() {
         float f0 = max(m.reflectivity, pow((ior - 1.0) / (ior + 1.0), 2.0));
         float F = f0 + (1.0 - f0) * pow(1.0 - n3.z, 5.0);
         if (ior > 3.0) F = min(F, max(m.reflectivity, 0.5));  // a very high ior doesn't turn the rim into a mirror
+#ifdef HAS_MARCH_STEPS_VAR
+        g_march_steps = MARCH_RIM_STEPS;
+#endif
         if (F > 0.01) col = mix(col, fluid ? liquid_reflection(p, n3, m.roughness)
                                            : reflection(p, n3, id, d, m.roughness), F);
         // L's per-pixel spec follows each fluid body's own dome: speckle on the merged liquid (its glint is enough)

@@ -178,7 +178,11 @@ int g_extra_steps = 0;
 #define MARCH_LOOP_STEPS (MARCH_STEPS + g_extra_steps)
 #else
 #define MARCH_BUDGET MARCH_BOUNCES
-#define MARCH_LOOP_STEPS MARCH_STEPS
+// The march's step budget for this ray: MARCH_STEPS, or MARCH_RIM_STEPS for a glass rim's reflection
+// (glass_resolve.frag; a mirror's keeps MARCH_STEPS: its reflections reach far).
+int g_march_steps = MARCH_STEPS;
+#define MARCH_LOOP_STEPS g_march_steps
+#define HAS_MARCH_STEPS_VAR
 #endif
 #ifndef MARCH_HOOK
 #define MARCH_HOOK(at, r, inside, t)

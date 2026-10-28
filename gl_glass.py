@@ -66,6 +66,9 @@ BEHIND_DIRECT = True  # light F's behind layer at each pixel (glass_behind.frag)
 # ---- in-plane march (glass_common.march)
 SDF_TRACE = True  # march mirror / glass-rim reflections in the plane when S's sdf is there (~+0.3 ms at 900x584)
 MARCH_STEPS = 96
+# a glass rim's reflection march (glass_resolve.frag): 32 (was MARCH_STEPS): -0.4 ms on halloween, 0.12% of px change
+# by more than 2/255; mirrors keep MARCH_STEPS (at 32 their long reflections lost up to 114/255 on the lighting demo)
+MARCH_RIM_STEPS = 32
 MARCH_BOUNCES = 3
 MARCH_MAX_T = 320.0  # px
 STEP_MIN_PX, STEP_MAX_PX = 1.0, 8.0  # sdf step clamp in air (max: so glass bodies outside the sdf aren't skipped)
@@ -128,7 +131,7 @@ def _glsl(v):
 
 
 def _defines(**over):
-    d = dict(MARCH_STEPS=MARCH_STEPS, MARCH_BOUNCES=MARCH_BOUNCES,
+    d = dict(MARCH_STEPS=MARCH_STEPS, MARCH_RIM_STEPS=MARCH_RIM_STEPS, MARCH_BOUNCES=MARCH_BOUNCES,
              MARCH_MAX_T=float(MARCH_MAX_T), STEP_MIN_PX=STEP_MIN_PX, STEP_MAX_PX=STEP_MAX_PX,
              STEP_NOSDF_PX=STEP_NOSDF_PX, STEP_MEDIUM_PX=STEP_MEDIUM_PX, RATIO_EPS=RATIO_EPS,
              REFRACT_DEPTH_PX=REFRACT_DEPTH_PX, MIN_REFRACT_PX=MIN_REFRACT_PX, THICK_PER_EDGE=THICK_PER_EDGE,

@@ -148,6 +148,8 @@ def test_view_identical(ctx):
     data = gh.build(gh.demo_shapes(), gh.checker(gh.SIZE))
     outs = []
     real_read = gl_glass._read
+    rim = gl_glass.MARCH_RIM_STEPS  # (the baseline's resolve has no separate rim budget: compare at equal ones)
+    gl_glass.MARCH_RIM_STEPS = gl_glass.MARCH_STEPS
     for src in (None, base):
         gl_glass._read = (real_read if src is None else
                           (lambda name, src=src: src if name == "glass_common.glsl" else real_read(name)))
@@ -161,6 +163,7 @@ def test_view_identical(ctx):
                 glass.release()
         finally:
             gl_glass._read = real_read
+            gl_glass.MARCH_RIM_STEPS = rim
     for i, sdf in enumerate((False, True)):
         same = np.array_equal(outs[i], outs[i + 2])
         check(same, f"c. glass view output byte-identical to glass_common@{BASELINE_REV} (sdf {sdf})"
