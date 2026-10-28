@@ -46,8 +46,9 @@ world's own `gi_gain` (if any; saved in scenes, set by a map's "lighting" block)
 clamped to [0, MAX_GAIN], a non-finite gain counts as 1; GI_EMIT_GAIN likewise). Unlit materials emit nothing.
 On periodic maps the GI wraps seamlessly: the probe grid runs two top-cascade probe spacings past the period, and
 cascade merges and the upsampling take any footprint that would leave the grid one period over.
-The top GI_FAR_CASCADES cascades (the far field) are redone only every GI_FAR_EVERY frames and reused in between;
-a still scene renders exactly the same, and any whole-scene change redoes them at once (GiEffect._far_key).
+The top GI_FAR_CASCADES cascades (the far field) are redone a band of 1 / GI_FAR_EVERY of their rows per frame and
+reused in between; a still scene renders exactly the same, and any whole-scene change redoes them at once
+(GiEffect._far_key).
 Translucent casters (FLAG_TRANSLUCENT) are partial occluders for GI: rc_scene stores their transmittance in the
 scene texel (a = 1 + T) and a cascade ray entering one goes on through it with its radiance x T (rc_cascade).
 
@@ -67,11 +68,12 @@ GI_GAIN = 1.0  # multiplies shared["gi"]
 GI_EMIT_GAIN = 1.0  # multiplies the emission the cascades start from
 N_CASCADES = 6
 # The far field: the top GI_FAR_CASCADES cascades (the longest rays: most of the GI's cost on maps full of
-# translucent glass, whose rays march on through every body) are redone every GI_FAR_EVERY frames and reused in
-# between. A still scene renders exactly as with every cascade every frame; moving emitters' light from more than
+# translucent glass, whose rays march on through every body) are redone a band of 1 / GI_FAR_EVERY of their rows
+# (scissored) per frame, so every frame costs the same and each row is redone every GI_FAR_EVERY frames. A still
+# scene renders exactly as with every cascade every frame; moving emitters' light from more than
 # GI_L0 x (4^(N - k) - 1) / 3 half-res texels away (k = GI_FAR_CASCADES: 21 texels = 42 render px) lags up to
 # GI_FAR_EVERY - 1 frames. Anything that changes the whole scene (GiEffect._far_key: world swap or map load,
-# materials / palette, view mode, zoom, size; GI or lighting switched off and on) redoes them at once.
+# materials / palette, view mode, zoom, size; GI or lighting switched off and on) redoes them whole at once.
 # GI_FAR_EVERY 1 (or GI_FAR_CASCADES 0): every cascade every frame.
 GI_FAR_CASCADES = 3
 GI_FAR_EVERY = 2
@@ -472,30 +474,42 @@ class GiEffect:
         _set(c, "u_upper", 2)
         _set(c, "u_l0", float(GI_L0))
         _set(c, "u_period", period)
-        # the far cascades (GI_FAR_CASCADES, the top ones): kept in their own textures and redone every
-        # GI_FAR_EVERY frames, reused in between, unless anything that changes the whole scene changed (_far_key)
+        # the far cascades (GI_FAR_CASCADES, the top ones): kept in their own textures, a band of 1 / GI_FAR_EVERY of
+        # their rows redone per frame (each cascade's band reads the one above as it stands: half fresh), all of them
+        # when anything that changes the whole scene changed (_far_key) or a frame was skipped
         n_far = min(max(int(GI_FAR_CASCADES), 0), N_CASCADES - 1) if int(GI_FAR_EVERY) > 1 else 0
         far = list(range(N_CASCADES - 1, N_CASCADES - 1 - n_far, -1))  # top down
-        refresh = True
+        # band: the rows redone this frame, (y0, y1), or None for all of them
+        band, full = None, True
         if n_far:
+            every = int(GI_FAR_EVERY)
             key = self._far_key(gw, frame, period)
             no = getattr(gw, "frame_no", None)
             if len(self.far) != n_far:
                 self._alloc_far(n_far)
             elif (key == self._far_last_key and no is not None and self._far_last_no is not None
-                  and no == self._far_last_no + 1 and self._far_age + 1 < int(GI_FAR_EVERY)):
-                refresh = False
-            self._far_age = 0 if refresh else self._far_age + 1
+                  and no == self._far_last_no + 1):
+                full = False
+            self._far_age = 0 if full else (self._far_age + 1) % every
             self._far_last_key, self._far_last_no = key, no
-        self.stats["far_refreshed"] = bool(n_far) and refresh
+            if not full:
+                h = self.grid[1]
+                band = (h * self._far_age // every, h * (self._far_age + 1) // every)
+        self.stats["far_refreshed"] = bool(n_far) and full
+        self.stats["far_band"] = band
         upper = None
         for k, i in enumerate(far):
-            if refresh:
-                (upper if upper is not None else self.casc[0]).use(2)
-                _set(c, "u_has_upper", i < N_CASCADES - 1)
-                _set(c, "u_index", i)
-                self.far_fbos[k].use()
-                frame.fullscreen(c)
+            (upper if upper is not None else self.casc[0]).use(2)
+            _set(c, "u_has_upper", i < N_CASCADES - 1)
+            _set(c, "u_index", i)
+            fbo = self.far_fbos[k]
+            if band is not None:
+                fbo.scissor = (0, band[0], self.grid[0], band[1] - band[0])
+            fbo.use()
+            frame.fullscreen(c)
+            if band is not None:
+                fbo.scissor = None
+                fbo.use()  # (scissor test back off for the passes after)
             upper = self.far[k]
         cur = 0
         for i in range(N_CASCADES - 1 - n_far, -1, -1):
