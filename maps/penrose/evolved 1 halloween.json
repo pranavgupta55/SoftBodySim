@@ -78,7 +78,7 @@
 "lighting": {
 "enabled": true,
 "gi": true,
-"gi_gain": 5.0,
+"gi_gain": 6.4,
 "background": {
 "lightness": 0.4,
 "saturation": 0.3
