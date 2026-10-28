@@ -34,10 +34,14 @@ Worlds: `session` (world_selector.WorldSession) holds the Custom world and the p
 are always its active world and that world's editor (rebound whenever the selector switches or resets a world, and
 swapped in hud.cards). The session is also the sidebar's Worlds card.
 
-Timing: the compute card's "present" section is split into upload / render / gpu wait / flip. "gpu wait" is a
-GPU-tagged section around ctx.finish(): the time the CPU blocks until the GPU has finished this frame's texture
-uploads and draw. It is a lower bound on GPU work (anything the GPU finished while the CPU was still issuing
-commands is not counted). Set MEASURE_GPU = False to skip the sync.
+Timing: the compute card's "present" section is split into upload / render / gpu wait / flip. The loop doesn't wait
+for the GPU to finish each frame: a GL time-elapsed query (GpuTimer) brackets a frame's GL work and is read one frame
+late, so the next frame's physics and packing run on the CPU while the GPU draws this one (one frame in flight).
+"gpu wait" is a GPU-tagged section around that read: the time the CPU blocks until the GPU has finished the previous
+frame (one frame stale; 0 while the CPU is the slower side). GpuTimer.seconds holds that frame's GPU time. The
+per-frame streamed data in gl_world (instance buffers, fill vertex textures) is orphaned / cycled, so writing the
+next frame's never waits for the GPU. Set MEASURE_GPU = False to skip the query (nothing then bounds the frames in
+flight but the swap).
 """
 import argparse
 import array
@@ -75,7 +79,7 @@ GRAB_AREA_MIN, GRAB_AREA_MAX = 10.0, 400.0  # the area grab's circle radius rang
 GRAB_AREA_WHEEL = 1.15  # each wheel notch scales the circle by this
 GRAB_AREA_PRESETS = (20.0, 40.0, 80.0, 160.0)  # O cycles the circle's radius through these (world units)
 OVERLAY_LEGEND_PX = 6  # the debug overlay legend's top-left corner, UI px in from the top-left of the screen
-MEASURE_GPU = True  # ctx.finish() before the flip so the compute card can show GPU time
+MEASURE_GPU = True  # GpuTimer: GPU time per frame, read one frame late (and at most one frame in flight)
 INPUT_EVENTS = {pygame.KEYDOWN, pygame.KEYUP, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL}
 
 # ---------------- moderngl plumbing
@@ -315,6 +319,37 @@ class GLPresenter:
         ctx.viewport = (0, 0, fb_w, fb_h)
 
 
+class GpuTimer:
+    """GPU time of each frame's GL work, from two GL time-elapsed queries used in turn: begin() / end() bracket a
+    frame's commands, collect() then reads the previous frame's query. Reading waits until the GPU has finished that
+    frame, so at most one frame is in flight (this frame's commands queued while the previous one completes), and the
+    CPU never waits for the frame it just issued. seconds: the last frame read (None before the first). Time-elapsed
+    queries can't nest: an effect timing its own stages with them (gl_glass profile) must not run inside a frame."""
+
+    def __init__(self, ctx):
+        self.queries = [ctx.query(time=True) for _ in range(2)]
+        self.issued = [False, False]
+        self.k = 0  # the query the next begin() uses
+        self.seconds = None
+
+    def begin(self):
+        self.queries[self.k].__enter__()
+
+    def end(self):
+        self.queries[self.k].__exit__(None, None, None)
+        self.issued[self.k] = True
+        self.k ^= 1
+
+    def collect(self):
+        """Wait for the frame before the one last ended and return its GPU seconds (None: there was none)."""
+        k = self.k
+        if not self.issued[k]:
+            return None
+        self.issued[k] = False
+        self.seconds = self.queries[k].elapsed / 1e9
+        return self.seconds
+
+
 def preload_gpu_backend():
     """Import gpu_backend (and with it MLX, tens of ms) on a background thread, so the first world that runs on the
     GPU (backend "auto" picks it for big scenes such as diamonds and fluid) doesn't pay for it when it's opened.
@@ -424,6 +459,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     world_width, world_height = world_px[0] / ViewConfig.zoom, world_px[1] / ViewConfig.zoom
     world_view = screen2.subsurface((0, 0) + world_px)  # the grid, trails and bodies are drawn in the world area only
     profiler = Profiler()
+    gpu_timer = GpuTimer(ctx) if MEASURE_GPU else None
 
     full_width = screen_width / ViewConfig.zoom  # a fullscreen world's width: the whole window
     no_sidebar = pygame.Rect(win_w, 0, 0, win_h)  # a fullscreen editor's sidebar while the panel is hidden
@@ -647,6 +683,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
             stepped = True
         time_ctl.pending = 0  # a step requested just before resuming is dropped
         profiler.switch("draw")
+        if gpu_timer is not None:
+            gpu_timer.begin()  # this frame's GL work, from the world layer to the HUD quad
         view = screen2 if full else world_view  # a fullscreen world fills the whole render surface
         if gpu_world is not None:
             with profiler.section("trails"):
@@ -700,9 +738,10 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
             if sidebar_shown:
                 with profiler.section("hud"):
                     presenter.render_hud()
-        if MEASURE_GPU:
-            with profiler.section("gpu wait", device="gpu"):
-                ctx.finish()
+        if gpu_timer is not None:
+            gpu_timer.end()
+            with profiler.section("gpu wait", device="gpu"):  # the previous frame (this one runs on meanwhile)
+                gpu_timer.collect()
         with profiler.section("flip"):
             display.flip()
         if frame_index == 0:  # the first frame is up: load the GPU backend while the next ones idle in clock.tick

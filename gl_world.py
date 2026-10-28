@@ -402,7 +402,9 @@ class CircleAtlas:
 
 
 class _Stream:
-    """A growable instance buffer and its vertex array for one program."""
+    """A growable instance buffer and its vertex array for one program. Every write orphans the buffer first (fresh
+    storage under the same buffer object): the app no longer waits for the GPU each frame (main_opengl), so a draw
+    from the previous write may still be queued, and it keeps reading the old storage instead of stalling the write."""
 
     def __init__(self, ctx, prog, fmt, attrs):
         self.ctx, self.prog, self.fmt, self.attrs = ctx, prog, fmt, attrs
@@ -417,9 +419,36 @@ class _Stream:
                 self.buf.release()
             self.buf = self.ctx.buffer(reserve=self.cap, dynamic=True)
             self.vao = self.ctx.vertex_array(self.prog, [(self.buf, self.fmt, *self.attrs)])
+        elif data.nbytes:
+            self.buf.orphan(self.cap)
         if data.nbytes:
-            self.buf.write(data.tobytes())
+            self.buf.write(data)
         return len(data)
+
+
+class _TexRing:
+    """`n` growable (VERT_ROW, rows) textures used in turn, one per write (the fill vertices: written once or twice
+    a frame). With frames in flight (main_opengl waits one frame late) the texture a queued draw reads isn't
+    rewritten until n writes later, so a write never waits for the GPU. Textures can't be orphaned like buffers."""
+
+    def __init__(self, ctx, n, components, dtype):
+        self.ctx, self.components, self.dtype = ctx, components, dtype
+        self.texs, self.i = [None] * n, -1
+
+    def next(self, rows):
+        """The next texture of the ring, with at least `rows` rows (grown: doubled, contents dropped)."""
+        self.i = (self.i + 1) % len(self.texs)
+        tex = self.texs[self.i]
+        if tex is None or tex.size[1] < rows:
+            cap = max(rows, 2 * tex.size[1]) if tex is not None else rows
+            if tex is not None:
+                tex.release()
+            tex = self.texs[self.i] = self.ctx.texture((VERT_ROW, cap), self.components, dtype=self.dtype)
+            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        return tex
+
+
+VERT_RING = 4  # fill vertex textures in the main ring: two writes a frame (body pass, points-view occluder fill) x 2
 
 
 def grid_cells(world, w, h, zoom):
@@ -550,7 +579,8 @@ class GLWorld:
         self.lines = _Stream(ctx, self.progs["line"], "4i 4i 2i/i", ("in_ends", "in_style", "in_mat"))
         self.stamps = _Stream(ctx, self.progs["stamp"], "4i 4i 3i/i", ("in_pos", "in_mask", "in_style"))
         self.points = _Stream(ctx, self.progs["points"], "2i 4i", ("in_pos", "in_col"))
-        self.verts_tex = None
+        self.verts_tex = None  # the fill vertices of the last _upload_fills (one of _verts' textures)
+        self._verts = _TexRing(ctx, VERT_RING, 2, "i4")
         self.uvs_tex = ctx.texture((1, 1), 2, dtype="f4")
         self.uvs_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.atlas = CircleAtlas(ctx)
@@ -891,26 +921,23 @@ class GLWorld:
         if not len(fills):
             return 0
         rows = -(-len(verts) // VERT_ROW)
-        if self.verts_tex is None or self.verts_tex.size[1] < rows:
-            cap = max(rows, 2 * self.verts_tex.size[1]) if self.verts_tex is not None else rows
-            if self.verts_tex is not None:
-                self.verts_tex.release()
+        self.verts_tex = self._verts.next(rows)
+        if self.uvs_tex.size[0] != VERT_ROW or self.uvs_tex.size[1] < rows:
+            cap = max(rows, 2 * self.uvs_tex.size[1]) if self.uvs_tex.size[0] == VERT_ROW else rows
             self.uvs_tex.release()
-            self.verts_tex = ctx.texture((VERT_ROW, cap), 2, dtype="i4")
-            self.verts_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
             self.uvs_tex = ctx.texture((VERT_ROW, cap), 2, dtype="f4")
             self.uvs_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
             self._uv_key = None
         buf = np.zeros((rows * VERT_ROW, 2), np.int32)
         buf[:len(verts)] = verts
-        self.verts_tex.write(buf.tobytes(), viewport=(0, 0, VERT_ROW, rows))
+        self.verts_tex.write(buf, viewport=(0, 0, VERT_ROW, rows))
         vp = data["vert_pt"]
         key = self._uv_key
         if rest is not None and not (key is not None and key[0] is rest and np.array_equal(key[1], vp)):
             # rest coordinates change only with the topology or the periodic copies drawn
             uv = np.zeros((rows * VERT_ROW, 2), np.float32)
             uv[:len(verts)] = rest[vp]
-            self.uvs_tex.write(uv.tobytes(), viewport=(0, 0, VERT_ROW, rows))
+            self.uvs_tex.write(uv, viewport=(0, 0, VERT_ROW, rows))
             self._uv_key = (rest, vp.copy())
         return self.fills.write(fills)
 
@@ -919,7 +946,7 @@ class GLWorld:
         framebuffer, depth-tested by layer. blend: the unlit pass's translucent grab lines. ring: the margin's own
         streams and vertex texture (_margin) instead of the main ones."""
         ctx = self.ctx
-        fills, lines, stamps, verts_tex = ring or (self.fills, self.lines, self.stamps, self.verts_tex)
+        fills, lines, stamps, verts_tex = ring[:4] if ring else (self.fills, self.lines, self.stamps, self.verts_tex)
         self.material_tex.use(2)
         ctx.enable(moderngl.DEPTH_TEST)
         ctx.depth_func = "<="
@@ -1157,7 +1184,8 @@ class GLWorld:
             p = self.progs
             self._ring_streams = [_Stream(ctx, p["fill"], "4i 4i 2i/i", ("in_info", "in_box", "in_mat")),
                                   _Stream(ctx, p["line"], "4i 4i 2i/i", ("in_ends", "in_style", "in_mat")),
-                                  _Stream(ctx, p["stamp"], "4i 4i 3i/i", ("in_pos", "in_mask", "in_style")), None]
+                                  _Stream(ctx, p["stamp"], "4i 4i 3i/i", ("in_pos", "in_mask", "in_style")),
+                                  None, _TexRing(ctx, 2, 2, "i4")]  # [3]: this frame's vertex texture, of ring [4]
         rs = self._ring_streams
         shift = np.array([left, top, left, top])
         n_fills = n_lines = n_stamps = 0
@@ -1165,15 +1193,10 @@ class GLWorld:
             f = fills[keep_f].copy()
             f[:, 4:8] += shift
             rows = -(-len(verts) // VERT_ROW)
-            if rs[3] is None or rs[3].size[1] < rows:
-                if rs[3] is not None:
-                    rs[3].release()
-                rs[3] = ctx.texture((VERT_ROW, max(rows, 2 * rs[3].size[1] if rs[3] is not None else rows)), 2,
-                                    dtype="i4")
-                rs[3].filter = (moderngl.NEAREST, moderngl.NEAREST)
+            rs[3] = rs[4].next(rows)
             buf = np.zeros((rows * VERT_ROW, 2), np.int32)
             buf[:len(verts)] = verts + np.array([left, top], np.int32)
-            rs[3].write(buf.tobytes(), viewport=(0, 0, VERT_ROW, rows))
+            rs[3].write(buf, viewport=(0, 0, VERT_ROW, rows))
             n_fills = rs[0].write(f)
         if keep_l.any():
             ln = lines[keep_l].copy()
