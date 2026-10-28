@@ -17,9 +17,10 @@ One round, incumbent layout K, S fresh seeds shared by every job of the round (p
   3. Per chunk, the best variant replaces the incumbent's tiles only if its flow beats the incumbent's by more than
      --margin.
   4. Assemble K' (chunk_mutate.assemble, which drops border tiles that break the placement rules). Score the
-     shifted chunks whose tiles differ between K and K' on the same seeds, for both; while a shifted chunk got worse
-     by more than --seam-threshold, revert one changed grid chunk overlapping the worst such one (the one that gained
-     least in step 3), re-assemble and re-score the shifted chunks it touches.
+     shifted chunks whose tiles differ between K and K' on the same seeds, for both. A changed grid chunk's seam
+     damage is the summed flow change of those shifted chunks over it; a chunk past -(--seam-threshold) is re-scored
+     on --recheck-seeds fresh seeds and judged on all of them; if still past it, the worst is reverted,
+     K' re-assembled and re-scored. (One chunk's flow varies ~0.02 between seeds, so the threshold sits at ~2x.)
   5. Save K' to maps/<base's folder>/OUT_NAME.json (the base's spawn, tiling, clusters and lighting kept) and to
      LOG_DIR/layouts/rN.json.
   6. Every --spot-every rounds and after the last round: one whole-map run of K' per spot seed (chunk_test.
@@ -224,9 +225,9 @@ class Scorer:
         return [[self.cache[ck] for ck in row] for row in keyed]
 
 
-def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin=0.005, seam_threshold=0.01,
-           n_remove=3, n_add=3, share=0.5, seed=0, deadline=None, spot_every=2, spot_seconds=120.0, spot_seeds=2,
-           test_wall=TEST_WALL, clock=time.time, say=print):
+def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin=0.005, seam_threshold=0.04,
+           recheck_seeds=2, n_remove=3, n_add=3, share=0.5, seed=0, deadline=None, spot_every=2, spot_seconds=120.0,
+           spot_seeds=2, test_wall=TEST_WALL, clock=time.time, say=print):
     """Run up to `rounds` rounds from be.base_keys (see the module doc); returns {"keys", "rounds", "history",
     "spots"}. `be`: a MapBackend or a fake with the same members."""
     os.makedirs(os.path.join(log_dir, "layouts"), exist_ok=True)
@@ -331,9 +332,18 @@ def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin
                         best = ((f, s), v)
                 if best is not None and best[1] != K and best[0][0] > flow[g] + margin:
                     picks[g], gain[g] = best[1], best[0][0] - flow[g]
-            # 4. assemble, then revert changed chunks under seams that got worse
+            # 4. assemble, then revert changed chunks whose seams got worse in total (re-checked on more seeds)
             changed = sorted(picks)
             reverted, seam_log, Kn = [], [], K
+            recheck = Scorer(pool, size, pad, [int(rng.integers(1, 1 << 30)) for _ in range(recheck_seeds)], log, r) \
+                if recheck_seeds else None
+
+            def deltas(scorer, Kn, chunks, suffix=""):
+                res = scorer.score([(K, s, "shift_inc" + suffix, {}) for s in chunks]
+                                   + [(Kn, s, "shift_new" + suffix, {"reverted": list(reverted)}) for s in chunks])
+                n = len(chunks)
+                return {s: mean_of(res[n + i]) - mean_of(res[i]) for i, s in enumerate(chunks)}
+
             while True:
                 live = [g for g in changed if g not in reverted]
                 if not live:
@@ -341,16 +351,20 @@ def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin
                     break
                 Kn = be.assemble({g: picks.get(g, K) if g not in reverted else K for g in grids})
                 affected = [s for s in shifted if sc.sig(Kn, s) != sc.sig(K, s)]
-                res = sc.score([(K, s, "shift_inc", {}) for s in affected]
-                               + [(Kn, s, "shift_new", {"reverted": list(reverted)}) for s in affected])
-                n = len(affected)
-                delta = {s: mean_of(res[n + i]) - mean_of(res[i]) for i, s in enumerate(affected)}
+                delta = deltas(sc, Kn, affected)
+                # a changed chunk's seam damage: the summed change of the affected shifted chunks over it
+                damage = {g: sum(delta[s] for s in over[g] if s in delta) for g in live}
                 victim = None
-                for d, s in sorted((d, s) for s, d in delta.items() if d < -seam_threshold):
-                    cands = [g for g in live if s in over[g]]
-                    if cands:
-                        victim = min(cands, key=lambda g: (gain[g], g))
-                        seam_log.append({"shifted": s, "delta": round(d, 4), "revert": victim})
+                for d, g in sorted((d, g) for g, d in damage.items() if d < -seam_threshold):
+                    mine = [s for s in over[g] if s in delta]
+                    if recheck is not None:  # suspect: rescore its seams on fresh seeds, judge on all of them
+                        more = deltas(recheck, Kn, mine, "_recheck")
+                        w0, w1 = len(sc.seeds), len(recheck.seeds)
+                        d = sum((delta[s] * w0 + more[s] * w1) / (w0 + w1) for s in mine)
+                    seam_log.append({"chunk": g, "damage": round(sum(delta[s] for s in mine), 4),
+                                     "rechecked": round(d, 4), "shifted": mine, "revert": d < -seam_threshold})
+                    if d < -seam_threshold:
+                        victim = g
                         break
                 if victim is None:
                     break
@@ -404,8 +418,10 @@ def main(argv=None, backend=None):
     p.add_argument("--seeds", type=int, default=2, help="paired seeds per round (fresh each round)")
     p.add_argument("--workers", type=int, default=6)
     p.add_argument("--margin", type=float, default=0.005, help="a variant must beat the chunk's flow by more")
-    p.add_argument("--seam-threshold", type=float, default=0.01,
-                   help="a shifted chunk losing more flow than this reverts a changed chunk under it")
+    p.add_argument("--seam-threshold", type=float, default=0.04,
+                   help="a changed chunk is reverted if the shifted chunks over it lose more flow than this in total")
+    p.add_argument("--recheck-seeds", type=int, default=2,
+                   help="fresh seeds a suspect seam is re-scored on before reverting (0: no re-check)")
     p.add_argument("--remove", type=int, default=3, help="tiles removed per chunk variant")
     p.add_argument("--add", type=int, default=3, help="tiles added per chunk variant")
     p.add_argument("--targeted-share", type=float, default=0.5, help="share of stuck-targeted (vs uniform) draws")
@@ -435,7 +451,8 @@ def main(argv=None, backend=None):
         p.error("OUT_NAME is the base map: pick a new name")
     log_dir = args.log_dir or os.path.join(tempfile.gettempdir(), "chunk_evolve", args.name)
     return evolve(be, out, log_dir, args.rounds, variants=args.variants, seeds=args.seeds, workers=args.workers,
-                  margin=args.margin, seam_threshold=args.seam_threshold, n_remove=args.remove, n_add=args.add,
+                  margin=args.margin, seam_threshold=args.seam_threshold,
+                  recheck_seeds=args.recheck_seeds, n_remove=args.remove, n_add=args.add,
                   share=args.targeted_share, seed=args.seed, deadline=parse_deadline(args.deadline),
                   spot_every=args.spot_every, spot_seconds=args.spot_seconds, spot_seeds=args.spot_seeds,
                   test_wall=args.test_wall)

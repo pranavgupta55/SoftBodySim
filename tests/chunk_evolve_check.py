@@ -174,7 +174,7 @@ def check_run(tmp):
     # paired seeds
     ok_seeds, all_seeds = True, []
     for rec in rounds:
-        mine = [x for x in jobs if x["round"] == rec["round"]]
+        mine = [x for x in jobs if x["round"] == rec["round"] and not x["role"].endswith("_recheck")]
         ok_seeds &= {x["seed"] for x in mine} == set(rec["seeds"]) and len(set(rec["seeds"])) == 2
         groups = {}
         for x in mine:
@@ -208,7 +208,8 @@ def check_run(tmp):
     check(ok_own, "only kept changed chunks' tiles move between rounds")
     check(not (res["keys"] & POISON), "no poison tile in the final layout")
     seams = [s for rec in rounds for s in rec["seams"]]
-    check(any(s["revert"] == "grid r0c0" for s in seams), f"seam reverts took grid r0c0 back ({len(seams)} reverts)")
+    check(any(s["chunk"] == "grid r0c0" and s["revert"] for s in seams),
+          f"seam reverts took grid r0c0 back ({sum(s['revert'] for s in seams)} reverts)")
     check(max(be.stuck_seen) > 0,
           "mutate gets the chunk's stuck shapes")
     shift_inc = [x for x in jobs if x["role"] == "shift_inc"]
