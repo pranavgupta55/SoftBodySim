@@ -76,6 +76,9 @@ class EnvConfig:
     # ticks per frame -> slower frames): a frame costing render + 0.85 dt of physics settles at dt = render / 0.15
     # (2 ms of rendering: ~13 ms frames, ~75 fps). It never cuts below what scale 1 needs, so speeds <= 100% are
     # untouched. Ticks are never made longer (that would change the trajectory). None: no budget.
+    # The app (main_opengl) passes World.step a budget of its own instead: main_opengl.FRAME_TARGET (1/60 s) minus
+    # the last frame's measured rendering, so a map that takes long to draw keeps ~60 fps at high time scales (a
+    # lower delivered speed) instead of the 0.85 share above, which assumes ~2 ms of rendering. None turns that off too.
     physics_budget = 0.85 / 60
 
 

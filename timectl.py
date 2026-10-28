@@ -9,9 +9,10 @@ never the ticks themselves: every speed follows the same trajectory, tick for ti
     0.25x   60 ticks of 1/240 s per real second   (about one every 4th frame at 160 fps)
     1x      240 ticks per second                   (1.5 per frame at 160 fps, 4 per frame at 60 fps)
     2x      480 ticks per second                   (twice the physics cost)
-    100x    24000 ticks per second                 (100 times the cost: past EnvConfig.physics_budget a frame runs
+    100x    24000 ticks per second                 (100 times the cost: past the physics budget a frame runs
                                                     fewer ticks than asked and the rest is dropped, so the delivered
-                                                    speed, `actual` below, falls short of the request)
+                                                    speed, `actual` below, falls short of the request; the app's
+                                                    budget: main_opengl.FRAME_TARGET less the last frame's rendering)
 
 Frame stepping (N, while paused) runs one 1/60 s frame at the current scale: round(substeps x scale) ticks, at least
 one, so 1x + N steps 4 ticks and 0.25x + N a single 1/240 s tick at a time (World.step_frame). Collisions are

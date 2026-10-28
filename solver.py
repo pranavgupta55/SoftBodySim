@@ -520,7 +520,7 @@ class World:
         4 substeps per 1/60 s frame). Inside step() it is this world's own (its env overrides apply)."""
         return 1.0 / (60.0 * EnvConfig.substeps)
 
-    def step(self, dt, scale=1.0, frames=None):
+    def step(self, dt, scale=1.0, frames=None, budget=None):
         """Advance dt * scale seconds in whole fixed ticks (see _step): the time goes into an accumulator and every
         whole tick_length() in it runs, the remainder waits for the next call. A tick is one PBD substep; every
         span_ticks ticks (counted from tick 0, whatever the calls) end with one CCD pass (_tick). So the trajectory
@@ -529,10 +529,12 @@ class World:
         state CCD hasn't checked yet, which may overlap; settle() ends the span early).
         scale is the time scale (timectl.py): more or fewer ticks per call, never longer or shorter ones. dt is
         clamped at max_dt first (a hitch drops time instead of piling up ticks), and above scale 1 physics_budget
-        may cap the ticks of a call (the excess time is dropped). frames is ignored (it used to set the substep count
-        per frame; kept so old callers still work). Sets last_sim_dt to the seconds actually simulated (ticks run x
-        tick length), last_requested_dt to dt * scale and last_wraps to the looping moves of every tick run."""
-        self._with_env(self._step, dt, scale)
+        may cap the ticks of a call (the excess time is dropped). budget: seconds of wall time this call's ticks may
+        take, in place of physics_budget's share of dt (main_opengl passes what the frame has left after rendering);
+        either way never fewer ticks than scale 1 needs. frames is ignored (it used to set the substep count per
+        frame; kept so old callers still work). Sets last_sim_dt to the seconds actually simulated (ticks run x tick
+        length), last_requested_dt to dt * scale and last_wraps to the looping moves of every tick run."""
+        self._with_env(self._step, dt, scale, budget)
 
     def step_frame(self, scale=1.0):
         """N while paused (timectl.py): one 1/60 s frame at the time scale, round(substeps * scale) ticks (at least
@@ -552,7 +554,7 @@ class World:
             for name, value in saved.items():
                 setattr(EnvConfig, name, value)
 
-    def _step(self, dt, scale):
+    def _step(self, dt, scale, budget=None):
         tick = self.tick_length()
         self.last_requested_dt = dt * scale  # what the caller asked for (before the max_dt clamp)
         dt = min(dt, EnvConfig.max_dt)  # hitch clamp, on real time: a long stall drops time, no burst of ticks
@@ -561,12 +563,16 @@ class World:
         self._tick_acc -= n * tick
         if abs(self._tick_acc) < 1e-6 * tick:
             self._tick_acc = 0.0
-        if EnvConfig.physics_budget is not None and self._substep_cost:
-            # at most physics_budget of wall time per 1/60 s of real time (85% of the frame); never below what scale 1
-            # needs (dt / tick plus one for the carried remainder), so scales <= 1 are never cut. The excess is
-            # dropped, not carried
+        if EnvConfig.physics_budget is None:  # (this world's env may turn it off too)
+            budget = None
+        elif budget is None:
+            budget = EnvConfig.physics_budget * 60.0 * dt  # physics_budget per 1/60 s of real time (85% of the frame)
+        if budget is not None and self._substep_cost:
+            # at most `budget` s of wall time, from the running mean tick cost; never below what scale 1 needs
+            # (dt / tick plus one for the carried remainder), so scales <= 1 are never cut. The excess is dropped,
+            # not carried
             base = int(dt / tick + 1e-6) + 1
-            n = min(n, max(base, int(EnvConfig.physics_budget * 60.0 * dt / self._substep_cost)))
+            n = min(n, max(base, int(max(budget, 0.0) / self._substep_cost)))
         self._run_ticks(n, tick)
 
     def _step_frame(self, scale):

@@ -79,6 +79,10 @@ GRAB_AREA_MIN, GRAB_AREA_MAX = 10.0, 400.0  # the area grab's circle radius rang
 GRAB_AREA_WHEEL = 1.15  # each wheel notch scales the circle by this
 GRAB_AREA_PRESETS = (20.0, 40.0, 80.0, 160.0)  # O cycles the circle's radius through these (world units)
 OVERLAY_LEGEND_PX = 6  # the debug overlay legend's top-left corner, UI px in from the top-left of the screen
+# s: the frame time a time scale above 1 aims for. Physics gets at most this minus the last frame's measured rendering
+# (everything but its physics and the frame cap's sleep: draw, UI, present, the GPU wait), and never fewer ticks than
+# 1x needs (World.step's budget); the rest of the requested time is dropped
+FRAME_TARGET = 1 / 60
 MEASURE_GPU = True  # GpuTimer: GPU time per frame, read one frame late (and at most one frame in flight)
 INPUT_EVENTS = {pygame.KEYDOWN, pygame.KEYUP, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL}
 
@@ -348,6 +352,16 @@ class GpuTimer:
         self.issued[k] = False
         self.seconds = self.queries[k].elapsed / 1e9
         return self.seconds
+
+
+def physics_budget(last):
+    """World.step's budget for this frame: FRAME_TARGET minus the non-physics time of the last profiled frame `last`
+    (a profiler.Frame: its wall time less its physics section and idle wait), or None (World.step's own
+    EnvConfig.physics_budget rule) before the first frame or with EnvConfig.physics_budget off."""
+    if last is None or EnvConfig.physics_budget is None:
+        return None
+    render = last.wall - last.sections.get(("physics",), 0.0) - last.idle
+    return max(FRAME_TARGET - render, 0.0)
 
 
 def preload_gpu_backend():
@@ -672,7 +686,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         # world runs whole fixed ticks and carries the rest, so the frame rate never changes the physics
         stepped = not editor.paused
         if stepped:
-            world.step(*time_ctl.step_args(dt / fps))
+            world.step(*time_ctl.step_args(dt / fps), budget=physics_budget(profiler.last))
             time_ctl.note(dt / fps, getattr(world, "last_sim_dt", 0.0))  # the delivered speed (Controls card)
             overlays.after_step(world)
         else:
