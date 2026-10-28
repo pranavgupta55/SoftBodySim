@@ -9,7 +9,7 @@
 // A ray that reaches its interval's end unblocked takes the radiance cascade i+1 saw in its direction, bilinearly
 // interpolated between the 4 nearest cascade i+1 probes. Cascade 0's tile is the whole texture: per-texel fluence.
 // Needs sdf_common.glsl.
-uniform sampler2D u_scene;   // E: rgb emission, a solid (rc_scene.frag)
+uniform sampler2D u_scene;   // E: rgb emission, a: 0 open, 1 solid, 1 + T translucent (rc_scene.frag)
 uniform sampler2D u_dist;    // E: signed distance to solid texels, in texels (NEAREST)
 uniform sampler2D u_upper;   // cascade i+1, when u_has_upper
 uniform bool u_has_upper;
@@ -22,16 +22,35 @@ out vec4 f_rad;
 const float TAU = 6.28318530718;
 const int RC_STEPS = 32;
 
+// rgb: the radiance gathered, a: what still gets through (0 = blocked). A solid texel stops the ray with its
+// emission; a translucent one (scene a = 1 + T, rc_scene) adds its emission and the ray goes on through the body
+// with x T (once per body: the ray strides through it). A ray that starts inside a translucent body past its probe
+// (a > 0) is the continuation of a lower cascade's ray, which already counted that body.
 vec4 march(vec2 o, vec2 dir, float a, float b, ivec2 size) {
     float t = a;
+    vec3 rad = vec3(0.0);
+    float vis = 1.0;
+    bool inside = a > 0.0;
     for (int k = 0; k < RC_STEPS && t <= b; k++) {
         ivec2 q = ivec2(floor(o + dir * t));
-        if (!sdf_wrap(q, size, u_period)) return vec4(0.0, 0.0, 0.0, 1.0);  // off the map: nothing there
+        if (!sdf_wrap(q, size, u_period)) return vec4(rad, vis);  // off the map: nothing there
         float d = texelFetch(u_dist, q, 0).r;
-        if (d < 0.0) return vec4(texelFetch(u_scene, q, 0).rgb, 0.0);
-        t += max(d - 0.5, 0.5);
+        if (d < 0.0) {
+            vec4 s = texelFetch(u_scene, q, 0);
+            float tr = s.a - 1.0;
+            if (tr <= 0.0) return vec4(rad + vis * s.rgb, 0.0);  // opaque (or an emitter): it stops the ray
+            if (!inside) {
+                rad += vis * s.rgb;
+                vis *= min(tr, 1.0);
+                inside = true;
+            }
+            t += max(-d, 0.5);
+        } else {
+            inside = false;
+            t += max(d - 0.5, 0.5);
+        }
     }
-    return vec4(0.0, 0.0, 0.0, 1.0);
+    return vec4(rad, vis);
 }
 
 // Cascade i+1's radiance along its group j (= this cascade's ray j) at probe-centre position o (texels).

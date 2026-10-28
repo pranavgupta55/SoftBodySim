@@ -7,6 +7,11 @@ uniform block, 4 vec4 per light (pack_lights), MAX_LIGHTS per draw (more lights 
 cover the box of their radius, spot lights the box of their cone, directional lights the whole surface; light_accum
 does the per-pixel work (N.L with the light at its pseudo height, Blinn-Phong, toon bands, shadows from
 shared["sdf"] via sdf_shadow.glsl when there is one, minimum-image distances on periodic maps).
+Translucent shadows: on frames where gl_sdf publishes shared["sdf_tr"] (see-through glass / fluid casters on
+screen, tr_scale > 0) a variant (light_tr.glsl) shadows with shared["sdf_opaque"] x sdf_shadow_tr, so those bodies
+let light through tinted by their colour. Caustics (gl_glass) already deliver the light that passes glass / fluid,
+so while they run for this frame (caustics_on) the light let through is scaled by 1 - CAUSTIC_SHARE (default 0:
+those shadows stay opaque and only the caustics light them, no light counted twice).
 
 ComposeEffect (order 300): GLWorld.tex = tone(exposure x (albedo * (ambient + light + gi + caustics) + spec +
 emissive)) on lit pixels (TONEMAP: a hue-preserving shoulder above TONE_KNEE plus a +-0.5/255 dither; off: a plain
@@ -43,6 +48,32 @@ MIN_SOFTNESS_PX = 0.75  # the smallest shadow softness passed to the shader: an 
 # banding. Off: plain clamp, as before. world.exposure (if set) scales the lit colour before it.
 TONEMAP = True
 TONE_KNEE = 0.8
+# How much of the light passing a translucent (glass / fluid) body the caustics deliver while they run: its shadow
+# lets through transmittance x (1 - CAUSTIC_SHARE). 1: all of it (the shadow is opaque, the caustics fill it).
+CAUSTIC_SHARE = 1.0
+
+
+def caustics_on(gw, frame):
+    """Do gl_glass's caustics run this frame: the filled view (the points view has none) and the world's
+    `caustics` switch or a CausticsEffect enabled (gl_glass.CAUSTICS) among gw.effects."""
+    if not getattr(frame, "filled", True):
+        return False
+    if getattr(getattr(frame, "world", None), "caustics", False):
+        return True
+    return any(type(e).__name__ == "CausticsEffect" and getattr(e, "enabled", False)
+               for e in (getattr(gw, "effects", None) or ()))
+
+
+def tr_scale(gw, frame):
+    """The factor on a translucent body's transmittance in its shadow: 1, or 1 - CAUSTIC_SHARE while caustics run
+    (clamped to [0, 1]; a bad value counts as 1, i.e. opaque shadows plus caustics)."""
+    if not caustics_on(gw, frame):
+        return 1.0
+    try:
+        share = float(CAUSTIC_SHARE)
+    except (TypeError, ValueError):
+        share = 1.0
+    return min(max(1.0 - share, 0.0), 1.0) if math.isfinite(share) else 0.0
 
 
 def pack_lights(lights, zoom):
@@ -163,14 +194,16 @@ class LightsEffect:
         for t in (self.light, self.spec):
             t.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
-    def _prog(self, frame, has_sdf):
-        if has_sdf not in self.progs:
-            shadow = "sdf_shadow.glsl" if has_sdf else "light_noshadow.glsl"
-            prog = frame.load("light_quad.vert", "light_accum.frag", includes=("material.glsl", shadow))
+    def _prog(self, frame, has_sdf, tr=False):
+        key = (has_sdf, tr)
+        if key not in self.progs:
+            shadow = ("light_tr.glsl", "sdf_shadow.glsl") if tr else (
+                ("sdf_shadow.glsl",) if has_sdf else ("light_noshadow.glsl",))
+            prog = frame.load("light_quad.vert", "light_accum.frag", includes=("material.glsl", *shadow))
             prog["Lights"].binding = 0
-            self.progs[has_sdf] = prog
-            self.vaos[has_sdf] = self.ctx.vertex_array(prog, [])
-        return self.progs[has_sdf], self.vaos[has_sdf]
+            self.progs[key] = prog
+            self.vaos[key] = self.ctx.vertex_array(prog, [])
+        return self.progs[key], self.vaos[key]
 
     def run(self, gw, frame):
         ctx = self.ctx
@@ -185,10 +218,14 @@ class LightsEffect:
         self.fbo.use()
         self.fbo.clear(0.0, 0.0, 0.0, 0.0)
         if len(data):
-            sdf = frame.shared.get("sdf")
-            prog, vao = self._prog(frame, sdf is not None)
+            sh = frame.shared
+            sdf = sh.get("sdf")
+            tr = sdf is not None and all(k in sh for k in ("sdf_opaque", "sdf_tr", "sdf_tint"))
+            prog, vao = self._prog(frame, sdf is not None, tr)
             units = {"u_normal": frame.gbuf["normal"], "u_mat": frame.gbuf["mat"], "u_mat_table": frame.material_tex}
-            if sdf is not None:
+            if tr:
+                units.update(u_sdf=sh["sdf_opaque"], u_sdf_tr=sh["sdf_tr"], u_sdf_tint=sh["sdf_tint"])
+            elif sdf is not None:
                 units["u_sdf"] = sdf
             for unit, (name, tex) in enumerate(units.items()):
                 tex.use(unit)
@@ -196,7 +233,8 @@ class LightsEffect:
                     prog[name].value = unit
             reach, fade_start = shadow_reach(self.size, frame)
             values = {"u_res": tuple(float(s) for s in self.size), "u_period": _period(frame),
-                      "u_shadow_reach": reach, "u_shadow_fade_start": fade_start, "u_relief": float(DIFFUSE_RELIEF)}
+                      "u_shadow_reach": reach, "u_shadow_fade_start": fade_start, "u_relief": float(DIFFUSE_RELIEF),
+                      "u_tr_scale": tr_scale(gw, frame)}
             for name, v in values.items():
                 if name in prog:
                     prog[name].value = v
