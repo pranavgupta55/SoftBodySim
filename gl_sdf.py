@@ -24,6 +24,11 @@ or gl_lights.CAUSTIC_SHARE < 1), SdfEffect also publishes, all at the render siz
 from a split pass (sdf_tr.frag) and one more jump flood over both masks (jfa2_*.frag). gl_lights then shadows with sdf_opaque x sdf_shadow_tr.
 Frames without them cost nothing extra and render exactly as before.
 
+Frames nothing reads the fields on (SdfEffect._wanted: no light casting shadows, and the points view or no glass /
+mirror / fluid material) skip the flood and publish no "sdf"; the points view with translucent fields publishes no
+"sdf" either (lights shadow with sdf_opaque / sdf_tr there, and the glass / caustics effects that read "sdf" don't
+run in it).
+
 Lit-render margin (gl_world.LIT_MARGIN): when the frame has FrameInfo.occ (a G-buffer padded around the view, with
 the bodies just off screen drawn in it), every field above is built over it instead of the view-sized G-buffer, and
 shared["sdf_origin"] = FrameInfo.origin: render px p is texel p + origin of the fields (0, 0 without a margin).
@@ -304,7 +309,25 @@ class SdfEffect:
         return gl_lights.tr_scale(gw, frame) > 0.0
 
 
+    @staticmethod
+    def _wanted(gw, frame):
+        """Does anything read the fields this frame: a light that casts shadows (gl_lights; also all caustics need),
+        or, in the filled view, glass / mirror / fluid materials (gl_glass's resolve marches shared["sdf"]; in the
+        points view every body has an opaque twin and the resolve has nothing to do). No: the frame goes without
+        (lights then use their no-shadow variant, which is what a light without shadows gets anyway)."""
+        world = getattr(frame, "world", None)
+        if world is None or _shadow_lights(world):
+            return True
+        if not getattr(frame, "filled", True):
+            return False
+        kinds = getattr(gw, "mat_kinds", None)
+        if kinds is None:
+            return True
+        return bool(set(int(k) for k in kinds) & {materials.GLASS, materials.MIRROR, materials.FLUID})
+
     def run(self, gw, frame):
+        if not self._wanted(gw, frame):
+            return
         # the lit-render margin (gl_world.LIT_MARGIN): the fields cover the padded G-buffer, render px p at texel
         # p + origin (published as shared["sdf_origin"] for sdf_shadow.glsl's u_sdf_origin)
         src = getattr(frame, "occ", None) or frame.gbuf
@@ -315,9 +338,13 @@ class SdfEffect:
         self.jfa = self._cached(self.jfas, size, lambda: JumpFlood(self.ctx, size, linear=True))
         self.ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
         period = _period(frame.period)
-        frame.shared["sdf"] = self.jfa.build(frame, self.progs, src["normal"], 0, period)
         frame.shared["sdf_origin"] = origin
-        if not self._wants_tr(gw, frame):
+        tr = self._wants_tr(gw, frame)
+        # the points view with translucent fields: lights shadow with those alone, and nothing else there reads the
+        # field of every caster (glass / caustics are filled-view effects), so its flood is skipped
+        if not (tr and not getattr(frame, "filled", True)):
+            frame.shared["sdf"] = self.jfa.build(frame, self.progs, src["normal"], 0, period)
+        if not tr:
             return
         if self.split_progs is None:
             self.split_progs = SplitFlood.progs(frame)

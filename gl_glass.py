@@ -475,6 +475,10 @@ class GlassEffect:
         kinds = self.kinds.of(getattr(frame, "world", None))
         if not kinds & {materials.GLASS, materials.MIRROR, materials.FLUID}:
             return
+        # the points view draws every body with its opaque twin (gl_world) and has no liquid: the resolve would
+        # discard every pixel, so the push-pull and behind passes before it are skipped too
+        if not getattr(frame, "filled", True):
+            return
         prev = ctx.fbo
         ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
         timer = _Timer(ctx, self.profile, self.queries)

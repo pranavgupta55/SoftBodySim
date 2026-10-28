@@ -220,8 +220,8 @@ class LightsEffect:
         if len(data):
             sh = frame.shared
             sdf = sh.get("sdf")
-            tr = sdf is not None and all(k in sh for k in ("sdf_opaque", "sdf_tr", "sdf_tint"))
-            prog, vao = self._prog(frame, sdf is not None, tr)
+            tr = all(sh.get(k) is not None for k in ("sdf_opaque", "sdf_tr", "sdf_tint"))
+            prog, vao = self._prog(frame, sdf is not None or tr, tr)
             units = {"u_normal": frame.gbuf["normal"], "u_mat": frame.gbuf["mat"], "u_mat_table": frame.material_tex}
             if tr:
                 units.update(u_sdf=sh["sdf_opaque"], u_sdf_tr=sh["sdf_tr"], u_sdf_tint=sh["sdf_tint"])
