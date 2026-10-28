@@ -91,6 +91,9 @@ N_CASCADES = 6
 # GI_FAR_EVERY 1 (or GI_FAR_CASCADES 0): every cascade every frame.
 GI_FAR_CASCADES = 3
 GI_FAR_EVERY = 2
+# The least march step inside a translucent body, half-res texels (rc_cascade u_min_in). 1.0 (was 0.5): -0.3 ms on
+# halloween (after the far-band and SDF caches), 0.9% of px change by more than 2/255, max 7.
+RC_MIN_STEP_IN = 1.0
 GI_L0 = 1.0  # cascade 0's ray interval, half-res texels (cascade i's is 4^i times longer)
 
 FULLSCREEN_VERT = "world_base.vert"  # gl_world's fullscreen triangle strip from gl_VertexID
@@ -570,6 +573,7 @@ class GiEffect:
         _set(c, "u_dist", 1)
         _set(c, "u_upper", 2)
         _set(c, "u_l0", float(GI_L0))
+        _set(c, "u_min_in", float(RC_MIN_STEP_IN))
         _set(c, "u_period", period)
         # the far cascades (GI_FAR_CASCADES, the top ones): kept in their own textures, a band of 1 / GI_FAR_EVERY of
         # their rows redone per frame (each cascade's band reads the one above as it stands: half fresh), all of them

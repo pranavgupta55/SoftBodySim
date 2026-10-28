@@ -21,6 +21,7 @@ out vec4 f_rad;
 
 const float TAU = 6.28318530718;
 const int RC_STEPS = 32;
+uniform float u_min_in = 1.0;  // the least step inside a translucent body, texels (GiEffect: RC_MIN_STEP_IN)
 
 // rgb: the radiance gathered, a: what still gets through (0 = blocked). A solid texel stops the ray with its
 // emission; a translucent one (scene a = 1 + T, rc_scene) adds its emission and the ray goes on through the body
@@ -44,7 +45,7 @@ vec4 march(vec2 o, vec2 dir, float a, float b, ivec2 size) {
                 vis *= min(tr, 1.0);
                 inside = true;
             }
-            t += max(-d, 0.5);
+            t += max(-d, u_min_in);
         } else {
             inside = false;
             t += max(d - 0.5, 0.5);
