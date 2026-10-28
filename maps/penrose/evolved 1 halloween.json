@@ -103,7 +103,7 @@
 "absorption": 0.0,
 "reflectivity": 0.04,
 "emissive": "hue",
-"emissive_strength": 0.02
+"emissive_strength": 0.12
 }
 },
 "palette": "halloween"
