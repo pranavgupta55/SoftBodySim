@@ -59,10 +59,17 @@ import math
 from types import SimpleNamespace
 
 import moderngl
+import numpy as np
 
 import lights as lights_mod
 import materials
 
+# Reuse SdfEffect's fields from the last frame while every shadow caster is a fixed body and nothing they depend on
+# changed (SdfEffect._static_key: the casters' points, materials and colours, the world, view mode, zoom, size,
+# period). Not exact: a body that casts no shadow but is drawn over a caster's edge (a glowing shape resting on a
+# glass tile) un-flags those px of the caster mask every frame it is there; the reused fields keep the mask of the
+# frame they were built on. On penrose/evolved 1 halloween that is at most 6/255 on ~0.01% of px.
+SDF_CACHE = True
 GI_ENABLED = False  # radiance cascades GI on / off (the UI may toggle this; read every frame)
 GI_GAIN = 1.0  # multiplies shared["gi"]
 GI_EMIT_GAIN = 1.0  # multiplies the emission the cascades start from
@@ -298,8 +305,55 @@ class SdfEffect:
         # by size (the margin's padding varies as off-screen casters move): the last few, so a body moving in and
         # out of the margin doesn't reallocate every frame
         self.jfas, self.splits = {}, {}
+        self.stats = {}
+        # the static cache (SDF_CACHE): the last frame's key (_static_key), the fixed casters' points then, what it
+        # published; the per-topology fixed-caster point indices
+        self._key, self._key_pos, self._pub = None, None, None
+        self._fixed_of = (None, None, None)
 
     CACHE = 4
+
+    def _static_key(self, gw, frame, size, origin, period, tr):
+        """(key, positions) when every shadow caster on the frame is a fixed body (so only an edit, a material or
+        view change or a world swap changes the caster mask), else None. The fields of the last frame are reused
+        while both are the same (run). Bodies that don't cast shadows are not in the key: moving ones drawn over a
+        caster's edge do change its mask by a few px (a pumpkin over a tile's rim un-flags those px), which the
+        reused fields then miss (see SDF_CACHE)."""
+        world = frame.world
+        topo = getattr(getattr(gw, "packer", None), "topo", None)
+        mats, casts = getattr(gw, "body_mat", None), getattr(gw, "mat_casts", None)
+        bodies = getattr(world, "bodies", None)
+        if not SDF_CACHE or topo is None or mats is None or casts is None or bodies is None \
+                or len(mats) != len(bodies) or getattr(world, "P", None) is None:
+            return None
+        if getattr(world, "ropes", None) and len(casts) > 1 and casts[1]:  # (ropes draw in the default material)
+            return None
+        sig = getattr(gw, "_mat_sig", None)
+        if self._fixed_of[0] is not topo or self._fixed_of[1] is not sig:
+            fixed = np.array([bool(getattr(b, "fixed", False)) for b in bodies], bool)
+            casting = casts[np.clip(mats, 0, len(casts) - 1)]
+            if (casting & ~fixed).any():
+                idx = None
+            else:
+                pb = getattr(world, "point_body", None)
+                idx = None if pb is None or len(pb) != world.P.shape[1] else np.flatnonzero((casting & fixed)[pb])
+            self._fixed_of = (topo, sig, idx)
+        idx = self._fixed_of[2]
+        if idx is None:
+            return None
+        pos = world.P[:, idx]
+        hooks = tuple(tuple(float(v) for v in getattr(h, "pos", ())) for h in getattr(world, "hooks", ()) or ())
+        key = (world, topo, sig, getattr(world, "palette", None), bool(getattr(frame, "filled", True)),
+               getattr(gw, "last_outlines", None), float(frame.zoom), tuple(frame.clip), size, origin, period, tr,
+               hooks, "tr" in frame.gbuf)
+        return key, pos
+
+    def _same(self, key):
+        """Is key (with its positions) the last frame's?"""
+        if key is None or self._key is None or len(key[0]) != len(self._key):
+            return False
+        return (all(a is b or (type(a) is type(b) and a == b) for a, b in zip(key[0], self._key))
+                and key[1].shape == self._key_pos.shape and np.array_equal(key[1], self._key_pos))
 
     def _cached(self, cache, size, make):
         obj = cache.pop(size, None)
@@ -358,12 +412,25 @@ class SdfEffect:
         period = _period(frame.period)
         frame.shared["sdf_origin"] = origin
         tr = self._wants_tr(gw, frame)
+        key = self._static_key(gw, frame, size, origin, period, tr)
+        hit = self._same(key) and self._pub is not None
+        self.stats["cached"] = hit
+        if hit:
+            frame.shared.update(self._pub)
+            return
+        self._key, self._key_pos = (None, None) if key is None else (key[0], key[1].copy())
+        self._pub = None
+        before = set(frame.shared)
         # the points view with translucent fields: lights shadow with those alone, and nothing else there reads the
         # field of every caster (glass / caustics are filled-view effects), so its flood is skipped
         if not (tr and not getattr(frame, "filled", True)):
             frame.shared["sdf"] = self.jfa.build(frame, self.progs, src["normal"], 0, period)
-        if not tr:
-            return
+        if tr:
+            self._split(frame, size, period, src, origin)
+        if key is not None:
+            self._pub = {k: frame.shared[k] for k in set(frame.shared) - before}
+
+    def _split(self, frame, size, period, src, origin):
         if self.split_progs is None:
             self.split_progs = SplitFlood.progs(frame)
         self.split = self._cached(self.splits, size, lambda: SplitFlood(self.ctx, size))
@@ -378,6 +445,8 @@ class SdfEffect:
             p.release()
         self.jfas, self.splits = {}, {}
         self.jfa = self.progs = self.split = self.split_progs = None
+        self._key, self._key_pos, self._pub = None, None, None
+        self._fixed_of = (None, None, None)
 
 
 class GiEffect:
