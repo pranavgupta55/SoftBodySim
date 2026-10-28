@@ -1,11 +1,14 @@
 // Fluid field, one axis of a separable Gaussian blur (u_dir = (1, 0) then (0, 1)) at half resolution. Run twice:
-// the field and its colour (fluid_splat.frag), then (FIELD_ONLY, u_step = threshold) the thresholded liquid mask,
-// whose smooth version gives the surface normal and thickness (flat inside the liquid, curved at its rim). Taps wrap
-// across a periodic axis and clamp at the view's edge on a walled one (so fluid resting on the edge stays full).
+// the field with its colour and light ratio (fluid_splat.frag), then (FIELD_ONLY, u_step = threshold) the
+// thresholded liquid mask, whose smooth version gives the surface normal and thickness (flat inside the liquid,
+// curved at its rim). Taps wrap across a periodic axis and clamp at the view's edge on a walled one (so fluid resting
+// on the edge stays full).
 layout(location = 0) out float o_field;
 #ifndef FIELD_ONLY
 layout(location = 1) out vec4 o_col;
+layout(location = 2) out vec4 o_ratio;
 uniform sampler2D u_src_col;
+uniform sampler2D u_src_ratio;
 #endif
 
 uniform sampler2D u_src;
@@ -33,6 +36,7 @@ void main() {
     float sum = tap(p), wsum = 1.0;
 #ifndef FIELD_ONLY
     vec4 col = texelFetch(u_src_col, p, 0);
+    vec4 ratio = texelFetch(u_src_ratio, p, 0);
 #endif
     for (int i = 1; i <= rad; i++) {
         float w = exp(k * float(i * i));
@@ -40,11 +44,13 @@ void main() {
         sum += w * (tap(a) + tap(b));
 #ifndef FIELD_ONLY
         col += w * (texelFetch(u_src_col, a, 0) + texelFetch(u_src_col, b, 0));
+        ratio += w * (texelFetch(u_src_ratio, a, 0) + texelFetch(u_src_ratio, b, 0));
 #endif
         wsum += 2.0 * w;
     }
     o_field = sum / wsum;
 #ifndef FIELD_ONLY
     o_col = col / wsum;
+    o_ratio = ratio / wsum;
 #endif
 }

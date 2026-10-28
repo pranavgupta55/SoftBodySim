@@ -252,9 +252,12 @@ def test_garbage(ctx):
         try:
             c, _ = caustics(ctx, shape, [lt])
             ok = bool(np.isfinite(c).all())
-            if "zero dir" not in label:
+            # lights.active (gl_glass's caustics, like gl_lights) drops a light without a finite position and repairs
+            # the rest (dir -> (0, 1), falloff -> its default): those draw, as the light pass draws them
+            if "pos" in label:
                 ok = ok and c.max() < 1e-3
-            check(ok, f"i. {label}: finite caustics, nothing drawn for a garbage light (max {np.nanmax(c):.3f})")
+            check(ok, f"i. {label}: finite caustics, nothing drawn for a light without a finite position "
+                  f"(max {np.nanmax(c):.3f})")
         except Exception as e:  # noqa: BLE001
             check(False, f"i. {label}: raised {e!r}")
 
