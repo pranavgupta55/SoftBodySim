@@ -708,7 +708,7 @@ class GLWorld:
         self.base_vao.render(moderngl.TRIANGLE_STRIP, vertices=4)
         overlays = self._bodies(world, filled, zoom, outlines, lit)
         if lit:
-            occ, origin = self._margin(world, clip, zoom, filled)
+            occ, origin = self._margin(world, clip, zoom, filled) if self._wants_occ(world, filled) else (None, (0, 0))
             self._effects(world, clip, zoom, filled, occ, origin)
             self._overlays(overlays)
         self._restore(prev)
@@ -1047,6 +1047,19 @@ class GLWorld:
         g = self.gbuf
         self.tr_fbo = ctx.framebuffer([g["albedo"], g["normal"], g["mat"], self.tr_tex], self.depth)
         self.tr_clear_fbo = ctx.framebuffer([self.tr_tex])
+
+    def _wants_occ(self, world, filled):
+        """Does an effect read the lit-render margin this frame? (gl_effects: an effect with `wants_occ(gw, world,
+        filled)` says; one without it never reads FrameInfo.occ.) Not: _margin is skipped, its draw and its CPU work.
+        Before the first lit frame (no effects yet): yes."""
+        if self.effects is None:
+            return True
+        for e in self.effects:
+            f = getattr(e, "wants_occ", None)
+            if f is not None and f(self, world, filled):
+                return True
+        self._ring = None
+        return False
 
     @staticmethod
     def margin_limits(world):

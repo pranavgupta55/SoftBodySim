@@ -53,6 +53,7 @@ Periodic maps: frame.period (render px; an axis with 0 doesn't repeat) is assume
 wrap into [0, period) and distances are minimum-image.
 """
 import math
+from types import SimpleNamespace
 
 import moderngl
 
@@ -308,6 +309,10 @@ class SdfEffect:
         import gl_lights  # (lazily: keeps the two modules' import order free)
         return gl_lights.tr_scale(gw, frame) > 0.0
 
+
+    def wants_occ(self, gw, world, filled):
+        """gl_world: draw the lit-render margin this frame? Only when the fields get built (it is all they use)."""
+        return self._wanted(gw, SimpleNamespace(world=world, filled=filled))
 
     @staticmethod
     def _wanted(gw, frame):
