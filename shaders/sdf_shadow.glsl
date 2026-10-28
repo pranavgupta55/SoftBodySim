@@ -1,6 +1,8 @@
 // Soft shadows from the shared signed distance field (gl_sdf.py's shared["sdf"]: R32F, signed distance in render px
 // to the nearest shadow-casting occluder boundary, negative inside, minimum-image across periodic edges; LINEAR
-// filtered). Self-contained: include it into any shader (it declares no uniforms).
+// filtered). Self-contained: include it into any shader. Its one uniform, u_sdf_origin, is the texel of render px
+// (0, 0) in the fields (gl_sdf's shared["sdf_origin"]: the lit-render margin pads them around the view; (0, 0),
+// the default, without one): every program sampling the fields sets it.
 //
 // Coordinates are render px, y down, continuous: texel (x, y) covers [x, x + 1) x [y, y + 1), so a fragment's
 // own position is gl_FragCoord.xy. `period` is the map's repeat in render px per axis, (0, 0) = not periodic.
@@ -44,12 +46,15 @@ const float SDF_MIN_SOFT = 0.75;  // px: softness floor (anti-aliased hard shado
 const float SDF_THIN = 0.5;  // px every occluder counts fatter (thin ropes' shadows stay continuous)
 const float SDF_LIGHT_INSIDE = 3.0;  // px: sdf_shadow_pt, a light this deep in a body starts to skip it
 
+uniform vec2 u_sdf_origin;  // texel of render px (0, 0) in the fields (the lit-render margin), see above
+
 // The field at p (bilinear). Off a non-periodic texture, a lower bound from the nearest texel centre (occluders
 // all lie on the texture: sqrt(d^2 + offset^2) for outside points).
 float sdf_at(sampler2D sdf, vec2 p, vec2 period) {
     vec2 size = vec2(textureSize(sdf, 0));
     if (period.x > 0.0) p.x -= period.x * floor(p.x / period.x);
     if (period.y > 0.0) p.y -= period.y * floor(p.y / period.y);
+    p += u_sdf_origin;
     vec2 c = clamp(p, vec2(0.5), size - 0.5);
     float d = texture(sdf, c / size).r;
     vec2 off = p - c;
@@ -85,6 +90,7 @@ vec3 sdf_tint_at(sampler2D tint, vec2 p, vec2 period) {
     vec2 size = vec2(textureSize(tint, 0));
     if (period.x > 0.0) p.x -= period.x * floor(p.x / period.x);
     if (period.y > 0.0) p.y -= period.y * floor(p.y / period.y);
+    p += u_sdf_origin;
     return texture(tint, clamp(p, vec2(0.5), size - 0.5) / size).rgb;
 }
 
