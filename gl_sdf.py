@@ -83,7 +83,9 @@ GI_JFA_START = 0
 GI_ENABLED = False  # radiance cascades GI on / off (the UI may toggle this; read every frame)
 GI_GAIN = 1.0  # multiplies shared["gi"]
 GI_EMIT_GAIN = 1.0  # multiplies the emission the cascades start from
-N_CASCADES = 6
+# 5 (was 6): with see-through bodies a medium, the 6th cascade (light from 341-1365 half-res texels) added at most
+# 8/255 on 0.06% of px of halloween for 2.3 ms
+N_CASCADES = 5
 # The far field: the top GI_FAR_CASCADES cascades (the longest rays: most of the GI's cost on maps full of
 # translucent glass, whose rays march on through every body) are redone a band of 1 / GI_FAR_EVERY of their rows
 # (scissored) per frame, so every frame costs the same and each row is redone every GI_FAR_EVERY frames. A still
@@ -92,7 +94,7 @@ N_CASCADES = 6
 # GI_FAR_EVERY - 1 frames. Anything that changes the whole scene (GiEffect._far_key: world swap or map load,
 # materials / palette, view mode, zoom, size; GI or lighting switched off and on) redoes them whole at once.
 # GI_FAR_EVERY 1 (or GI_FAR_CASCADES 0): every cascade every frame.
-GI_FAR_CASCADES = 3
+GI_FAR_CASCADES = 2
 GI_FAR_EVERY = 2
 # See-through bodies in the GI: a participating medium (rc_scene's mipmapped glass texture). A px of transmittance T
 # has extinction -ln T / GI_GLASS_CHORD per world unit, so a ray crossing GI_GLASS_CHORD of it keeps T (the
