@@ -11,8 +11,8 @@
 // Needs sdf_common.glsl.
 uniform sampler2D u_scene;   // E: rgb emission, a: 1 opaque (rc_scene.frag)
 uniform sampler2D u_dist;    // E: signed distance to opaque texels, in texels (NEAREST)
-uniform sampler2D u_sigma;   // E, mipmapped: the see-through medium's extinction per texel (rc_scene.frag)
-uniform sampler2D u_glow;    // E, mipmapped: its emission per texel
+uniform sampler2D u_sigma;   // mipmapped: the see-through medium's extinction per texel (rc_scene.frag), E in its corner
+uniform sampler2D u_glow;    // likewise its emission per texel
 uniform sampler2D u_upper;   // cascade i+1, when u_has_upper
 uniform bool u_has_upper;
 uniform int u_index;         // i
@@ -35,7 +35,7 @@ vec2 medium_uv(vec2 p, ivec2 size) {
     for (int a = 0; a < 2; a++) {
         if (u_period[a] > 0.0) p[a] -= u_period[a] * floor((p[a] - u_wrap0) / u_period[a]);
     }
-    return p / vec2(size);
+    return p / vec2(textureSize(u_sigma, 0));  // (power-of-two textures, the grid in their corner)
 }
 
 // The step [t, t + s] of a ray, its midpoint at p (texels), through the medium at mip level lod: the emission

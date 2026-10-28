@@ -551,20 +551,30 @@ class GiEffect:
         need = [max(h, int(math.ceil(p)) + 2 * m) if p > 0 else h for h, p in zip(half, period)]
         self.grid = tuple(-(-n // m) * m for n in need)
         self.scene = _tex(ctx, self.grid, 4, "f2")
-        # the see-through medium (rc_scene): extinction and emission, mipmapped each frame; bilinear within the
-        # nearest mip level (trilinear changed at most 1/255 for +0.9 ms on halloween)
-        self.sigma = _tex(ctx, self.grid, 1, "f2", linear=True)
-        self.glow = _tex(ctx, self.grid, 4, "f2", linear=True)
+        # the see-through medium (rc_scene): extinction and emission at the grid's size, copied each frame into
+        # the corner of power-of-two textures that are then mipmapped (this driver's mip levels of an odd size drop
+        # texels: a glass wall vanished from them), read bilinear within the nearest mip level (trilinear changed at
+        # most 1/255 for +0.9 ms on halloween)
+        self.sigma_src = _tex(ctx, self.grid, 1, "f2")
+        self.glow_src = _tex(ctx, self.grid, 4, "f2")
+        pow2 = tuple(1 << max(int(n) - 1, 0).bit_length() for n in self.grid)
+        self.sigma = _tex(ctx, pow2, 1, "f2", linear=True)
+        self.glow = _tex(ctx, pow2, 4, "f2", linear=True)
+        self.medium_copies = [(ctx.framebuffer([dst]), ctx.framebuffer([src]))
+                              for dst, src in ((self.sigma, self.sigma_src), (self.glow, self.glow_src))]
+        for dst, _ in self.medium_copies:
+            dst.clear()  # (past the grid: no medium, for good)
         for t in (self.sigma, self.glow):
             t.filter = (moderngl.LINEAR_MIPMAP_NEAREST, moderngl.LINEAR)
             t.build_mipmaps()
-        self.scene_fbo = ctx.framebuffer([self.scene, self.sigma, self.glow])
+        self.scene_fbo = ctx.framebuffer([self.scene, self.sigma_src, self.glow_src])
         self.casc = [_tex(ctx, self.grid, 4, "f2", linear=True) for _ in range(2)]
         self.casc_fbos = [ctx.framebuffer([t]) for t in self.casc]
         self.out = _tex(ctx, size, 4, "f2", linear=True)
         self.out_fbo = ctx.framebuffer([self.out])
         self.jfa = JumpFlood(ctx, self.grid, linear=False)
-        self.textures = [self.scene_fbo, self.scene, self.sigma, self.glow, *self.casc_fbos, *self.casc, self.out_fbo, self.out]
+        self.textures = [self.scene_fbo, self.scene, *(f for pair in self.medium_copies for f in pair),
+                         self.sigma_src, self.glow_src, self.sigma, self.glow, *self.casc_fbos, *self.casc, self.out_fbo, self.out]
         self.size, self.period = size, period
 
     def run(self, gw, frame):
@@ -603,6 +613,8 @@ class GiEffect:
         # moving body had covered a tile's edge)
         self.scene_fbo.use()
         frame.fullscreen(p["scene"])
+        for dst, src in self.medium_copies:
+            ctx.copy_framebuffer(dst, src)
         self.sigma.build_mipmaps()
         self.glow.build_mipmaps()
         dist = self.jfa.build(frame, p, self.scene, 1, period, int(GI_JFA_START))
