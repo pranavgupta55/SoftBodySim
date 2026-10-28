@@ -21,8 +21,9 @@ or gl_lights.CAUSTIC_SHARE < 1), SdfEffect also publishes, all at the render siz
   shared["sdf_tr"] (R32F, LINEAR): over the translucent casters only;
   shared["sdf_tint"] (RGBA8, LINEAR): per texel, the transmittance of the nearest translucent caster
     (material.glsl mat_transmittance: transparency x Beer-Lambert toward its colour);
-from a split pass (sdf_tr.frag) and one more jump flood over both masks (jfa2_*.frag). gl_lights then shadows with sdf_opaque x sdf_shadow_tr.
-Frames without them cost nothing extra and render exactly as before.
+from a split pass (sdf_tr.frag) and one jump flood over both masks (jfa2_*.frag). gl_lights then shadows with sdf_opaque x sdf_shadow_tr.
+On those frames shared["sdf"] is min(sdf_opaque, sdf_tr) from the same flood (no flood of its own): the same field
+outside the casters, and inside one where it touches a caster of the other kind, the distance to its own edge.
 
 Frames nothing reads the fields on (SdfEffect._wanted: no light casting shadows, and the points view or no glass /
 mirror / fluid material) skip the flood and publish no "sdf"; the points view with translucent fields publishes no
@@ -70,6 +71,12 @@ import materials
 # glass tile) un-flags those px of the caster mask every frame it is there; the reused fields keep the mask of the
 # frame they were built on. On penrose/evolved 1 halloween that is at most 6/255 on ~0.01% of px.
 SDF_CACHE = True
+# The floods' first step (0: the full flood, ceil(log2(size)) step passes; see _steps). A px farther than 2 x start
+# from the boundary then reads that bound instead of its distance: safe for marching, but not the same pixels. Off:
+# halloween's GI flood at 32 saved ~0.3 ms for max 1/255 on 0.07% of px; the full-res one at 64 changed the lighting
+# demo's shadows by up to 40/255 (a sparse map: its far px march in shorter steps) and saved nothing.
+SDF_JFA_START = 0
+GI_JFA_START = 0
 GI_ENABLED = False  # radiance cascades GI on / off (the UI may toggle this; read every frame)
 GI_GAIN = 1.0  # multiplies shared["gi"]
 GI_EMIT_GAIN = 1.0  # multiplies the emission the cascades start from
@@ -140,9 +147,11 @@ class JumpFlood:
         n = max(1, math.ceil(math.log2(max(self.size))))
         self.steps = [1 << k for k in range(n - 1, -1, -1)] + [1]
 
-    def build(self, frame, progs, src, mode, period):
-        """src: the mask texture (unit 0); mode: sdf_common.glsl's sdf_solid mode; period: vec2 in texels."""
+    def build(self, frame, progs, src, mode, period, start=0):
+        """src: the mask texture (unit 0); mode: sdf_common.glsl's sdf_solid mode; period: vec2 in texels.
+        start: the first (largest) step, 0 = the full flood (_steps)."""
         seed, step, dist = progs["seed"], progs["step"], progs["dist"]
+        steps, far = _steps(self.steps, start)
         src.use(0)
         _set(seed, "u_src", 0)
         _set(seed, "u_mode", mode)
@@ -152,7 +161,7 @@ class JumpFlood:
         cur = 0
         _set(step, "u_seeds", 0)
         _set(step, "u_period", period)
-        for s in self.steps:
+        for s in steps:
             self.seeds[cur].use(0)
             _set(step, "u_step", s)
             self.seed_fbos[1 - cur].use()
@@ -160,6 +169,7 @@ class JumpFlood:
             cur = 1 - cur
         self.seeds[cur].use(0)
         src.use(1)
+        _set(dist, "u_far", far)
         _set(dist, "u_seeds", 0)
         _set(dist, "u_src", 1)
         _set(dist, "u_mode", mode)
@@ -176,7 +186,8 @@ class JumpFlood:
 class SplitFlood:
     """SdfEffect's translucent fields: the split pass (sdf_tr.frag: translucent casters' transmittance, opaque
     casters) and one jump flood for both masks at once (jfa2_*.frag, RGBA16I seeds: the passes' texel fetches are
-    shared). build() -> (opaque distance, translucent distance, tint), all LINEAR at the render size."""
+    shared). build() -> (opaque distance, translucent distance, tint), all LINEAR at the render size; `union` then
+    holds min(opaque, translucent): shared["sdf"] on these frames (no flood of its own)."""
 
     def __init__(self, ctx, size):
         self.ctx, self.size = ctx, tuple(size)
@@ -187,7 +198,8 @@ class SplitFlood:
         self.opq = _tex(ctx, self.size, 1, "f4", linear=True)
         self.tr = _tex(ctx, self.size, 1, "f4", linear=True)
         self.tint = _tex(ctx, self.size, 4, "f1", linear=True)
-        self.dist_fbo = ctx.framebuffer([self.opq, self.tr, self.tint])
+        self.union = _tex(ctx, self.size, 1, "f4", linear=True)
+        self.dist_fbo = ctx.framebuffer([self.opq, self.tr, self.tint, self.union])
         n = max(1, math.ceil(math.log2(max(self.size))))
         self.steps = [1 << k for k in range(n - 1, -1, -1)] + [1]
 
@@ -244,8 +256,21 @@ class SplitFlood:
 
     def release(self):
         for o in [self.split_fbo, self.tr_src, self.opq_src, *self.seed_fbos, *self.seeds, self.dist_fbo,
-                  self.opq, self.tr, self.tint]:
+                  self.opq, self.tr, self.tint, self.union]:
             o.release()
+
+
+SDF_FAR = 1e4  # sdf_dist.frag's distance with no seed at all
+
+
+def _steps(full, start):
+    """The step passes of a flood starting at step `start` (a power of two; 0 or more than the full flood's first:
+    the full flood), and the distance to write where no seed arrived. Every px with a seed within Chebyshev distance
+    R = 2 start (the steps' sum, with the extra step 1) of it gets one (some seed, the nearest unless the flood
+    errs), so a px left without one is at least R + 0.5 from the boundary: that bound is safe for sphere tracing."""
+    if start <= 0 or start >= full[0]:
+        return full, SDF_FAR
+    return [s for s in full[:-1] if s <= start] + [1], 2.0 * start + 0.5
 
 
 def _jfa_progs(frame):
@@ -421,12 +446,15 @@ class SdfEffect:
         self._key, self._key_pos = (None, None) if key is None else (key[0], key[1].copy())
         self._pub = None
         before = set(frame.shared)
-        # the points view with translucent fields: lights shadow with those alone, and nothing else there reads the
-        # field of every caster (glass / caustics are filled-view effects), so its flood is skipped
-        if not (tr and not getattr(frame, "filled", True)):
-            frame.shared["sdf"] = self.jfa.build(frame, self.progs, src["normal"], 0, period)
+        # with translucent fields shared["sdf"] is their union (SplitFlood), no flood of its own; the points view
+        # publishes none (lights shadow with the split fields alone, and glass / caustics are filled-view effects)
+        if not tr:
+            frame.shared["sdf"] = self.jfa.build(frame, self.progs, src["normal"], 0, period,
+                                                    int(SDF_JFA_START))
         if tr:
             self._split(frame, size, period, src, origin)
+            if getattr(frame, "filled", True):
+                frame.shared["sdf"] = self.split.union
         if key is not None:
             self._pub = {k: frame.shared[k] for k in set(frame.shared) - before}
 
@@ -533,7 +561,7 @@ class GiEffect:
         _set(p["scene"], "u_emit_gain", _gain(GI_EMIT_GAIN))
         self.scene_fbo.use()
         frame.fullscreen(p["scene"])
-        dist = self.jfa.build(frame, p, self.scene, 1, period)
+        dist = self.jfa.build(frame, p, self.scene, 1, period, int(GI_JFA_START))
         # cascades, top down, ping-ponging between two textures
         c = p["cascade"]
         self.scene.use(0)

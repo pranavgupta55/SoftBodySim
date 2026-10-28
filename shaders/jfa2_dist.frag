@@ -2,7 +2,9 @@
 // pairs. location 0: mask 0's signed distance (shared["sdf_opaque"]), location 1: mask 1's (shared["sdf_tr"]),
 // location 2: mask 1's rgb at its nearest solid texel (the seed, or the solid 4-neighbour of an outside seed;
 // white with no seed): every texel gets the transmittance of the translucent body nearest to it
-// (shared["sdf_tint"]). Needs sdf_common.glsl.
+// (shared["sdf_tint"]); location 3: the union's, min(mask 0's, mask 1's) (shared["sdf"] on these frames: exact
+// outside both masks; inside one where it touches the other, the distance to that one's own edge). Needs
+// sdf_common.glsl.
 uniform isampler2D u_seeds;
 uniform sampler2D u_src0;
 uniform sampler2D u_src1;
@@ -11,6 +13,7 @@ uniform vec2 u_period;  // texels, (0, 0) none
 layout(location = 0) out float f_dist0;
 layout(location = 1) out float f_dist1;
 layout(location = 2) out vec4 f_carry;
+layout(location = 3) out float f_union;
 
 const float SDF_FAR = 1e4;
 
@@ -24,6 +27,7 @@ void main() {
     float d0 = dist(s.xy, p), d1 = dist(s.zw, p);
     f_dist0 = sdf_solid(u_src0, p, 1) ? -d0 : d0;
     f_dist1 = sdf_solid(u_src1, p, 1) ? -d1 : d1;
+    f_union = min(f_dist0, f_dist1);
     f_carry = vec4(1.0);
     if (s.z != SDF_NONE) {
         ivec2 size = textureSize(u_src1, 0);
