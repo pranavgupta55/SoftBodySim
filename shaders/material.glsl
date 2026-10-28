@@ -63,9 +63,31 @@ Mat mat_fetch(sampler2D table, uint id) {
     return m;
 }
 
-// G-buffer flags (normal.a x 255) of a body pixel with this material: an occluder, casts a shadow, is lit.
+// a see-through shadow caster (glass / fluid with transparency > 0): its shadow lets light through (gl_sdf's
+// translucent field, sdf_shadow_tr) and GI passes it, attenuated (rc_scene). Set with FLAG_CASTS_SHADOW, so the
+// plain shared["sdf"] (glass refraction, caustics) still holds the body.
+const int FLAG_TRANSLUCENT = 16;
+// Beer-Lambert path through a body for its shadow's colour (glass_resolve's THICK_PER_EDGE x THICK_CAP_PX: what
+// the middle of a body shows when looked through)
+const float MAT_SHADOW_THICK_PX = 16.0;
+
+bool mat_translucent(Mat m) {
+    return (m.kind == KIND_GLASS || m.kind == KIND_FLUID) && m.transparency > 0.0;
+}
+
+// G-buffer flags (normal.a x 255) of a body pixel with this material: an occluder, casts a shadow (translucent:
+// see-through glass / fluid), is lit.
 int mat_flags(Mat m) {
-    return FLAG_OCCLUDER | (m.casts_shadow ? FLAG_CASTS_SHADOW : 0) | (m.lit ? FLAG_LIT : 0);
+    int f = FLAG_OCCLUDER | (m.casts_shadow ? FLAG_CASTS_SHADOW : 0) | (m.lit ? FLAG_LIT : 0);
+    return (m.casts_shadow && mat_translucent(m)) ? f | FLAG_TRANSLUCENT : f;
+}
+
+// The light a translucent body pixel of colour col lets through (0 for anything else): transparency x Beer-Lambert
+// absorption toward the body's colour over MAT_SHADOW_THICK_PX, as glass_resolve tints what's seen through it.
+vec3 mat_transmittance(Mat m, vec3 col) {
+    if (!mat_translucent(m)) return vec3(0.0);
+    return clamp(m.transparency, 0.0, 1.0) * mix(clamp(col, 0.0, 1.0), vec3(1.0),
+                                                   exp(-max(m.absorption, 0.0) * MAT_SHADOW_THICK_PX));
 }
 
 // The body's own colour with the material's tint mixed in (tint_strength 0: unchanged).

@@ -8,7 +8,19 @@ both set), negative inside, minimum-image across frame.period. Built by jump flo
 (GL 4.1, no compute): a seed pass (pixels on either side of a boundary store their own coordinates, RG16I),
 ceil(log2(max(w, h))) step passes with steps 2^(k-1) .. 1 plus one more step-1 pass (JFA+1), then a distance pass.
 Accuracy: within ~0.7 px of the true distance to the rasterised outline. shaders/sdf_shadow.glsl has the
-shadow march lights use (sdf_shadow / sdf_at).
+shadow march lights use (sdf_shadow / sdf_at). shared["sdf"] holds every shadow caster, see-through ones included
+(glass refraction and caustics march it to find bodies).
+
+Translucent shadows: see-through casters (glass / fluid with transparency > 0: G-buffer FLAG_TRANSLUCENT, bit4)
+let light through. On frames that have them (a scan of the world's materials, redone when gl_world's material
+signature changes), in the filled view, with a light that casts shadows and gl_lights.tr_scale > 0 (caustics off,
+or gl_lights.CAUSTIC_SHARE < 1), SdfEffect also publishes, all at the render size:
+  shared["sdf_opaque"] (R32F, LINEAR): the same field over the opaque casters only;
+  shared["sdf_tr"] (R32F, LINEAR): over the translucent casters only;
+  shared["sdf_tint"] (RGBA8, LINEAR): per texel, the transmittance of the nearest translucent caster
+    (material.glsl mat_transmittance: transparency x Beer-Lambert toward its colour);
+from a split pass (sdf_tr.frag) and one more jump flood over both masks (jfa2_*.frag). gl_lights then shadows with sdf_opaque x sdf_shadow_tr.
+Frames without them cost nothing extra and render exactly as before.
 
 GiEffect (radiance cascades, an experiment) publishes frame.shared["gi"]: RGBA16F at the render size, the light
 emissive bodies throw on everything around them (occluded by shadow casters), to add to the diffuse light. It
@@ -19,6 +31,8 @@ world's own `gi_gain` (if any; saved in scenes, set by a map's "lighting" block)
 clamped to [0, MAX_GAIN], a non-finite gain counts as 1; GI_EMIT_GAIN likewise). Unlit materials emit nothing.
 On periodic maps the GI wraps seamlessly: the probe grid runs two top-cascade probe spacings past the period, and
 cascade merges and the upsampling take any footprint that would leave the grid one period over.
+Translucent casters (FLAG_TRANSLUCENT) are partial occluders for GI: rc_scene stores their transmittance in the
+scene texel (a = 1 + T) and a cascade ray entering one goes on through it with its radiance x T (rc_cascade).
 
 Periodic maps: frame.period (render px; an axis with 0 doesn't repeat) is assumed to start at pixel 0; lookups
 wrap into [0, period) and distances are minimum-image.
@@ -26,6 +40,9 @@ wrap into [0, period) and distances are minimum-image.
 import math
 
 import moderngl
+
+import lights as lights_mod
+import materials
 
 GI_ENABLED = False  # radiance cascades GI on / off (the UI may toggle this; read every frame)
 GI_GAIN = 1.0  # multiplies shared["gi"]
@@ -120,6 +137,75 @@ class JumpFlood:
             o.release()
 
 
+class SplitFlood:
+    """SdfEffect's translucent fields: the split pass (sdf_tr.frag: translucent casters' transmittance, opaque
+    casters) and one jump flood for both masks at once (jfa2_*.frag, RGBA16I seeds: the passes' texel fetches are
+    shared). build() -> (opaque distance, translucent distance, tint), all LINEAR at the render size."""
+
+    def __init__(self, ctx, size):
+        self.ctx, self.size = ctx, tuple(size)
+        self.tr_src, self.opq_src = _tex(ctx, self.size, 4, "f1"), _tex(ctx, self.size, 4, "f1")
+        self.split_fbo = ctx.framebuffer([self.tr_src, self.opq_src])
+        self.seeds = [_tex(ctx, self.size, 4, "i2") for _ in range(2)]
+        self.seed_fbos = [ctx.framebuffer([t]) for t in self.seeds]
+        self.opq = _tex(ctx, self.size, 1, "f4", linear=True)
+        self.tr = _tex(ctx, self.size, 1, "f4", linear=True)
+        self.tint = _tex(ctx, self.size, 4, "f1", linear=True)
+        self.dist_fbo = ctx.framebuffer([self.opq, self.tr, self.tint])
+        n = max(1, math.ceil(math.log2(max(self.size))))
+        self.steps = [1 << k for k in range(n - 1, -1, -1)] + [1]
+
+    @staticmethod
+    def progs(frame):
+        inc = ["sdf_common.glsl"]
+        return {"split": frame.load(FULLSCREEN_VERT, "sdf_tr.frag", ["material.glsl"]),
+                "seed": frame.load(FULLSCREEN_VERT, "jfa2_seed.frag", inc),
+                "step": frame.load(FULLSCREEN_VERT, "jfa2_step.frag", inc),
+                "dist": frame.load(FULLSCREEN_VERT, "jfa2_dist.frag", inc)}
+
+    def build(self, frame, progs, period):
+        g = frame.gbuf
+        sp = progs["split"]
+        for unit, (name, tex) in enumerate((("u_normal", g["normal"]), ("u_albedo", g["albedo"]),
+                                            ("u_mat", g["mat"]), ("u_mats", frame.material_tex))):
+            tex.use(unit)
+            _set(sp, name, unit)
+        self.split_fbo.use()
+        frame.fullscreen(sp)
+        seed, step, dist = progs["seed"], progs["step"], progs["dist"]
+        self.opq_src.use(0)
+        self.tr_src.use(1)
+        _set(seed, "u_src0", 0)
+        _set(seed, "u_src1", 1)
+        _set(seed, "u_period", period)
+        self.seed_fbos[0].use()
+        frame.fullscreen(seed)
+        cur = 0
+        _set(step, "u_seeds", 0)
+        _set(step, "u_period", period)
+        for s in self.steps:
+            self.seeds[cur].use(0)
+            _set(step, "u_step", s)
+            self.seed_fbos[1 - cur].use()
+            frame.fullscreen(step)
+            cur = 1 - cur
+        self.seeds[cur].use(0)
+        self.opq_src.use(1)
+        self.tr_src.use(2)
+        _set(dist, "u_seeds", 0)
+        _set(dist, "u_src0", 1)
+        _set(dist, "u_src1", 2)
+        _set(dist, "u_period", period)
+        self.dist_fbo.use()
+        frame.fullscreen(dist)
+        return self.opq, self.tr, self.tint
+
+    def release(self):
+        for o in [self.split_fbo, self.tr_src, self.opq_src, *self.seed_fbos, *self.seeds, self.dist_fbo,
+                  self.opq, self.tr, self.tint]:
+            o.release()
+
+
 def _jfa_progs(frame):
     inc = ["sdf_common.glsl"]
     return {"seed": frame.load(FULLSCREEN_VERT, "jfa_seed.frag", inc),
@@ -127,14 +213,63 @@ def _jfa_progs(frame):
             "dist": frame.load(FULLSCREEN_VERT, "sdf_dist.frag", inc)}
 
 
+def translucent_caster(m):
+    """Does a Material cast a see-through shadow (material.glsl mat_flags' FLAG_TRANSLUCENT)?"""
+    try:
+        return bool(m.casts_shadow) and m.kind in (materials.GLASS, materials.FLUID) and float(m.transparency) > 0
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+class _Translucent:
+    """Has a world any translucent shadow caster? Rescanned when gw's material signature (gl_world._materials'
+    _mat_sig, replaced whenever a body or its material changes) is a new object, or every frame without one."""
+
+    def __init__(self):
+        self.sig, self.world, self.value = None, None, False
+
+    def of(self, gw, world):
+        if world is None:
+            return False
+        sig = getattr(gw, "_mat_sig", None)
+        if sig is not None and sig is self.sig and world is self.world:
+            return self.value
+        self.value = any(translucent_caster(materials.of_body(b)) for b in getattr(world, "bodies", ()))
+        self.sig, self.world = sig, world
+        return self.value
+
+
+def _shadow_lights(world):
+    """Is any light drawn that casts shadows?"""
+    try:
+        return any(lt.casts_shadows for lt in (lights_mod.sanitize(x) for x in lights_mod.of_world(world)[0])
+                   if lt is not None)
+    except Exception:  # (a broken lights list: no translucent pass, plain shadows as before)
+        return False
+
+
 class SdfEffect:
-    """shared["sdf"] from the G-buffer's shadow-casting occluders."""
+    """shared["sdf"] from the G-buffer's shadow-casting occluders; with translucent casters on screen also
+    shared["sdf_opaque"], shared["sdf_tr"] and shared["sdf_tint"] (module docs)."""
     order = 100
 
     def __init__(self, ctx, size):
         self.ctx, self.size = ctx, tuple(size)
         self.jfa = None
         self.progs = None
+        self.translucent = _Translucent()
+        self.split = None  # SplitFlood, made on the first frame that needs it
+        self.split_progs = None
+
+    def _wants_tr(self, gw, frame):
+        world = getattr(frame, "world", None)
+        if world is None or not getattr(frame, "filled", True):  # (points view: no see-through silhouettes)
+            return False
+        if not self.translucent.of(gw, world) or not _shadow_lights(world):
+            return False
+        import gl_lights  # (lazily: keeps the two modules' import order free)
+        return gl_lights.tr_scale(gw, frame) > 0.0
+
 
     def run(self, gw, frame):
         size = tuple(frame.size)
@@ -145,14 +280,26 @@ class SdfEffect:
                 self.jfa.release()
             self.jfa = JumpFlood(self.ctx, size, linear=True)
         self.ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
-        frame.shared["sdf"] = self.jfa.build(frame, self.progs, frame.gbuf["normal"], 0, _period(frame.period))
+        period = _period(frame.period)
+        frame.shared["sdf"] = self.jfa.build(frame, self.progs, frame.gbuf["normal"], 0, period)
+        if not self._wants_tr(gw, frame):
+            return
+        if self.split_progs is None:
+            self.split_progs = SplitFlood.progs(frame)
+        if self.split is None or self.split.size != size:
+            if self.split is not None:
+                self.split.release()
+            self.split = SplitFlood(self.ctx, size)
+        sh = frame.shared
+        sh["sdf_opaque"], sh["sdf_tr"], sh["sdf_tint"] = self.split.build(frame, self.split_progs, period)
 
     def release(self):
-        if self.jfa is not None:
-            self.jfa.release()
-        for p in (self.progs or {}).values():
+        for o in (self.jfa, self.split):
+            if o is not None:
+                o.release()
+        for p in [*(self.progs or {}).values(), *(self.split_progs or {}).values()]:
             p.release()
-        self.jfa = self.progs = None
+        self.jfa = self.progs = self.split = self.split_progs = None
 
 
 class GiEffect:

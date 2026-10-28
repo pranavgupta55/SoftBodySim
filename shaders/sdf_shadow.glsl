@@ -24,6 +24,13 @@
 //   body lights its side evenly instead of dimming the room with a quantised fan.
 // - sdf_shadow_dir(..., fade_start): directional lights; fade_start > 0 fades the shadow out between fade_start and
 //   max_t along the march (periodic maps: a wrapped shadow ends softly instead of in a cut at the march length).
+// - sdf_shadow_tr(sdf_tr, tint, p, dir, max_t, softness_px, period, point, fade_start, scale) -> vec3: the same
+//   march over a field of translucent bodies only (gl_sdf's shared["sdf_tr"]), returning the light let through per
+//   channel. tint (shared["sdf_tint"]) holds each texel's nearest translucent body's transmittance T (x scale).
+//   Each sample's soft visibility v (the estimator's, as above) becomes mix(T, 1, v) and the result is the minimum
+//   over the samples: a ray through one body keeps T of it with sdf_shadow's soft edge, a ray through several the
+//   least T among them (the minimum over crossings, not a product, so a row of clear bodies doesn't go dark).
+//   Opaque occluders are another field's job: multiply with sdf_shadow_light over gl_sdf's shared["sdf_opaque"].
 #ifndef SDF_SHADOW_GLSL
 #define SDF_SHADOW_GLSL
 
@@ -67,18 +74,34 @@ float sdf_shadow_r(float h, float s, float rem, float k, float soft, float clear
     return k * he / max(s, 1e-3);
 }
 
+// The estimator's minimum r (clamped to [-1, 1]) as a visibility: 0 shadowed .. 1 lit, smooth at both ends.
+float sdf_shadow_vis(float r) {
+    r = clamp(r, -1.0, 1.0);
+    return 0.25 * (1.0 + r) * (1.0 + r) * (2.0 - r);
+}
+
+// The tint texture (sdf_shadow_tr) at p, wrapped like sdf_at.
+vec3 sdf_tint_at(sampler2D tint, vec2 p, vec2 period) {
+    vec2 size = vec2(textureSize(tint, 0));
+    if (period.x > 0.0) p.x -= period.x * floor(p.x / period.x);
+    if (period.y > 0.0) p.y -= period.y * floor(p.y / period.y);
+    return texture(tint, clamp(p, vec2(0.5), size - 0.5) / size).rgb;
+}
+
 // The march shared by the variants. light_end: the light's disk is clipped to its free space (point lights);
 // walk_light: march only to where the light's body ends toward the pixel; fade_start > 0: the directional fade.
-float sdf_shadow_march(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softness_px, vec2 period,
-                       bool light_end, bool walk_light, float fade_start) {
+// tr (sdf_shadow_tr): sdf is a translucent field and tint its transmittance (x tr_scale); the result is per channel.
+// Otherwise tint is unused (pass sdf) and all three channels are the visibility.
+vec3 sdf_shadow_march(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softness_px, vec2 period,
+                      bool light_end, bool walk_light, float fade_start, sampler2D tint, bool tr, float tr_scale) {
     float t = 0.0;
     float d = sdf_at(sdf, p, period);
     for (int i = 0; i < SDF_EXIT_STEPS && d < 0.0; i++) {  // leave the body p is in
         t += max(-d, 0.5);
-        if (t >= max_t) return 1.0;
+        if (t >= max_t) return vec3(1.0);
         d = sdf_at(sdf, p + dir * t, period);
     }
-    if (d < 0.0) return 1.0;  // still inside one long body: its own, so lit
+    if (d < 0.0) return vec3(1.0);  // still inside one long body: its own, so lit
     float end_t = max_t;
     if (walk_light) {  // a light inside an occluder: walk out of it toward the pixel, march only to there
         vec2 lp = p + dir * max_t;
@@ -92,7 +115,7 @@ float sdf_shadow_march(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softn
     }
     vec2 o = p + dir * t;
     float rem = end_t - t;
-    if (rem <= 0.5) return 1.0;  // the light is right here (or the pixel and the light share a body)
+    if (rem <= 0.5) return vec3(1.0);  // the light is right here (or the pixel and the light share a body)
     float soft = max(softness_px, SDF_MIN_SOFT);
     float k = max_t / soft;
     // light_end: the light's free space (sdf_shadow_pt has moved it at least ~1 px off any surface)
@@ -100,6 +123,8 @@ float sdf_shadow_march(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softn
     bool fade = fade_start > 0.0 && fade_start < max_t;
     float last = rem - 0.5;  // the final sample, always taken
     float res = 1.0;
+    vec3 res_tr = vec3(1.0);  // tr: the light let through so far
+    float r_last = 1.0;  // tr: this sample's r (deep in a body's umbra the march may stride)
     float s = min(SDF_MIN_STEP, last);
     float ps = 0.0, ph = -1.0;  // the previous sample (ph <= 0: none usable)
     // After walking out, the ray first moves away from its own body (h rising, slowly when it left at a grazing
@@ -141,8 +166,18 @@ float sdf_shadow_march(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softn
             // max(r, fade): the minimum of max() sits on a sharp crossing whose sampled value jumped between
             // neighbouring rays (contour arcs); a smooth sum keeps the minimum smooth.
             if (fade) r = max(r, -1.0) + 2.0 * smoothstep(fade_start, max_t, t + s);
-            res = min(res, r);
-            if (res <= -1.0) break;
+            if (tr) {
+                // a translucent body's shadow is its transmittance where it would be black
+                r_last = r;
+                if (r < 1.0) {
+                    vec3 tt = clamp(sdf_tint_at(tint, o + dir * s, period) * tr_scale, 0.0, 1.0);
+                    res_tr = min(res_tr, mix(tt, vec3(1.0), sdf_shadow_vis(r)));
+                    if (max(res_tr.r, max(res_tr.g, res_tr.b)) <= 0.002) break;
+                }
+            } else {
+                res = min(res, r);
+                if (res <= -1.0) break;
+            }
         }
         if (s >= last) break;
         ps = s;
@@ -150,6 +185,9 @@ float sdf_shadow_march(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softn
         float step;
         if (finishing) {
             step = (last - s) / float(max(SDF_MARCH_STEPS + SDF_FINISH_STEPS - 2 - i, 1));
+        } else if (tr && h < 0.0 && r_last <= -1.0) {
+            // tr, deep in a body's umbra (what it lets through is counted): stride through it toward its far side
+            step = max(-h, SDF_INSIDE_STEP);
         } else if (h < 0.0) {
             // Inside an occluder (a penumbra's dark side, the ray clipping a corner) step a fixed SDF_INSIDE_STEP:
             // stepping |h| there makes the sampled minimum of h jump as the step positions slide from pixel to
@@ -164,18 +202,18 @@ float sdf_shadow_march(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softn
         }
         s = min(s + step, last);  // the last step lands on the final sample
     }
-    res = clamp(res, -1.0, 1.0);
-    return 0.25 * (1.0 + res) * (1.0 + res) * (2.0 - res);
+    return tr ? res_tr : vec3(sdf_shadow_vis(res));
 }
 
 float sdf_shadow(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softness_px, vec2 period) {
-    return sdf_shadow_march(sdf, p, dir, max_t, softness_px, period, false, false, 0.0);
+    return sdf_shadow_march(sdf, p, dir, max_t, softness_px, period, false, false, 0.0, sdf, false, 1.0).x;
 }
 
-// A light's shadow: point (sdf_shadow_pt) or directional (sdf_shadow_dir, with its fade). One march call site
-// (the march inlines, and every extra copy costs registers and occupancy).
-float sdf_shadow_light(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softness_px, vec2 period, bool point,
-                       float fade_start) {
+// A light's shadow: point or directional (with its fade), over an opaque field (sdf_shadow_light) or a translucent
+// one (sdf_shadow_tr). One march call site each (the march inlines, and every extra copy costs registers and
+// occupancy).
+vec3 sdf_shadow_light_c(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softness_px, vec2 period, bool point,
+                        float fade_start, sampler2D tint, bool tr, float tr_scale) {
     vec2 v = dir * max_t;  // to the light, or to where it's moved out of the surface it's on
     bool walk = false;
     if (point) {
@@ -200,7 +238,17 @@ float sdf_shadow_light(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softn
     }
     float lv = length(v);
     return lv > 0.5 ? sdf_shadow_march(sdf, p, v / lv, lv, softness_px, period, point, walk,
-                                       point ? 0.0 : fade_start) : 1.0;
+                                       point ? 0.0 : fade_start, tint, tr, tr_scale) : vec3(1.0);
+}
+
+float sdf_shadow_light(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softness_px, vec2 period, bool point,
+                       float fade_start) {
+    return sdf_shadow_light_c(sdf, p, dir, max_t, softness_px, period, point, fade_start, sdf, false, 1.0).x;
+}
+
+vec3 sdf_shadow_tr(sampler2D sdf_tr, sampler2D tint, vec2 p, vec2 dir, float max_t, float softness_px,
+                   vec2 period, bool point, float fade_start, float scale) {
+    return sdf_shadow_light_c(sdf_tr, p, dir, max_t, softness_px, period, point, fade_start, tint, true, scale);
 }
 
 float sdf_shadow_pt(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softness_px, vec2 period) {

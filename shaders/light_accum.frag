@@ -9,8 +9,13 @@
 // nothing. Each light's term is multiplied by its shadow (sdf_shadow_pt / sdf_shadow_dir, or the stub's
 // sdf_shadow when there is no SDF) unless it doesn't cast shadows. On periodic maps a point / spot light adds every
 // image of itself within its radius (at most MAX_IMAGES, nearest first), each with its own attenuation and march.
+// Translucent shadows (LIGHT_TR defined, gl_lights' variant for frames with gl_sdf's translucent fields): u_sdf is
+// shared["sdf_opaque"] (opaque casters only) and the shadow is that visibility x sdf_shadow_tr over
+// shared["sdf_tr"] / shared["sdf_tint"]: glass, jelly and water let light through, tinted by their colour, x
+// u_tr_scale (gl_lights: 1, or 1 - CAUSTIC_SHARE while caustics deliver the light that passes them).
 //
-// Included before it: material.glsl (Mat, mat_fetch) and sdf_shadow.glsl, or light_noshadow.glsl without an SDF.
+// Included before it: material.glsl (Mat, mat_fetch) and sdf_shadow.glsl (after light_tr.glsl for LIGHT_TR), or
+// light_noshadow.glsl without an SDF.
 layout(std140) uniform Lights {
     vec4 u_lights[1024];
 };
@@ -18,7 +23,12 @@ layout(std140) uniform Lights {
 uniform sampler2D u_normal;     // G-buffer normal: rg = n.xy * 0.5 + 0.5, a = flags / 255
 uniform usampler2D u_mat;       // G-buffer material id
 uniform sampler2D u_mat_table;  // material table (mat_fetch)
-uniform sampler2D u_sdf;        // shared["sdf"] (unused by the no-SDF stub)
+uniform sampler2D u_sdf;        // shared["sdf"] (unused by the no-SDF stub); LIGHT_TR: shared["sdf_opaque"]
+#ifdef LIGHT_TR
+uniform sampler2D u_sdf_tr;     // shared["sdf_tr"]: translucent shadow casters only
+uniform sampler2D u_sdf_tint;   // shared["sdf_tint"]: their transmittance, carried to every texel
+uniform float u_tr_scale;       // x the transmittance (0: translucent bodies shadow like opaque ones)
+#endif
 uniform vec2 u_period;
 uniform float u_shadow_reach;   // directional lights: how far the shadow march looks, px
 uniform float u_shadow_fade_start;  // directional lights: the shadow fades out from here to u_shadow_reach (<= 0 off)
@@ -49,12 +59,19 @@ float toon(float x, float bands) {
     return bands > 0.0 ? floor(clamp(x, 0.0, 1.0) * bands + 0.5) / bands : x;
 }
 
-// One call site for the march (it inlines: several sites cost registers and occupancy).
-float shadow(vec2 p, vec2 dir, float reach, float soft, bool point) {
+// One call site for the march (it inlines: several sites cost registers and occupancy); LIGHT_TR: one per field.
+vec3 shadow(vec2 p, vec2 dir, float reach, float soft, bool point) {
 #ifdef SDF_SHADOW_GLSL
-    return sdf_shadow_light(u_sdf, p, dir, reach, soft, u_period, point, point ? 0.0 : u_shadow_fade_start);
+    float fade = point ? 0.0 : u_shadow_fade_start;
+    float o = sdf_shadow_light(u_sdf, p, dir, reach, soft, u_period, point, fade);
+#ifdef LIGHT_TR
+    if (o > 0.0) {
+        return o * sdf_shadow_tr(u_sdf_tr, u_sdf_tint, p, dir, reach, soft, u_period, point, fade, u_tr_scale);
+    }
+#endif
+    return vec3(o);
 #else
-    return sdf_shadow(u_sdf, p, dir, reach, soft, u_period);
+    return vec3(sdf_shadow(u_sdf, p, dir, reach, soft, u_period));
 #endif
 }
 
@@ -84,7 +101,7 @@ void main() {
     vec2 d0 = kind == 2 ? vec2(0.0) : min_image(a.xy - p);
     int nx = (kind != 2 && u_period.x > 0.0) ? 1 : 0;
     int ny = (kind != 2 && u_period.y > 0.0) ? 1 : 0;
-    float diff = 0.0, spec = 0.0;
+    vec3 diff = vec3(0.0), spec = vec3(0.0);
     int used = 0;  // bit j: IMAGE_ORDER[j] done (or not an image on this map)
     for (int j = 0; j < 9; j++) {
         ivec2 oj = ivec2(IMAGE_ORDER[j]);
@@ -136,20 +153,29 @@ void main() {
             to_light = dist > 0.0 ? d / dist : vec2(0.0, -1.0);
             reach = dist;
         }
+        vec3 sh = vec3(1.0);  // the shadow: what reaches the pixel, per channel (tinted through translucent bodies)
         if (e.z > 0.5) {
-            atten *= shadow(p, to_light, reach, e.y, kind != 2);
+            sh = shadow(p, to_light, reach, e.y, kind != 2);
         }
-        if (atten <= 0.0) {
+        float sm = max(sh.r, max(sh.g, sh.b));
+        if (atten <= 0.0 || sm <= 0.0) {
             continue;
         }
+        // toon bands quantise the brightest channel; the shadow's tint scales the result
+#ifdef LIGHT_TR
+        vec3 tint = sh / sm;
+#else
+        const vec3 tint = vec3(1.0);
+#endif
+        atten *= sm;
         float ndl = u_relief > 0.0 ? max(1.0 + u_relief * (dot(n, l) - l.z), 0.0) : max(dot(n, l), 0.0);
-        diff += toon(ndl * atten, bands);
+        diff += toon(ndl * atten, bands) * tint;
         if (m.specular > 0.0 && dot(n, l) >= 0.0) {
             vec3 h = normalize(l + vec3(0.0, 0.0, 1.0));
-            spec += toon(pow(max(dot(n, h), 0.0), shin) * atten, bands) * m.specular * spec_norm;
+            spec += toon(pow(max(dot(n, h), 0.0), shin) * atten, bands) * m.specular * spec_norm * tint;
         }
     }
-    if (diff <= 0.0 && spec <= 0.0) {
+    if (max(diff.r, max(diff.g, diff.b)) <= 0.0 && max(spec.r, max(spec.g, spec.b)) <= 0.0) {
         discard;
     }
     f_light = vec4(b.rgb * diff, 1.0);
