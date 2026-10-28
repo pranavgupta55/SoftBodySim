@@ -35,7 +35,8 @@ Lit passes (_bodies):
 - points view: dots and sticks use each material's points-view twin (kind OPAQUE, no shadow, bevel 0: no optics, no
   stripes) and are no occluders; the filled view's shapes are then drawn invisibly (only normal.a written), so the
   silhouettes cast the same shadows as in the filled view; see-through ones also write their transmittance to
-  gbuf["tr"] (only on such frames), which the translucent shadows and the GI read in place of a material id.
+  gbuf["tr"] (only on such frames), which the translucent shadows and the GI read in place of a material id, and
+  their GI emission to gbuf["tr_emit"], so emissive glass glows into the GI as in the filled view.
 - margin (up to LIT_MARGIN px per side, non-periodic axes): the shadow-casting primitives reaching past the view
   are drawn again, shifted, into a padded G-buffer (`occ`, each side only as wide as they reach), and the view's
   G-buffer is copied into its middle (_margin). gl_sdf builds the shadow fields over that, so bodies just off screen
@@ -748,8 +749,9 @@ class GLWorld:
         self.mat_kinds = np.array([-1, materials.OPAQUE], np.int64)  # Material.kind per id
         self.mat_casts = np.array([False, materials.resolve().casts_shadow], bool)  # Material.casts_shadow per id
         self.mat_tr = np.zeros(2, bool)  # per id: a translucent shadow caster (_translucent_caster)
-        # the points view's silhouette transmittance (_occluder_fill), made on the first frame that needs it
-        self.tr_tex, self.tr_fbo, self.tr_clear_fbo = None, None, None
+        # the points view's silhouette transmittance and GI emission (_occluder_fill), made on the first frame that
+        # needs them
+        self.tr_tex, self.tr_emit_tex, self.tr_fbo, self.tr_clear_fbo = None, None, None, None
         self.behind, self.behind_fbo = None, None  # pass A's copy (gbuf["behind"...]), made on the first glass frame
         # the lit-render margin (_margin): padded albedo / normal / mat + their own depth, made on first use
         self.occ, self.occ_fbo, self.occ_depth = None, None, None
@@ -784,10 +786,10 @@ class GLWorld:
             self.behind_fbo.release()
         self.behind, self.behind_fbo = None, None
         self._release_occ()
-        for o in (self.tr_fbo, self.tr_clear_fbo, self.tr_tex):
+        for o in (self.tr_fbo, self.tr_clear_fbo, self.tr_tex, self.tr_emit_tex):
             if o is not None:
                 o.release()
-        self.tr_tex, self.tr_fbo, self.tr_clear_fbo = None, None, None
+        self.tr_tex, self.tr_emit_tex, self.tr_fbo, self.tr_clear_fbo = None, None, None, None
         for key in ("albedo", "normal", "mat"):
             t = (self.gbuf or {}).get(key)
             if t is not None:
@@ -1049,7 +1051,8 @@ class GLWorld:
             for key in BEHIND_KEYS:
                 self.gbuf.pop(key, None)
         if self.gbuf is not None:
-            self.gbuf.pop("tr", None)  # (the points view's, set again by _occluder_fill when it has one)
+            for key in ("tr", "tr_emit"):  # (the points view's, set again by _occluder_fill when it has them)
+                self.gbuf.pop(key, None)
         if lit and not filled:
             self._occluder_fill(world, zoom, outlines)
         return overlays
@@ -1162,7 +1165,9 @@ class GLWorld:
         id of its own here to find its transmittance from, so when any is drawn the pass also writes gbuf["tr"]
         (RGBA8, only on such frames: rgb = the transmittance of the silhouette at each px, a = 1 there, 0 elsewhere),
         which gl_sdf's translucent split and the GI scene read in its place: a clear glass tile lets light and glow
-        through as in the filled view."""
+        through as in the filled view. With it comes gbuf["tr_emit"] (RGBA16F: rgb = the silhouette px's GI emission,
+        material.glsl mat_tr_emit_px), which the GI scene reads as the glass's own glow there: an emissive glass tile
+        lights the room as in the filled view."""
         data = self.packer.pack(world, True, zoom, outlines, self.body_mat, 1)
         lines = data["lines"]
         lines = lines[lines[:, 8] >= 0]
@@ -1183,15 +1188,15 @@ class GLWorld:
         if tr:
             self._ensure_tr()
             self.tr_clear_fbo.clear(0.0, 0.0, 0.0, 0.0)
-            self.gbuf["tr"] = self.tr_tex
+            self.gbuf["tr"], self.gbuf["tr_emit"] = self.tr_tex, self.tr_emit_tex
         fbo = self.tr_fbo if tr else self.gbuf_fbo
         off = (False,) * 4
-        fbo.color_mask = [off, (False, False, False, True), off] + ([(True,) * 4] if tr else [])
+        fbo.color_mask = [off, (False, False, False, True), off] + ([(True,) * 4] * 2 if tr else [])
         fbo.depth_mask = False
         fbo.use()
         self._set_pass(True, False, seethrough=0, flags_only=True)
         self._draw_bodies(n_fills, n_lines, n_stamps)
-        fbo.color_mask = [(True,) * 4] * (4 if tr else 3)
+        fbo.color_mask = [(True,) * 4] * (5 if tr else 3)
         fbo.depth_mask = True
         self.gbuf_fbo.use()
         self._set_pass(True, False)
@@ -1210,16 +1215,18 @@ class GLWorld:
         return False
 
     def _ensure_tr(self):
-        """The points view's transmittance texture and the framebuffer its occluder fill draws into (the G-buffer's
-        three targets + it, sharing the depth buffer)."""
+        """The points view's transmittance and emission textures and the framebuffer its occluder fill draws into
+        (the G-buffer's three targets + them, sharing the depth buffer)."""
         if self.tr_tex is not None:
             return
         ctx = self.ctx
         self.tr_tex = ctx.texture(self.size, 4)
         self.tr_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         g = self.gbuf
-        self.tr_fbo = ctx.framebuffer([g["albedo"], g["normal"], g["mat"], self.tr_tex], self.depth)
-        self.tr_clear_fbo = ctx.framebuffer([self.tr_tex])
+        self.tr_emit_tex = ctx.texture(self.size, 4, dtype="f2")  # (16-bit: a 0.02 glow is a few 8-bit steps)
+        self.tr_emit_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.tr_fbo = ctx.framebuffer([g["albedo"], g["normal"], g["mat"], self.tr_tex, self.tr_emit_tex], self.depth)
+        self.tr_clear_fbo = ctx.framebuffer([self.tr_tex, self.tr_emit_tex])
 
     def _wants_occ(self, world, filled):
         """Does an effect read the lit-render margin this frame? (gl_effects: an effect with `wants_occ(gw, world,

@@ -12,8 +12,9 @@
 // neither dims nor glows: there is no medium to emit).
 // On a periodic axis, texels past the G-buffer (the grid runs on past the period, GiEffect._alloc) hold the medium
 // one period back, so its mip levels are whole across the seam (rc_cascade samples them there).
-// Points view: a see-through silhouette's transmittance comes from gbuf["tr"] (gl_world _occluder_fill: its px have
-// no material id of their own), and an emissive stick / dot of a see-through body outside the silhouette (no
+// Points view: a see-through silhouette's transmittance comes from gbuf["tr"] and its emission from gbuf["tr_emit"]
+// (gl_world _occluder_fill: its px have no material id of their own; a stick / dot on it emits the more of the two,
+// so an emissive glass tile glows into the GI as in the filled view), and an emissive stick / dot of a see-through body outside the silhouette (no
 // FLAG_OCCLUDER; its twin material keeps the body's transparency) is translucent like the body.
 // Solid = a shadow-casting occluder (blocks light) or an emissive body px (gives light). Emission is the px's albedo
 // x material emissive x emissive_strength, 0 for an unlit material (compose shows it unlit: no glow there, so
@@ -27,6 +28,8 @@ uniform sampler2D u_mats;     // material table
 uniform float u_emit_gain;
 uniform sampler2D u_tr;       // the points view's gbuf["tr"] (gl_world _occluder_fill), when u_has_tr
 uniform bool u_has_tr;
+uniform sampler2D u_tr_emit;  // the points view's gbuf["tr_emit"] (with gbuf["tr"]), when u_has_tr_emit
+uniform bool u_has_tr_emit;
 uniform float u_chord;        // the see-through bodies' reference chord, texels (GiEffect: GI_GLASS_CHORD)
 uniform vec2 u_period;        // texels, (0, 0) none
 const int BORDER_REACH = 3;  // > gl_world.BORDER_WIDTH (2): the fill starts just inside the 2px outline
@@ -93,8 +96,10 @@ void main() {
             vec4 ptr = u_has_tr ? texelFetch(u_tr, p, 0) : vec4(0.0);
             float t = -1.0;  // the px's transmittance; < 0: opaque
             if (solid && (f & FLAG_TRANSLUCENT) != 0 && ptr.a > 0.5) {
-                // the points view's see-through silhouette: its transmittance from gbuf["tr"]
+                // the points view's see-through silhouette: its transmittance from gbuf["tr"], its glow from
+                // gbuf["tr_emit"] (or a stick / dot's own there, if brighter)
                 t = dot(ptr.rgb, LUMA);
+                if (u_has_tr_emit) pe = max(pe, texelFetch(u_tr_emit, p, 0).rgb);
             } else if (solid && (f & FLAG_TRANSLUCENT) != 0 && id != 0u && mat_translucent(m)) {
                 // (a translucent body's black border passes light untinted, as in its shadow: sdf_tr.frag)
                 vec3 col = (f & FLAG_BORDER) != 0 ? vec3(1.0) : texelFetch(u_albedo, p, 0).rgb;

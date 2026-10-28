@@ -40,6 +40,7 @@ layout(location = 0) out vec4 f_color;
 layout(location = 1) out vec4 f_normal;
 layout(location = 2) out uint f_mat;
 layout(location = 3) out vec4 f_tr;  // u_flags_only: gbuf["tr"] (bound only then, when it is wanted)
+layout(location = 4) out vec4 f_tr_emit;  // u_flags_only: gbuf["tr_emit"] (bound with gbuf["tr"])
 
 const int VERT_ROW = 4096;
 
@@ -171,6 +172,7 @@ void main() {
         f_normal = vec4(0.0, 0.0, 0.0, float(mat_flags(m) | FLAG_LIT) / 255.0);
         f_mat = 0u;
         f_tr = mat_tr_px(m, mat_tinted(m, v_col));
+        f_tr_emit = mat_tr_emit_px(m, mat_tinted(m, v_col));
         return;
     }
     if (tau > 0.0 && dot(soft_dir, soft_dir) > 1e-8) {

@@ -188,6 +188,20 @@ def main():
         gi_vals[filled] = mean(r.gi(), (slice(140, 160), slice(230, 250))).mean()
     check(abs(gi_vals[False] - gi_vals[True]) < 0.15 * gi_vals[True] + 1e-4,
           f"(f) GI past clear glass: points view {gi_vals[False]:.4f} ~ filled {gi_vals[True]:.4f}")
+    # an emissive glass slab throws the same glow in the points view as filled: its silhouette's emission comes from
+    # gbuf["tr_emit"] (it has no material id there), not just from its sticks and dots
+    glow = {}
+    for filled in (True, False):
+        slab = body((255, 160, 60), "glass", rect=(200, 150, 60, 120), transparency=0.5, absorption=0.0,
+                    emissive_strength=0.5)
+        w = world(slab, light=False)
+        w.gi = True
+        r.render(w, filled=filled)
+        check(("tr_emit" in r.gw.gbuf) == (not filled), f"(f) gbuf['tr_emit'] only in the points view (filled {filled})")
+        glow[filled] = mean(r.gi(), (slice(140, 160), slice(250, 280))).mean()
+    check(glow[True] > 1e-3, f"(f) an emissive glass slab lights the room beside it ({glow[True]:.4f})")
+    check(abs(glow[False] - glow[True]) < 0.15 * glow[True],
+          f"(f) ... as much in the points view {glow[False]:.4f} as filled {glow[True]:.4f}")
     print("all translucent shadow checks passed")
     return 0
 

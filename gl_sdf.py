@@ -598,13 +598,16 @@ class GiEffect:
         p = self.progs
         # scene at half res
         g = frame.gbuf
-        tr = g.get("tr")  # (the points view's silhouette transmittance, gl_world _occluder_fill)
+        tr = g.get("tr")  # (the points view's silhouette transmittance and emission, gl_world _occluder_fill)
+        tr_emit = g.get("tr_emit") if tr is not None else None
         for unit, tex in enumerate((g["normal"], g["albedo"], g["mat"], frame.material_tex,
-                                    tr if tr is not None else g["albedo"])):
+                                    tr if tr is not None else g["albedo"],
+                                    tr_emit if tr_emit is not None else g["albedo"])):
             tex.use(unit)
-        for unit, name in enumerate(("u_normal", "u_albedo", "u_mat", "u_mats", "u_tr")):
+        for unit, name in enumerate(("u_normal", "u_albedo", "u_mat", "u_mats", "u_tr", "u_tr_emit")):
             _set(p["scene"], name, unit)
         _set(p["scene"], "u_has_tr", tr is not None)
+        _set(p["scene"], "u_has_tr_emit", tr_emit is not None)
         _set(p["scene"], "u_emit_gain", _gain(GI_EMIT_GAIN))
         _set(p["scene"], "u_chord", max(float(GI_GLASS_CHORD) * float(frame.zoom) / 2.0, 1e-3))  # (world -> texels)
         _set(p["scene"], "u_period", period)

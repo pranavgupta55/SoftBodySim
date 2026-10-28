@@ -96,6 +96,14 @@ vec4 mat_tr_px(Mat m, vec3 col) {
     return (m.casts_shadow && mat_translucent(m)) ? vec4(mat_transmittance(m, col), 1.0) : vec4(0.0);
 }
 
+// The same pass's gbuf["tr_emit"]: the GI emission of such a silhouette px of albedo col, as rc_scene.frag finds it
+// for a filled body's px (emissive x emissive_strength x albedo, 0 for an unlit material), a = 1; 0 for anything
+// else. (Its px have no material id of their own, so without it the hollow view's glass would throw no glow.)
+vec4 mat_tr_emit_px(Mat m, vec3 col) {
+    return (m.casts_shadow && mat_translucent(m)) ? vec4(m.emissive * m.emissive_strength * float(m.lit) * col, 1.0)
+                                                 : vec4(0.0);
+}
+
 // The body's own colour with the material's tint mixed in (tint_strength 0: unchanged).
 vec3 mat_tinted(Mat m, vec3 col) {
     return mix(col, col * m.tint, m.tint_strength);
