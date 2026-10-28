@@ -16,6 +16,7 @@ uniform sampler2D u_materials;
 layout(location = 0) out vec4 f_color;
 layout(location = 1) out vec4 f_normal;
 layout(location = 2) out uint f_mat;
+layout(location = 3) out vec4 f_tr;  // u_flags_only: gbuf["tr"] (world_fill.frag)
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -38,6 +39,7 @@ void main() {
         f_color = vec4(0.0);
         f_normal = vec4(0.0, 0.0, 0.0, float(mat_flags(m) | FLAG_LIT) / 255.0);
         f_mat = 0u;
+        f_tr = mat_tr_px(m, (v_mat & STAMP_BORDER) != 0 ? vec3(1.0) : mat_tinted(m, v_col));
         return;
     }
     int flags = mat_flags(m);

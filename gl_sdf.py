@@ -14,7 +14,8 @@ shadow march lights use (sdf_shadow / sdf_at). shared["sdf"] holds every shadow 
 
 Translucent shadows: see-through casters (glass / fluid with transparency > 0: G-buffer FLAG_TRANSLUCENT, bit4)
 let light through. On frames that have them (a scan of the world's materials, redone when gl_world's material
-signature changes), in the filled view, with a light that casts shadows and gl_lights.tr_scale > 0 (caustics off,
+signature changes), in the filled view (or the points view when gl_world drew the silhouettes' transmittance,
+gbuf["tr"], which then stands in for their material), with a light that casts shadows and gl_lights.tr_scale > 0 (caustics off,
 or gl_lights.CAUSTIC_SHARE < 1), SdfEffect also publishes, all at the render size:
   shared["sdf_opaque"] (R32F, LINEAR): the same field over the opaque casters only;
   shared["sdf_tr"] (R32F, LINEAR): over the translucent casters only;
@@ -172,14 +173,19 @@ class SplitFlood:
                 "step": frame.load(FULLSCREEN_VERT, "jfa2_step.frag", inc),
                 "dist": frame.load(FULLSCREEN_VERT, "jfa2_dist.frag", inc)}
 
-    def build(self, frame, progs, period, g=None):
-        """g: the G-buffer textures to split (frame.gbuf, or the margin's padded frame.occ)."""
+    def build(self, frame, progs, period, g=None, origin=(0, 0)):
+        """g: the G-buffer textures to split (frame.gbuf, or the margin's padded frame.occ, render px p at texel
+        p + origin). The points view's frame.gbuf["tr"], when there is one, gives its silhouettes' transmittance."""
         g = frame.gbuf if g is None else g
+        tr = frame.gbuf.get("tr")
         sp = progs["split"]
         for unit, (name, tex) in enumerate((("u_normal", g["normal"]), ("u_albedo", g["albedo"]),
-                                            ("u_mat", g["mat"]), ("u_mats", frame.material_tex))):
+                                            ("u_mat", g["mat"]), ("u_mats", frame.material_tex),
+                                            ("u_tr", tr if tr is not None else g["albedo"]))):
             tex.use(unit)
             _set(sp, name, unit)
+        _set(sp, "u_has_tr", tr is not None)
+        _set(sp, "u_tr_origin", tuple(int(o) for o in origin))
         self.split_fbo.use()
         frame.fullscreen(sp)
         seed, step, dist = progs["seed"], progs["step"], progs["dist"]
@@ -287,7 +293,10 @@ class SdfEffect:
 
     def _wants_tr(self, gw, frame):
         world = getattr(frame, "world", None)
-        if world is None or not getattr(frame, "filled", True):  # (points view: no see-through silhouettes)
+        if world is None:
+            return False
+        # the points view has see-through silhouettes only when gl_world drew their transmittance (gbuf["tr"])
+        if not getattr(frame, "filled", True) and "tr" not in frame.gbuf:
             return False
         if not self.translucent.of(gw, world) or not _shadow_lights(world):
             return False
@@ -314,7 +323,8 @@ class SdfEffect:
             self.split_progs = SplitFlood.progs(frame)
         self.split = self._cached(self.splits, size, lambda: SplitFlood(self.ctx, size))
         sh = frame.shared
-        sh["sdf_opaque"], sh["sdf_tr"], sh["sdf_tint"] = self.split.build(frame, self.split_progs, period, src)
+        sh["sdf_opaque"], sh["sdf_tr"], sh["sdf_tint"] = self.split.build(frame, self.split_progs, period, src,
+                                                                          origin)
 
     def release(self):
         for o in [*self.jfas.values(), *self.splits.values()]:
@@ -377,10 +387,13 @@ class GiEffect:
         p = self.progs
         # scene at half res
         g = frame.gbuf
-        for unit, tex in enumerate((g["normal"], g["albedo"], g["mat"], frame.material_tex)):
+        tr = g.get("tr")  # (the points view's silhouette transmittance, gl_world _occluder_fill)
+        for unit, tex in enumerate((g["normal"], g["albedo"], g["mat"], frame.material_tex,
+                                    tr if tr is not None else g["albedo"])):
             tex.use(unit)
-        for unit, name in enumerate(("u_normal", "u_albedo", "u_mat", "u_mats")):
+        for unit, name in enumerate(("u_normal", "u_albedo", "u_mat", "u_mats", "u_tr")):
             _set(p["scene"], name, unit)
+        _set(p["scene"], "u_has_tr", tr is not None)
         _set(p["scene"], "u_emit_gain", _gain(GI_EMIT_GAIN))
         self.scene_fbo.use()
         frame.fullscreen(p["scene"])

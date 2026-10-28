@@ -11,6 +11,11 @@ uniform sampler2D u_normal;   // G-buffer normal (flags in alpha)
 uniform sampler2D u_albedo;   // G-buffer albedo
 uniform usampler2D u_mat;     // G-buffer material id
 uniform sampler2D u_mats;     // material table
+// the points view (gl_world _occluder_fill): gbuf["tr"], view-sized, the silhouettes' transmittance (a = 1 on one);
+// texel p - u_tr_origin of it is this pass's texel p (the lit-render margin pads the G-buffer read here)
+uniform sampler2D u_tr;
+uniform bool u_has_tr;
+uniform ivec2 u_tr_origin;
 
 const int BORDER_REACH = 3;  // px
 
@@ -26,6 +31,16 @@ void main() {
     if ((f & FLAG_TRANSLUCENT) == 0) {
         f_opaque = vec4(1.0);
         return;
+    }
+    if (u_has_tr) {  // the points view: a see-through silhouette's transmittance is in gbuf["tr"]
+        ivec2 v = p - u_tr_origin;
+        if (all(greaterThanEqual(v, ivec2(0))) && all(lessThan(v, textureSize(u_tr, 0)))) {
+            vec4 t = texelFetch(u_tr, v, 0);
+            if (t.a > 0.5) {
+                f_tr = vec4(t.rgb, 1.0);
+                return;
+            }
+        }
     }
     uint id = texelFetch(u_mat, p, 0).r;
     Mat m = mat_fetch(u_mats, id);

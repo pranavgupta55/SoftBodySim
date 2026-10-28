@@ -32,7 +32,8 @@ Lit passes (_bodies):
   without FLAG_LIT (it stays black: no light, specular or glow).
 - points view: dots and sticks use each material's points-view twin (kind OPAQUE, no shadow, bevel 0: no optics, no
   stripes) and are no occluders; the filled view's shapes are then drawn invisibly (only normal.a written), so the
-  silhouettes cast the same shadows as in the filled view (GLASS / FLUID silhouettes excepted: no shadow there).
+  silhouettes cast the same shadows as in the filled view; see-through ones also write their transmittance to
+  gbuf["tr"] (only on such frames), which the translucent shadows and the GI read in place of a material id.
 - margin (up to LIT_MARGIN px per side, non-periodic axes): the shadow-casting primitives reaching past the view
   are drawn again, shifted, into a padded G-buffer (`occ`, each side only as wide as they reach), and the view's
   G-buffer is copied into its middle (_margin). gl_sdf builds the shadow fields over that, so bodies just off screen
@@ -478,6 +479,14 @@ def _body_rest(body, seed):
     return np.asarray(rest, dtype=np.float64) + off[:, None]
 
 
+def _translucent_caster(m):
+    """Does a Material cast a see-through shadow (material.glsl mat_flags' FLAG_TRANSLUCENT; gl_sdf's twin)?"""
+    try:
+        return bool(m.casts_shadow) and m.kind in SEE_THROUGH and float(m.transparency) > 0
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def _seed_of(b):
     s = getattr(b, "pattern_seed", None)
     return int(s) if isinstance(s, (int, np.integer)) and not isinstance(s, bool) else None
@@ -568,6 +577,9 @@ class GLWorld:
         self.body_mat_points = np.zeros(0, np.int64)  # body_mat's points-view twins (_materials)
         self.mat_kinds = np.array([-1, materials.OPAQUE], np.int64)  # Material.kind per id
         self.mat_casts = np.array([False, materials.resolve().casts_shadow], bool)  # Material.casts_shadow per id
+        self.mat_tr = np.zeros(2, bool)  # per id: a translucent shadow caster (_translucent_caster)
+        # the points view's silhouette transmittance (_occluder_fill), made on the first frame that needs it
+        self.tr_tex, self.tr_fbo, self.tr_clear_fbo = None, None, None
         self.behind, self.behind_fbo = None, None  # pass A's copy (gbuf["behind"...]), made on the first glass frame
         # the lit-render margin (_margin): padded albedo / normal / mat + their own depth, made on first use
         self.occ, self.occ_fbo, self.occ_depth = None, None, None
@@ -601,6 +613,10 @@ class GLWorld:
             self.behind_fbo.release()
         self.behind, self.behind_fbo = None, None
         self._release_occ()
+        for o in (self.tr_fbo, self.tr_clear_fbo, self.tr_tex):
+            if o is not None:
+                o.release()
+        self.tr_tex, self.tr_fbo, self.tr_clear_fbo = None, None, None
         for key in ("albedo", "normal", "mat"):
             t = (self.gbuf or {}).get(key)
             if t is not None:
@@ -737,13 +753,17 @@ class GLWorld:
             return i
 
         body_mat = np.array([id_of(materials.of_body(b)) for b in bodies], np.int64)
-        # the points view's twins: the same colour, tint and glow on plain flat dots and sticks (no optics)
-        twin = {i: id_of(dataclasses.replace(table[i], kind=materials.OPAQUE, casts_shadow=False, bevel_px=0.0))
+        # the points view's twins: the same colour, tint and glow on plain flat dots and sticks (no optics); a
+        # translucent caster's keeps its transparency (rc_scene.frag: GI goes through its sticks as through it)
+        twin = {i: id_of(dataclasses.replace(
+                    table[i], kind=materials.OPAQUE, casts_shadow=False, bevel_px=0.0,
+                    transparency=table[i].transparency if _translucent_caster(table[i]) else 0.0))
                 for i in sorted(set(body_mat.tolist()))}
         self.body_mat_points = np.array([twin[i] for i in body_mat.tolist()], np.int64)
         self.eye_mat = id_of(EYE_MATERIAL)  # the pumpkin eyes' material (_eye_stamps)
         self.mat_kinds = np.array([-1] + [m.kind for m in table[1:]], np.int64)
         self.mat_casts = np.array([False] + [bool(m.casts_shadow) for m in table[1:]], bool)
+        self.mat_tr = np.array([False] + [_translucent_caster(m) for m in table[1:]], bool)
         self.body_mat, self.n_materials = body_mat, len(table)
         packed = np.zeros((len(table), materials.TEXELS, 4), np.float32)
         packed[0] = materials.pack(materials.resolve())  # row 0: the background (lit, default material)
@@ -852,6 +872,8 @@ class GLWorld:
         elif self.gbuf is not None:
             for key in BEHIND_KEYS:
                 self.gbuf.pop(key, None)
+        if self.gbuf is not None:
+            self.gbuf.pop("tr", None)  # (the points view's, set again by _occluder_fill when it has one)
         if lit and not filled:
             self._occluder_fill(world, zoom, outlines)
         return overlays
@@ -962,30 +984,69 @@ class GLWorld:
         """The points view (lighting on): the filled view's shapes (fills, borders, segments, ropes, hooks) drawn
         with only normal.a written (the other outputs masked, no depth writes), setting their occluder /
         casts-shadow flags (plus FLAG_LIT) under the dots and sticks, so shadows, the SDF and GI see the same
-        silhouettes as in the filled view. Albedo, normals and material ids stay the points view's. GLASS / FLUID
-        bodies are left out: their silhouette would be a plain opaque occluder here (no material id to make it
-        translucent), so a clear glass tile would block light and glow that it lets through in the filled view."""
+        silhouettes as in the filled view. Albedo, normals and material ids stay the points view's.
+        See-through (GLASS / FLUID) silhouettes are drawn too. A translucent one (FLAG_TRANSLUCENT) has no material
+        id of its own here to find its transmittance from, so when any is drawn the pass also writes gbuf["tr"]
+        (RGBA8, only on such frames: rgb = the transmittance of the silhouette at each px, a = 1 there, 0 elsewhere),
+        which gl_sdf's translucent split and the GI scene read in its place: a clear glass tile lets light and glow
+        through as in the filled view."""
         data = self.packer.pack(world, True, zoom, outlines, self.body_mat, 1)
         lines = data["lines"]
         lines = lines[lines[:, 8] >= 0]
         n_fills = self._upload_fills(data)
-        n_lines = self.lines.write(lines) if len(lines) else 0
         inst = self._stamps(data["stamps"], data["radii"]) if len(data["stamps"]) else np.zeros((0, 11), np.int64)
+        tr = self._any_tr(data["fills"], lines, inst)
+        if tr and len(lines):  # the outline's transmittance: the body's colour, as sdf_tr.frag takes it
+            lines = lines.copy()
+            border = (lines[:, 9] == 2) & (lines[:, 6] < 2 * len(world.bodies))
+            if border.any():
+                fill_c = pack_rgb([b.fill_col for b in world.bodies])
+                lines[border, 5] = fill_c[lines[border, 6] // 2]
+        n_lines = self.lines.write(lines) if len(lines) else 0
         n_stamps = self.stamps.write(inst) if len(inst) else 0
-        self._ring = (data, lines, inst, 1)  # the margin draws these silhouettes too (GLASS / FLUID left out)
+        self._ring = (data, lines, inst, 0)  # the margin draws these silhouettes too
         if not (n_fills or n_lines or n_stamps):
             return
-        fbo = self.gbuf_fbo
+        if tr:
+            self._ensure_tr()
+            self.tr_clear_fbo.clear(0.0, 0.0, 0.0, 0.0)
+            self.gbuf["tr"] = self.tr_tex
+        fbo = self.tr_fbo if tr else self.gbuf_fbo
         off = (False,) * 4
-        fbo.color_mask = [off, (False, False, False, True), off]
+        fbo.color_mask = [off, (False, False, False, True), off] + ([(True,) * 4] if tr else [])
         fbo.depth_mask = False
         fbo.use()
-        self._set_pass(True, False, seethrough=1, flags_only=True)
+        self._set_pass(True, False, seethrough=0, flags_only=True)
         self._draw_bodies(n_fills, n_lines, n_stamps)
-        fbo.color_mask = [(True,) * 4] * 3
+        fbo.color_mask = [(True,) * 4] * (4 if tr else 3)
         fbo.depth_mask = True
-        fbo.use()
+        self.gbuf_fbo.use()
         self._set_pass(True, False)
+
+    def _any_tr(self, fills, lines, stamps):
+        """Whether any primitive to draw has a translucent shadow caster's material (lighting on)."""
+        kinds = self.mat_tr
+        for ids in (fills[:, 8] if len(fills) else None, lines[:, 8] if len(lines) else None,
+                    stamps[:, 10] & (STAMP_BORDER - 1) if len(stamps) else None):
+            if ids is None:
+                continue
+            ids = np.asarray(ids, np.int64)
+            ids = ids[(ids > 0) & (ids < len(kinds))]
+            if ids.size and kinds[ids].any():
+                return True
+        return False
+
+    def _ensure_tr(self):
+        """The points view's transmittance texture and the framebuffer its occluder fill draws into (the G-buffer's
+        three targets + it, sharing the depth buffer)."""
+        if self.tr_tex is not None:
+            return
+        ctx = self.ctx
+        self.tr_tex = ctx.texture(self.size, 4)
+        self.tr_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        g = self.gbuf
+        self.tr_fbo = ctx.framebuffer([g["albedo"], g["normal"], g["mat"], self.tr_tex], self.depth)
+        self.tr_clear_fbo = ctx.framebuffer([self.tr_tex])
 
     @staticmethod
     def margin_limits(world):

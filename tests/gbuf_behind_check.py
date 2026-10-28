@@ -131,7 +131,10 @@ def main():
     outer = xs.max()  # the rightmost dot pixel on the middle row (outside the polygon's x range 280)
     check(outer >= 285 and not f[150, outer] & OCC, f"points view: dot pixel outside the outline is no occluder "
           f"(x {outer}, flags {f[150, outer]})")
-    check(not f[150, 80] & OCC, "points view: a glass body's silhouette is no occluder")
+    trx = read(gb["tr"]) if "tr" in gb else None
+    check(f[150, 80] & OCC and f[150, 80] & CASTS and f[150, 80] & 16 and trx is not None and trx[150, 80, 3] == 255
+          and trx[150, 80, :3].max() > 0 and trx[150, 200, 3] == 0,
+          "points view: a glass body's silhouette is a translucent occluder, its transmittance in gbuf['tr']")
     render(w3, filled=True)
     ff = flags(gw.gbuf["normal"])
     check(ff[150, 200] & OCC and ff[150, 200] & CASTS, "filled view: same silhouette occluder")
