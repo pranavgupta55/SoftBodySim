@@ -343,6 +343,9 @@ def build_diamonds_scene(world_width, world_height, seed=DIAMONDS_SEED, inset=IN
     apply_palette(world, lighting.get("palette", DEFAULT))
     if isinstance(lighting.get("background"), list):
         world.background = [int(c) for c in lighting["background"]]
+    if lighting and isinstance(layout, str):  # visual_tune.py's Look card: the map's name and its lighting block
+        world.map_key = os.path.splitext(os.path.relpath(layout, os.path.dirname(DIAMONDS_DIR)))[0].replace(os.sep, "/")
+        world.map_lighting = lighting
     return world
 
 

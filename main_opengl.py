@@ -26,7 +26,7 @@ it's uploaded only when it changes.
 Needs moderngl (pip install moderngl). Uses an OpenGL 4.1 core profile context (the newest macOS offers) with
 GLSL 330 shaders. Hotkeys (all listed on the sidebar's Controls card): F compute card full / summary, G grid,
 V view (points / filled / filled without outlines), T motion trails, L lighting (the lit renderer; its Lights and
-Material cards, lighting_ui.py), SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), B point / circle grab, O circle radius (4 presets; the wheel too), ESC quit,
+Material cards, lighting_ui.py; on a lit map also the Look card, visual_tune.py), SPACE pause, right click spawn menu, arrow keys gravity (two for a diagonal; 0 = off/on; numpad 1-9 too), W worlds, H panel (fullscreen worlds), B point / circle grab, O circle radius (4 presets; the wheel too), ESC quit,
 1-4 debug overlays (debug_overlay.py), [ / ] or the Controls card's - / + physics speed 1%-10000% and N one physics frame while paused (timectl.py).
 Sidebar: click a card's title row to open / close it; the wheel over the sidebar scrolls it (hud_layer.py).
 
@@ -67,6 +67,8 @@ from trails import Trails
 from gravity_dial import GravityDial
 from palettes import PaletteCard
 from lighting_ui import LightsCard, MaterialCard
+import visual_tune
+from visual_tune import LookCard
 from debug_overlay import DebugOverlays
 from timectl import TimeControl
 from gl_world import GLWorld
@@ -527,7 +529,8 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
     # while lighting is on: the Lights card, and the Material card while bodies are picked (lighting_ui.py)
     lights_card = LightsCard(lambda: session.editor, ViewConfig, toggle_lighting)
     material_card = MaterialCard(lambda: session.editor)
-    look_cards = (material_card, lights_card)
+    look_card = LookCard(lambda: session.editor)  # a lit map's live look sliders, saved per map (visual_tune.py)
+    look_cards = (material_card, lights_card, look_card)
     lit_seen = None  # (world, its lighting switch) last frame
     session.bind_cards(hud.cards)
     hud.layout()
@@ -573,6 +576,7 @@ def main(argv=None, display=None, max_frames=None, on_frame=None):
         elif (world, lit) != lit_seen:  # another world, or this one's switch changed (a scene load)
             ViewConfig.lighting = lit
         lit_seen = (world, lit)
+        visual_tune.attach(world)  # once per lit map world: its saved look overrides (local/visual_overrides.json)
         for card in look_cards:  # the lighting cards come and go too (before the Palette card)
             wanted = card.wanted(ViewConfig)
             if wanted != (card in hud.cards):
