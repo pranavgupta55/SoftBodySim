@@ -46,6 +46,8 @@ world's own `gi_gain` (if any; saved in scenes, set by a map's "lighting" block)
 clamped to [0, MAX_GAIN], a non-finite gain counts as 1; GI_EMIT_GAIN likewise). Unlit materials emit nothing.
 On periodic maps the GI wraps seamlessly: the probe grid runs two top-cascade probe spacings past the period, and
 cascade merges and the upsampling take any footprint that would leave the grid one period over.
+The top GI_FAR_CASCADES cascades (the far field) are redone only every GI_FAR_EVERY frames and reused in between;
+a still scene renders exactly the same, and any whole-scene change redoes them at once (GiEffect._far_key).
 Translucent casters (FLAG_TRANSLUCENT) are partial occluders for GI: rc_scene stores their transmittance in the
 scene texel (a = 1 + T) and a cascade ray entering one goes on through it with its radiance x T (rc_cascade).
 
@@ -64,6 +66,15 @@ GI_ENABLED = False  # radiance cascades GI on / off (the UI may toggle this; rea
 GI_GAIN = 1.0  # multiplies shared["gi"]
 GI_EMIT_GAIN = 1.0  # multiplies the emission the cascades start from
 N_CASCADES = 6
+# The far field: the top GI_FAR_CASCADES cascades (the longest rays: most of the GI's cost on maps full of
+# translucent glass, whose rays march on through every body) are redone every GI_FAR_EVERY frames and reused in
+# between. A still scene renders exactly as with every cascade every frame; moving emitters' light from more than
+# GI_L0 x (4^(N - k) - 1) / 3 half-res texels away (k = GI_FAR_CASCADES: 21 texels = 42 render px) lags up to
+# GI_FAR_EVERY - 1 frames. Anything that changes the whole scene (GiEffect._far_key: world swap or map load,
+# materials / palette, view mode, zoom, size; GI or lighting switched off and on) redoes them at once.
+# GI_FAR_EVERY 1 (or GI_FAR_CASCADES 0): every cascade every frame.
+GI_FAR_CASCADES = 3
+GI_FAR_EVERY = 2
 GI_L0 = 1.0  # cascade 0's ray interval, half-res texels (cascade i's is 4^i times longer)
 
 FULLSCREEN_VERT = "world_base.vert"  # gl_world's fullscreen triangle strip from gl_VertexID
@@ -376,10 +387,32 @@ class GiEffect:
         self.progs = None
         self.textures = []
         self.stats = {}
+        self.far, self.far_fbos = [], []  # the far cascades' own textures (GI_FAR_CASCADES), top down
+        self._far_last_key, self._far_last_no, self._far_age = None, None, 0
+
+    @staticmethod
+    def _far_key(gw, frame, period):
+        """What the far cascades depend on besides the bodies' motion: a change redoes them at once. The world
+        (swap / map load: another World or a repacked one), its materials and colours (gl_world's material
+        signature, replaced on any change; the palette and background), the view mode, zoom and view size, the
+        grid and the emission gain. (Lighting toggled off and on: GLWorld.frame_no skips, see run.)"""
+        world = getattr(frame, "world", None)
+        packer = getattr(gw, "packer", None)
+        return (id(world), id(getattr(packer, "topo", None)), id(getattr(gw, "_mat_sig", None)),
+                getattr(world, "palette", None), tuple(getattr(world, "background", None) or ()),
+                bool(getattr(frame, "filled", True)), getattr(gw, "last_outlines", None), float(frame.zoom),
+                tuple(frame.clip), tuple(frame.size), period, _gain(GI_EMIT_GAIN))
+
+    def _alloc_far(self, n):
+        for o in self.far_fbos + self.far:
+            o.release()
+        self.far = [_tex(self.ctx, self.grid, 4, "f2", linear=True) for _ in range(n)]
+        self.far_fbos = [self.ctx.framebuffer([t]) for t in self.far]
 
     def _alloc(self, size, period):
         for o in self.textures:
             o.release()
+        self._alloc_far(0)
         ctx = self.ctx
         m = 1 << (N_CASCADES - 1)
         half = ((size[0] + 1) // 2, (size[1] + 1) // 2)
@@ -439,9 +472,35 @@ class GiEffect:
         _set(c, "u_upper", 2)
         _set(c, "u_l0", float(GI_L0))
         _set(c, "u_period", period)
+        # the far cascades (GI_FAR_CASCADES, the top ones): kept in their own textures and redone every
+        # GI_FAR_EVERY frames, reused in between, unless anything that changes the whole scene changed (_far_key)
+        n_far = min(max(int(GI_FAR_CASCADES), 0), N_CASCADES - 1) if int(GI_FAR_EVERY) > 1 else 0
+        far = list(range(N_CASCADES - 1, N_CASCADES - 1 - n_far, -1))  # top down
+        refresh = True
+        if n_far:
+            key = self._far_key(gw, frame, period)
+            no = getattr(gw, "frame_no", None)
+            if len(self.far) != n_far:
+                self._alloc_far(n_far)
+            elif (key == self._far_last_key and no is not None and self._far_last_no is not None
+                  and no == self._far_last_no + 1 and self._far_age + 1 < int(GI_FAR_EVERY)):
+                refresh = False
+            self._far_age = 0 if refresh else self._far_age + 1
+            self._far_last_key, self._far_last_no = key, no
+        self.stats["far_refreshed"] = bool(n_far) and refresh
+        upper = None
+        for k, i in enumerate(far):
+            if refresh:
+                (upper if upper is not None else self.casc[0]).use(2)
+                _set(c, "u_has_upper", i < N_CASCADES - 1)
+                _set(c, "u_index", i)
+                self.far_fbos[k].use()
+                frame.fullscreen(c)
+            upper = self.far[k]
         cur = 0
-        for i in range(N_CASCADES - 1, -1, -1):
-            self.casc[1 - cur].use(2)  # the cascade above (unused for the top one)
+        for i in range(N_CASCADES - 1 - n_far, -1, -1):
+            # the cascade above (unused for the top one)
+            (upper if upper is not None and i == N_CASCADES - 1 - n_far else self.casc[1 - cur]).use(2)
             _set(c, "u_has_upper", i < N_CASCADES - 1)
             _set(c, "u_index", i)
             self.casc_fbos[cur].use()
@@ -464,6 +523,7 @@ class GiEffect:
     def release(self):
         for o in self.textures:
             o.release()
+        self._alloc_far(0)
         if self.size is not None:
             self.jfa.release()
         for p in (self.progs or {}).values():

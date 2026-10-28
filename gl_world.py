@@ -591,6 +591,7 @@ class GLWorld:
         self._uv_key = None  # (rest array, vert_pt) last uploaded to uvs_tex
         self._fs_vaos = {}
         self.stats = {}
+        self.frame_no, self.last_outlines = 0, True  # render() calls so far (lit or not); its last `outlines`
 
     # ---------------- helpers for effects (gl_effects.FrameInfo)
     def load(self, vert, frag, includes=()):
@@ -680,6 +681,10 @@ class GLWorld:
         ctx = self.ctx
         prev = ctx.fbo if ctx.fbo is not None else ctx.screen
         lit = bool(lighting or getattr(world, "lighting", False))
+        # (effects that reuse work across frames tell consecutive frames and view changes apart by these: gl_sdf's
+        # far GI cascades)
+        self.frame_no += 1
+        self.last_outlines = bool(outlines)
         clip = (int(min(view_size[0], self.size[0])), int(min(view_size[1], self.size[1])))
         ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
         if clip[0] <= 0 or clip[1] <= 0:  # nothing of the world shows: the background past the clip, no effects
