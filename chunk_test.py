@@ -307,9 +307,13 @@ def _polygon_area(points):
 class ChunkTest:
     """One chunk test's world, ready to step (see the module doc). Local coordinates: the world spans
     (0, 0) .. world_size and the chunk rect sits at `rect` (offset by the margin); map = local + `offset`.
-    keys: test this layout (tile keys of the map's tiling) instead of the map's own tiles."""
+    keys: test this layout (tile keys of the map's tiling) instead of the map's own tiles.
+    sample_dt: also record every shape's centroid (mean of its points, map coordinates, not wrapped) every sample_dt
+    seconds (a whole number of frames), from t = 0 until it clears; result() then holds "track" (see track()).
+    Read only: the simulation is bit-identical with and without it."""
 
-    def __init__(self, info, chunk, seed, fill=FILL, seconds=SECONDS, vel=VEL, margin=MARGIN, keys=None):
+    def __init__(self, info, chunk, seed, fill=FILL, seconds=SECONDS, vel=VEL, margin=MARGIN, keys=None,
+                 sample_dt=None):
         from entities import EnvConfig, FixedBody, SoftBody, polygon_points
         import pumpkins
         from solver import World
@@ -366,6 +370,35 @@ class ChunkTest:
         self.cleared = []  # (body, time s)
         self.remaining = list(self.shapes)
         self._history = []  # per frame: centres of the remaining shapes (for the last-second speeds)
+        self.sample_dt = sample_dt
+        self._track = None
+        if sample_dt is not None:
+            every = sample_dt * FPS
+            if every < 1 or abs(every - round(every)) > 1e-9:
+                raise ValueError(f"sample_dt {sample_dt} isn't a whole number of 1/{FPS} s frames")
+            self._sample_every = int(round(every))
+            self._track = [[] for _ in self.shapes]
+            self._sample()
+
+    def _sample(self):
+        """Record the remaining shapes' centroids (map coordinates) in the track (sample_dt)."""
+        live = {id(b) for b in self.remaining}
+        for b, xy in zip(self.shapes, self._track):
+            if id(b) in live:
+                c = b.points.mean(axis=1) + self.offset
+                xy.append([round(float(c[0]), 2), round(float(c[1]), 2)])
+
+    def track(self):
+        """The sampled centroids (sample_dt set; else None): {"sample_dt", "shapes": [{"r" (placement circle
+        radius), "area" (polygon area), "exit_t" (clear time s, None if still in), "xy": [[x, y], ...] at
+        t = k x sample_dt, k = 0, 1, ... while the shape is in the chunk}]} in shape order."""
+        if self._track is None:
+            return None
+        exit_t = {id(b): t for b, t in self.cleared}
+        return {"sample_dt": self.sample_dt,
+                "shapes": [{"r": round(b.chunk_r, 3), "area": round(b.chunk_area, 2),
+                            "exit_t": None if id(b) not in exit_t else round(exit_t[id(b)], 4), "xy": xy}
+                           for b, xy in zip(self.shapes, self._track)]}
 
     def _place(self, draw, tiles, rng, target):
         """[(spec, (cx, cy, angle))] and their circles' area. Each circle lies wholly inside the chunk rect, GAP clear
@@ -444,6 +477,8 @@ class ChunkTest:
         self._history.append({id(b): b.points.mean(axis=1).copy() for b in self.remaining})
         if len(self._history) > FPS + 1:
             self._history.pop(0)
+        if self._track is not None and self.frame % self._sample_every == 0:
+            self._sample()
 
     def speeds(self):
         """{id(body): mean speed over the last second (or what has run of it), px/s} of the remaining shapes."""
@@ -481,12 +516,13 @@ class ChunkTest:
                 "slow_count": sum(v < SLOW_SPEED for v in sp.values()),
                 "tiles": len(self.tile_bodies), "fill": self.fill, "fill_achieved": round(self.fill_achieved, 4),
                 "points": self.points, "sim_seconds": self.time,
-                "stuck": stuck}
+                "stuck": stuck,
+                **({"track": self.track()} if self._track is not None else {})}
 
 
 def run_chunk(info, chunk, seed, **kw):
     """Build and run one chunk test to the end; its result dict plus "wall" (s, build + run) and "build_wall".
-    kw: ChunkTest's settings (fill, seconds, vel, margin, keys)."""
+    kw: ChunkTest's settings (fill, seconds, vel, margin, keys, sample_dt)."""
     t0 = time.perf_counter()
     test = ChunkTest(info, chunk, seed, **kw)
     t1 = time.perf_counter()
@@ -556,7 +592,8 @@ class ChunkPool:
             results = pool.score([(keys, "grid r1c2", seed), ...])
 
     score(jobs): jobs = [(keys, chunk_id, seed)] (an optional 4th item: a dict of ChunkTest settings for that job
-    over the pool's own `kw`: fill, seconds, vel) -> their run_chunk_keys results, in job order. Each job's keys go
+    over the pool's own `kw`: fill, seconds, vel, sample_dt) -> their run_chunk_keys results, in job order;
+    submit(job) queues one without waiting. Each job's keys go
     with it (pickled, ~20 KB: nothing next to a test); each worker caches its last 64 layouts' tiles.
     whole(jobs): jobs = [(keys, seconds, seed)] -> whole_map_score results, in order, on the same workers.
     Leaving the block (or close()) shuts the workers down and waits for them; an exception terminates them. Workers
@@ -572,6 +609,12 @@ class ChunkPool:
     def score(self, jobs):
         jobs = [(frozenset(norm_key(k) for k in j[0]),) + tuple(j[1:]) for j in jobs]
         return self._pool.map(_pool_job, jobs, chunksize=1)
+
+    def submit(self, job, callback=None, error_callback=None):
+        """Queue one score() job without waiting: its multiprocessing AsyncResult (callback(result), or
+        error_callback(exception), runs in the pool's result thread when it is done)."""
+        job = (frozenset(norm_key(k) for k in job[0]),) + tuple(job[1:])
+        return self._pool.apply_async(_pool_job, (job,), callback=callback, error_callback=error_callback)
 
     def whole(self, jobs):
         jobs = [(sorted(norm_key(k) for k in keys), seconds, seed) for keys, seconds, seed in jobs]
