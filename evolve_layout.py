@@ -17,7 +17,8 @@ variants. Every run is the physics only (no display, no drawing) for `seconds` o
 with --weights w1,w2,w3 (default 0.7,0.2,0.1).
 
 Then the last round's top `finalists` and the base (not with --no-final-base) run `final_seconds` each, on
---final-seeds fresh spawn seeds (ranked by their mean), and the best is written to
+--final-seeds fresh spawn seeds (ranked by their mean), and the best is written to (with the base map's "lighting"
+block, if any)
 maps/<tiling>/NAME.json (with the spawn settings it was evolved under, and for penrose the tiling's settings: pentagrid
 seed, edge, rotation, min slope, cup rule ("cups") and, for the "pair" rule, its gap, see scene._layout_tiling),
 and the base's archetype "clusters" settings, if any: the variants' added tiles follow them too), so it shows up as "<tiling>/NAME" in the Worlds panel. Progress goes to stdout (one line per round) and every run to
@@ -582,8 +583,12 @@ def main(argv=None):
             f"{args.finalists}{' + base' if base_score is not None else ''} re-run {args.final_seconds:g} s"
             f"{f' on {args.final_seeds} seeds' if args.final_seeds > 1 else ''}: {best['tag']} {best['score']:.4f}"
             f"{vs_base}")
+    lighting = None  # the base map's lit-renderer settings (materials, glass, palette...) carry over to the winner
+    if args.base != "random":
+        from diamonds_map import layout_lighting
+        lighting = layout_lighting(os.path.join(out_dir, args.base + ".json")) or None
     save_layout(out, None, size, note=note, spawn=spawn, keys=best["keys"],
-                tiling=tiling if tiling["tiling"] != "diamonds" else None)
+                tiling=tiling if tiling["tiling"] != "diamonds" else None, lighting=lighting)
     drop = ("keys", "stuck_xy")
     with open(os.path.join(log_dir, "summary.json"), "w") as f:
         json.dump({"name": args.name, "out": out, "note": note, "features": features,
