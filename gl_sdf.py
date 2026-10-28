@@ -14,7 +14,8 @@ shadow march lights use (sdf_shadow / sdf_at). shared["sdf"] holds every shadow 
 
 Translucent shadows: see-through casters (glass / fluid with transparency > 0: G-buffer FLAG_TRANSLUCENT, bit4)
 let light through. On frames that have them (a scan of the world's materials, redone when gl_world's material
-signature changes), in the filled view, with a light that casts shadows and gl_lights.tr_scale > 0 (caustics off,
+signature changes), in the filled view (or the points view when gl_world drew the silhouettes' transmittance,
+gbuf["tr"], which then stands in for their material), with a light that casts shadows and gl_lights.tr_scale > 0 (caustics off,
 or gl_lights.CAUSTIC_SHARE < 1), SdfEffect also publishes, all at the render size:
   shared["sdf_opaque"] (R32F, LINEAR): the same field over the opaque casters only;
   shared["sdf_tr"] (R32F, LINEAR): over the translucent casters only;
@@ -22,6 +23,11 @@ or gl_lights.CAUSTIC_SHARE < 1), SdfEffect also publishes, all at the render siz
     (material.glsl mat_transmittance: transparency x Beer-Lambert toward its colour);
 from a split pass (sdf_tr.frag) and one more jump flood over both masks (jfa2_*.frag). gl_lights then shadows with sdf_opaque x sdf_shadow_tr.
 Frames without them cost nothing extra and render exactly as before.
+
+Frames nothing reads the fields on (SdfEffect._wanted: no light casting shadows, and the points view or no glass /
+mirror / fluid material) skip the flood and publish no "sdf"; the points view with translucent fields publishes no
+"sdf" either (lights shadow with sdf_opaque / sdf_tr there, and the glass / caustics effects that read "sdf" don't
+run in it).
 
 Lit-render margin (gl_world.LIT_MARGIN): when the frame has FrameInfo.occ (a G-buffer padded around the view, with
 the bodies just off screen drawn in it), every field above is built over it instead of the view-sized G-buffer, and
@@ -40,6 +46,8 @@ world's own `gi_gain` (if any; saved in scenes, set by a map's "lighting" block)
 clamped to [0, MAX_GAIN], a non-finite gain counts as 1; GI_EMIT_GAIN likewise). Unlit materials emit nothing.
 On periodic maps the GI wraps seamlessly: the probe grid runs two top-cascade probe spacings past the period, and
 cascade merges and the upsampling take any footprint that would leave the grid one period over.
+The top GI_FAR_CASCADES cascades (the far field) are redone only every GI_FAR_EVERY frames and reused in between;
+a still scene renders exactly the same, and any whole-scene change redoes them at once (GiEffect._far_key).
 Translucent casters (FLAG_TRANSLUCENT) are partial occluders for GI: rc_scene stores their transmittance in the
 scene texel (a = 1 + T) and a cascade ray entering one goes on through it with its radiance x T (rc_cascade).
 
@@ -47,6 +55,7 @@ Periodic maps: frame.period (render px; an axis with 0 doesn't repeat) is assume
 wrap into [0, period) and distances are minimum-image.
 """
 import math
+from types import SimpleNamespace
 
 import moderngl
 
@@ -57,6 +66,15 @@ GI_ENABLED = False  # radiance cascades GI on / off (the UI may toggle this; rea
 GI_GAIN = 1.0  # multiplies shared["gi"]
 GI_EMIT_GAIN = 1.0  # multiplies the emission the cascades start from
 N_CASCADES = 6
+# The far field: the top GI_FAR_CASCADES cascades (the longest rays: most of the GI's cost on maps full of
+# translucent glass, whose rays march on through every body) are redone every GI_FAR_EVERY frames and reused in
+# between. A still scene renders exactly as with every cascade every frame; moving emitters' light from more than
+# GI_L0 x (4^(N - k) - 1) / 3 half-res texels away (k = GI_FAR_CASCADES: 21 texels = 42 render px) lags up to
+# GI_FAR_EVERY - 1 frames. Anything that changes the whole scene (GiEffect._far_key: world swap or map load,
+# materials / palette, view mode, zoom, size; GI or lighting switched off and on) redoes them at once.
+# GI_FAR_EVERY 1 (or GI_FAR_CASCADES 0): every cascade every frame.
+GI_FAR_CASCADES = 3
+GI_FAR_EVERY = 2
 GI_L0 = 1.0  # cascade 0's ray interval, half-res texels (cascade i's is 4^i times longer)
 
 FULLSCREEN_VERT = "world_base.vert"  # gl_world's fullscreen triangle strip from gl_VertexID
@@ -172,14 +190,19 @@ class SplitFlood:
                 "step": frame.load(FULLSCREEN_VERT, "jfa2_step.frag", inc),
                 "dist": frame.load(FULLSCREEN_VERT, "jfa2_dist.frag", inc)}
 
-    def build(self, frame, progs, period, g=None):
-        """g: the G-buffer textures to split (frame.gbuf, or the margin's padded frame.occ)."""
+    def build(self, frame, progs, period, g=None, origin=(0, 0)):
+        """g: the G-buffer textures to split (frame.gbuf, or the margin's padded frame.occ, render px p at texel
+        p + origin). The points view's frame.gbuf["tr"], when there is one, gives its silhouettes' transmittance."""
         g = frame.gbuf if g is None else g
+        tr = frame.gbuf.get("tr")
         sp = progs["split"]
         for unit, (name, tex) in enumerate((("u_normal", g["normal"]), ("u_albedo", g["albedo"]),
-                                            ("u_mat", g["mat"]), ("u_mats", frame.material_tex))):
+                                            ("u_mat", g["mat"]), ("u_mats", frame.material_tex),
+                                            ("u_tr", tr if tr is not None else g["albedo"]))):
             tex.use(unit)
             _set(sp, name, unit)
+        _set(sp, "u_has_tr", tr is not None)
+        _set(sp, "u_tr_origin", tuple(int(o) for o in origin))
         self.split_fbo.use()
         frame.fullscreen(sp)
         seed, step, dist = progs["seed"], progs["step"], progs["dist"]
@@ -287,7 +310,10 @@ class SdfEffect:
 
     def _wants_tr(self, gw, frame):
         world = getattr(frame, "world", None)
-        if world is None or not getattr(frame, "filled", True):  # (points view: no see-through silhouettes)
+        if world is None:
+            return False
+        # the points view has see-through silhouettes only when gl_world drew their transmittance (gbuf["tr"])
+        if not getattr(frame, "filled", True) and "tr" not in frame.gbuf:
             return False
         if not self.translucent.of(gw, world) or not _shadow_lights(world):
             return False
@@ -295,7 +321,29 @@ class SdfEffect:
         return gl_lights.tr_scale(gw, frame) > 0.0
 
 
+    def wants_occ(self, gw, world, filled):
+        """gl_world: draw the lit-render margin this frame? Only when the fields get built (it is all they use)."""
+        return self._wanted(gw, SimpleNamespace(world=world, filled=filled))
+
+    @staticmethod
+    def _wanted(gw, frame):
+        """Does anything read the fields this frame: a light that casts shadows (gl_lights; also all caustics need),
+        or, in the filled view, glass / mirror / fluid materials (gl_glass's resolve marches shared["sdf"]; in the
+        points view every body has an opaque twin and the resolve has nothing to do). No: the frame goes without
+        (lights then use their no-shadow variant, which is what a light without shadows gets anyway)."""
+        world = getattr(frame, "world", None)
+        if world is None or _shadow_lights(world):
+            return True
+        if not getattr(frame, "filled", True):
+            return False
+        kinds = getattr(gw, "mat_kinds", None)
+        if kinds is None:
+            return True
+        return bool(set(int(k) for k in kinds) & {materials.GLASS, materials.MIRROR, materials.FLUID})
+
     def run(self, gw, frame):
+        if not self._wanted(gw, frame):
+            return
         # the lit-render margin (gl_world.LIT_MARGIN): the fields cover the padded G-buffer, render px p at texel
         # p + origin (published as shared["sdf_origin"] for sdf_shadow.glsl's u_sdf_origin)
         src = getattr(frame, "occ", None) or frame.gbuf
@@ -306,15 +354,20 @@ class SdfEffect:
         self.jfa = self._cached(self.jfas, size, lambda: JumpFlood(self.ctx, size, linear=True))
         self.ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
         period = _period(frame.period)
-        frame.shared["sdf"] = self.jfa.build(frame, self.progs, src["normal"], 0, period)
         frame.shared["sdf_origin"] = origin
-        if not self._wants_tr(gw, frame):
+        tr = self._wants_tr(gw, frame)
+        # the points view with translucent fields: lights shadow with those alone, and nothing else there reads the
+        # field of every caster (glass / caustics are filled-view effects), so its flood is skipped
+        if not (tr and not getattr(frame, "filled", True)):
+            frame.shared["sdf"] = self.jfa.build(frame, self.progs, src["normal"], 0, period)
+        if not tr:
             return
         if self.split_progs is None:
             self.split_progs = SplitFlood.progs(frame)
         self.split = self._cached(self.splits, size, lambda: SplitFlood(self.ctx, size))
         sh = frame.shared
-        sh["sdf_opaque"], sh["sdf_tr"], sh["sdf_tint"] = self.split.build(frame, self.split_progs, period, src)
+        sh["sdf_opaque"], sh["sdf_tr"], sh["sdf_tint"] = self.split.build(frame, self.split_progs, period, src,
+                                                                          origin)
 
     def release(self):
         for o in [*self.jfas.values(), *self.splits.values()]:
@@ -334,10 +387,32 @@ class GiEffect:
         self.progs = None
         self.textures = []
         self.stats = {}
+        self.far, self.far_fbos = [], []  # the far cascades' own textures (GI_FAR_CASCADES), top down
+        self._far_last_key, self._far_last_no, self._far_age = None, None, 0
+
+    @staticmethod
+    def _far_key(gw, frame, period):
+        """What the far cascades depend on besides the bodies' motion: a change redoes them at once. The world
+        (swap / map load: another World or a repacked one), its materials and colours (gl_world's material
+        signature, replaced on any change; the palette and background), the view mode, zoom and view size, the
+        grid and the emission gain. (Lighting toggled off and on: GLWorld.frame_no skips, see run.)"""
+        world = getattr(frame, "world", None)
+        packer = getattr(gw, "packer", None)
+        return (id(world), id(getattr(packer, "topo", None)), id(getattr(gw, "_mat_sig", None)),
+                getattr(world, "palette", None), tuple(getattr(world, "background", None) or ()),
+                bool(getattr(frame, "filled", True)), getattr(gw, "last_outlines", None), float(frame.zoom),
+                tuple(frame.clip), tuple(frame.size), period, _gain(GI_EMIT_GAIN))
+
+    def _alloc_far(self, n):
+        for o in self.far_fbos + self.far:
+            o.release()
+        self.far = [_tex(self.ctx, self.grid, 4, "f2", linear=True) for _ in range(n)]
+        self.far_fbos = [self.ctx.framebuffer([t]) for t in self.far]
 
     def _alloc(self, size, period):
         for o in self.textures:
             o.release()
+        self._alloc_far(0)
         ctx = self.ctx
         m = 1 << (N_CASCADES - 1)
         half = ((size[0] + 1) // 2, (size[1] + 1) // 2)
@@ -377,10 +452,13 @@ class GiEffect:
         p = self.progs
         # scene at half res
         g = frame.gbuf
-        for unit, tex in enumerate((g["normal"], g["albedo"], g["mat"], frame.material_tex)):
+        tr = g.get("tr")  # (the points view's silhouette transmittance, gl_world _occluder_fill)
+        for unit, tex in enumerate((g["normal"], g["albedo"], g["mat"], frame.material_tex,
+                                    tr if tr is not None else g["albedo"])):
             tex.use(unit)
-        for unit, name in enumerate(("u_normal", "u_albedo", "u_mat", "u_mats")):
+        for unit, name in enumerate(("u_normal", "u_albedo", "u_mat", "u_mats", "u_tr")):
             _set(p["scene"], name, unit)
+        _set(p["scene"], "u_has_tr", tr is not None)
         _set(p["scene"], "u_emit_gain", _gain(GI_EMIT_GAIN))
         self.scene_fbo.use()
         frame.fullscreen(p["scene"])
@@ -394,9 +472,35 @@ class GiEffect:
         _set(c, "u_upper", 2)
         _set(c, "u_l0", float(GI_L0))
         _set(c, "u_period", period)
+        # the far cascades (GI_FAR_CASCADES, the top ones): kept in their own textures and redone every
+        # GI_FAR_EVERY frames, reused in between, unless anything that changes the whole scene changed (_far_key)
+        n_far = min(max(int(GI_FAR_CASCADES), 0), N_CASCADES - 1) if int(GI_FAR_EVERY) > 1 else 0
+        far = list(range(N_CASCADES - 1, N_CASCADES - 1 - n_far, -1))  # top down
+        refresh = True
+        if n_far:
+            key = self._far_key(gw, frame, period)
+            no = getattr(gw, "frame_no", None)
+            if len(self.far) != n_far:
+                self._alloc_far(n_far)
+            elif (key == self._far_last_key and no is not None and self._far_last_no is not None
+                  and no == self._far_last_no + 1 and self._far_age + 1 < int(GI_FAR_EVERY)):
+                refresh = False
+            self._far_age = 0 if refresh else self._far_age + 1
+            self._far_last_key, self._far_last_no = key, no
+        self.stats["far_refreshed"] = bool(n_far) and refresh
+        upper = None
+        for k, i in enumerate(far):
+            if refresh:
+                (upper if upper is not None else self.casc[0]).use(2)
+                _set(c, "u_has_upper", i < N_CASCADES - 1)
+                _set(c, "u_index", i)
+                self.far_fbos[k].use()
+                frame.fullscreen(c)
+            upper = self.far[k]
         cur = 0
-        for i in range(N_CASCADES - 1, -1, -1):
-            self.casc[1 - cur].use(2)  # the cascade above (unused for the top one)
+        for i in range(N_CASCADES - 1 - n_far, -1, -1):
+            # the cascade above (unused for the top one)
+            (upper if upper is not None and i == N_CASCADES - 1 - n_far else self.casc[1 - cur]).use(2)
             _set(c, "u_has_upper", i < N_CASCADES - 1)
             _set(c, "u_index", i)
             self.casc_fbos[cur].use()
@@ -419,6 +523,7 @@ class GiEffect:
     def release(self):
         for o in self.textures:
             o.release()
+        self._alloc_far(0)
         if self.size is not None:
             self.jfa.release()
         for p in (self.progs or {}).values():

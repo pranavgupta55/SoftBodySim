@@ -215,9 +215,18 @@ class _Kinds:
     def __init__(self):
         self.key, self.kinds, self.age = None, None, 0
 
-    def of(self, world):
+    def of(self, world, gw=None):
+        """gw: the GLWorld that drew the frame: its material table (gl_world _materials, rebuilt whenever a body's
+        material changes) already lists every kind in use, so no rescan is needed."""
         if world is None or not hasattr(world, "bodies"):
             return {materials.OPAQUE, materials.GLASS, materials.MIRROR, materials.FLUID}
+        mk = getattr(gw, "mat_kinds", None)
+        if mk is not None and getattr(gw, "_mat_sig", None) is not None:
+            if mk is not self.key:
+                self.key, self.kinds = mk, {int(k) for k in mk[1:]}
+            return self.kinds
+        if isinstance(self.key, np.ndarray):
+            self.key = None
         key = (id(world), len(world.bodies))
         self.age += 1
         if key != self.key or self.age >= KINDS_EVERY:
@@ -472,8 +481,12 @@ class GlassEffect:
 
     def run(self, gw, frame):
         ctx = self.ctx
-        kinds = self.kinds.of(getattr(frame, "world", None))
+        kinds = self.kinds.of(getattr(frame, "world", None), gw)
         if not kinds & {materials.GLASS, materials.MIRROR, materials.FLUID}:
+            return
+        # the points view draws every body with its opaque twin (gl_world) and has no liquid: the resolve would
+        # discard every pixel, so the push-pull and behind passes before it are skipped too
+        if not getattr(frame, "filled", True):
             return
         prev = ctx.fbo
         ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
@@ -571,15 +584,20 @@ class CausticsEffect:
     def _smooth():
         return CAUSTIC_NORMAL_SMOOTH_PX > 0 and CAUSTIC_NORMAL_TAPS > 0
 
-    def _boxes(self, world):
+    def _boxes(self, world, gw=None):
         """(lo, hi) world-unit AABBs (n, 2) of the world's glass / mirror / fluid bodies, or None when unknown (no
         point array: then no light is culled). Body kinds are rescanned with the kinds (KINDS_EVERY runs)."""
         bodies = getattr(world, "bodies", None)
         P, offsets = getattr(world, "P", None), getattr(world, "offsets", None)
         if not bodies or P is None or offsets is None or len(offsets) != len(bodies):
             return None
+        bm, mk = getattr(gw, "body_mat", None), getattr(gw, "mat_kinds", None)
         key = (id(world), len(bodies))
-        if self._optical_key != key or self.kinds.age == 0:
+        if bm is not None and mk is not None and len(bm) == len(bodies):  # gl_world's per-body material ids
+            if self._optical_key is not bm:  # (a new array whenever a body's material changes)
+                self._optical_key = bm
+                self._optical = np.isin(mk[bm], (materials.GLASS, materials.MIRROR, materials.FLUID))
+        elif isinstance(self._optical_key, np.ndarray) or self._optical_key != key or self.kinds.age == 0:
             self._optical_key = key
             optic = {materials.GLASS, materials.MIRROR, materials.FLUID}
             self._optical = np.array([materials.of_body(b).kind in optic for b in bodies], bool)
@@ -591,12 +609,12 @@ class CausticsEffect:
         hi = np.maximum.reduceat(P, starts, axis=1).T[self._optical]
         return lo, hi
 
-    def _lights(self, world):
+    def _lights(self, world, gw=None):
         """The lights that cast caustics: lights.active (sanitised, enabled); a point or spot light whose radius
         reaches no glass / mirror / fluid body's box is skipped (directional lights never); the CAUSTIC_MAX_LIGHTS
         brightest of the rest."""
         ls = lights.active(world)
-        boxes = self._boxes(world) if any(lt.kind != lights.DIRECTIONAL for lt in ls) else None
+        boxes = self._boxes(world, gw) if any(lt.kind != lights.DIRECTIONAL for lt in ls) else None
         if boxes is not None:
             lo, hi = boxes
             centre, half = (lo + hi) / 2, (hi - lo) / 2
@@ -623,10 +641,10 @@ class CausticsEffect:
             return
         if not getattr(frame, "filled", True):  # points view: a wireframe of springs focuses no light (its 1 px
             return  # lines, refracting on flat normals, would only fan the rays into streaks)
-        kinds = self.kinds.of(world)
+        kinds = self.kinds.of(world, gw)
         if not kinds & {materials.GLASS, materials.MIRROR, materials.FLUID}:
             return
-        ls = self._lights(world)
+        ls = self._lights(world, gw)
         if not ls:
             return
         n_rays = int(min(CAUSTIC_RAYS, max(CAUSTIC_MIN_RAYS, CAUSTIC_RAY_BUDGET // len(ls))))

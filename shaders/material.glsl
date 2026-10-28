@@ -90,6 +90,12 @@ vec3 mat_transmittance(Mat m, vec3 col) {
                                                    exp(-max(m.absorption, 0.0) * MAT_SHADOW_THICK_PX));
 }
 
+// The points view's occluder fill (gl_world _occluder_fill, u_flags_only): what a silhouette px of colour col writes
+// to gbuf["tr"]: rgb = its transmittance, a = 1, for a translucent shadow caster; 0 for anything else.
+vec4 mat_tr_px(Mat m, vec3 col) {
+    return (m.casts_shadow && mat_translucent(m)) ? vec4(mat_transmittance(m, col), 1.0) : vec4(0.0);
+}
+
 // The body's own colour with the material's tint mixed in (tint_strength 0: unchanged).
 vec3 mat_tinted(Mat m, vec3 col) {
     return mix(col, col * m.tint, m.tint_strength);

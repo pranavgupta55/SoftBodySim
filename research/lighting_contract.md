@@ -49,8 +49,14 @@ Points view (FrameInfo.filled False): dots and sticks use the material's points-
 False, bevel 0, other fields kept; its own id) and write only the lit bit; then the filled view's shapes are drawn
 invisibly, writing only normal.a = occluder | casts-shadow (per material) | lit. So the SDF, shadows and GI see the
 same silhouettes as in the filled view, while albedo, normal.rgb and mat are the dots / sticks (background, mat 0,
-between them). GLASS / FLUID silhouettes are left out of that fill (they would be plain opaque occluders without
-their material id), so see-through bodies cast no shadow and don't block GI in the points view.
+between them). GLASS / FLUID silhouettes are in that fill too. A translucent one (FLAG_TRANSLUCENT) has no material
+id there to find its transmittance from, so on frames where the fill draws any, it also writes `gbuf["tr"]`:
+RGBA8, view-sized, rgb = the silhouette's transmittance (material.glsl mat_tr_px; an outline takes its body's
+colour), a = 1 on a silhouette, 0 elsewhere; absent on every other frame (filled views included). gl_sdf's
+translucent split (sdf_tr.frag) and the GI scene (rc_scene.frag) take a flagged px's transmittance from it, so
+glass shadows and GI through glass match the filled view. A see-through body's twin keeps its transparency
+(other twins get 0): the GI scene lets an emissive stick / dot of it that reaches past the silhouette (no occluder
+bit) through like the body.
 
 Background, grid, trails write normal (0.5, 0.5, 0, 4 / 255) (flat, lit, not an occluder), mat 0; past the clip
 (outside the world view) flags 0, so no effect lights it and compose keeps the plain background there. Outline

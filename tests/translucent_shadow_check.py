@@ -13,7 +13,8 @@ it. Light is read from LightsEffect's shared["light"] (diffuse, before compose),
 (d) a water pool's shadow is lighter than an opaque one's
 (e) GI: an emitter behind a clear glass slab lights the far side (an opaque slab blocks it)
 (e2) GI energy: past fully clear glass panes the GI never exceeds the empty room's
-(f) the points view: no translucent fields (see-through silhouettes are left out there)
+(f) the points view: the see-through silhouettes' transmittance comes from gbuf["tr"], so the jelly's shadow and GI
+    through clear glass match the filled view; no gbuf["tr"] without see-through bodies or in the filled view
 Exit status 1 on the first failed check.
 """
 import os
@@ -167,7 +168,26 @@ def main():
 
     # (f) points view
     sh = r.render(world(body(red, "jelly", transparency=0.7)), filled=False)
-    check("sdf_tr" not in sh, "(f) points view: no translucent fields")
+    check(all(k in sh for k in ("sdf_opaque", "sdf_tr", "sdf_tint")) and "tr" in r.gw.gbuf,
+          "(f) points view: translucent fields, from gbuf['tr']")
+    pl = mean(r.light(), UNDER)
+    check(np.abs(pl - jl).max() < 0.03 * open_l.mean() + 1e-3, f"(f) ... the jelly's shadow as in the filled view "
+          f"({pl} vs {jl})")
+    r.render(world(body(red, "matte")), filled=False)
+    check("tr" not in r.gw.gbuf, "(f) points view without see-through bodies: no gbuf['tr']")
+    check(mean(r.light(), UNDER).max() < 0.02 * open_l.mean(), "(f) ... an opaque body's shadow stays dark")
+    r.render(world(body(red, "jelly", transparency=0.7)), filled=True)
+    check("tr" not in r.gw.gbuf, "(f) filled view: no gbuf['tr']")
+    # GI through clear glass in the points view, as in the filled view (e)
+    for filled in (True, False):
+        lamp = body((255, 200, 120), "glow", rect=(120, 150, 30, 30), emissive_strength=3.0)
+        wall = body((200, 220, 240), "glass", rect=(200, 150, 16, 240), transparency=0.9, absorption=0.0)
+        w = world(lamp, wall, light=False)
+        w.gi = True
+        r.render(w, filled=filled)
+        gi_vals[filled] = mean(r.gi(), (slice(140, 160), slice(230, 250))).mean()
+    check(abs(gi_vals[False] - gi_vals[True]) < 0.15 * gi_vals[True] + 1e-4,
+          f"(f) GI past clear glass: points view {gi_vals[False]:.4f} ~ filled {gi_vals[True]:.4f}")
     print("all translucent shadow checks passed")
     return 0
 

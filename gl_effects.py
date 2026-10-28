@@ -77,6 +77,7 @@ class FrameInfo:
     # a margin around it (bodies just outside the view are drawn there), or None (no margin this frame). Render px
     # (x, y) is texel (x + origin[0], y + origin[1]) of these; origin is 0 on a periodic axis (the wrap already
     # brings the neighbours in). Only the occluder side reads them (gl_sdf's fields); everything else stays gbuf.
+    # An effect that reads them has `wants_occ(gw, world, filled)`; when none says yes, gl_world skips the margin.
     occ: dict = None
     origin: tuple = (0, 0)
 

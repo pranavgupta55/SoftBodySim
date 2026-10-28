@@ -19,6 +19,7 @@ uniform bool u_points;
 layout(location = 0) out vec4 f_color;
 layout(location = 1) out vec4 f_normal;
 layout(location = 2) out uint f_mat;
+layout(location = 3) out vec4 f_tr;  // u_flags_only: gbuf["tr"] (world_fill.frag)
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -61,6 +62,7 @@ void main() {
         f_color = vec4(0.0);
         f_normal = vec4(0.0, 0.0, 0.0, float(mat_flags(m) | FLAG_LIT) / 255.0);
         f_mat = 0u;
+        f_tr = mat_tr_px(m, mat_tinted(m, v_col));  // (an outline comes with its body's colour: gl_world)
         return;
     }
     vec2 n = vec2(0.0);
