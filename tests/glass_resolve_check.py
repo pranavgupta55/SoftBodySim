@@ -11,7 +11,12 @@ b. no comb on a mirror: on a flat, slightly rotated mirror rect under a bright b
 c. glints are normalised: roughness 1 with specular 1 adds a glint peak below 0.15 (on glass and on a mirror).
 d. roughness blurs a mirror: the reflection of a striped bar in (b)'s band loses over half its contrast at
    roughness 1.
-With out_dir, writes 4x crops of (b) at roughness 0 and 1.
+e. no seam on a periodic map: a mirror straddling x = 0 with the period = the view; the column jump across the seam
+   is at most 2x the median jump between neighbouring columns of the mirror (the push-pull fill wraps).
+f. what lies under glass shows through: an opaque red rect under a glass disc, with F's behind layer, shows red
+   (its red within 20% of the rect's own lit red), lit directly (the stand-in's shared["light"]) and by the
+   push-pull ratio.
+With out_dir, writes 4x crops of (b) at roughness 0 and 1, the seam and the rect under glass.
 Exit status 1 on a failure.
 """
 import math
@@ -190,6 +195,101 @@ def test_glint(ctx):
         check(peak < 0.15, f"glint: {name} roughness 1, specular 1 peak {peak:.3f} (< 0.15)")
 
 
+def stand_in_light(data):
+    """What L's shared["light"] would hold for glass_harness.build's stand-in lighting: its bevel-shaded point light
+    (build's formula) without the ambient, as an (h, w, 3) array."""
+    h, w = data["mat"].shape
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float64) + 0.5
+    lx, ly = gh.LIGHT_POS
+    vx, vy, vz = lx - xs, ly - ys, np.full_like(xs, 80.0)
+    vl = np.sqrt(vx * vx + vy * vy + vz * vz)
+    n2 = data["normal"]
+    nz = np.sqrt(np.maximum(1 - (n2 ** 2).sum(-1), 0))
+    ndl = np.maximum((n2[..., 0] * vx + n2[..., 1] * vy + nz * vz) / vl, 0)
+    fall = np.clip(1 - np.hypot(vx, vy) / gh.LIGHT_RADIUS, 0, 1) ** 2
+    return np.repeat((0.9 * fall * ndl)[..., None], 3, axis=-1)
+
+
+def run_behind(ctx, data, under, light=True, **kw):
+    """Like run(), with F's behind layer (gbuf behind / behind_nrm / behind_mat) taken from `under` (the same
+    build without the see-through bodies) and, with `light`, the stand-in's shared["light"]: the resolve's direct
+    path (glass_behind.frag)."""
+    h = gh.Harness(ctx, data, **kw)
+    normal = np.zeros(under["normal"].shape[:2] + (4,), np.uint8)
+    normal[..., :2] = gh.u8(under["normal"] * 0.5 + 0.5)
+    normal[..., 2] = np.clip(np.round(under["dist"]), 0, 255).astype(np.uint8)
+    normal[..., 3] = np.where(under["mat"] > 0, 7, 4)  # occluder / casts shadow / lit; background lit
+    size = data["size"]
+    h.gbuf["behind"] = h._tex(gh.rgba8(under["albedo"]), size, 4, "f1")
+    h.gbuf["behind_nrm"] = h._tex(normal, size, 4, "f1")
+    h.gbuf["behind_mat"] = h._tex(under["mat"].astype(np.uint16), size, 1, "u2")
+    frame = h.frame()
+    if light:
+        frame.shared["light"] = h._tex(stand_in_light(data).astype(np.float32), size, 3, "f4")
+    caus, glass = gl_glass.make(ctx, size)
+    h.run([caus, glass], frame)
+    out = h.read()[..., :3].astype(np.float64) / 255.0
+    caus.release()
+    glass.release()
+    return out
+
+
+def test_body_under_glass(ctx, out_dir):
+    """(e) An opaque red rect under a glass disc shows red through the glass, close to its own lit colour."""
+    red = gh.Shape(gh.rounded_rect(430, 300, 60, 80, 4), replace(materials.PRESETS["matte"], specular=0.0),
+                   (220 / 255, 60 / 255, 60 / 255))
+    glass = gh.Shape(gh.ngon(470, 300, 75.0, 64), materials.PRESETS["glass"], GLASS_COL)
+    floor = flat_floor(0.5)
+    data, under = gh.build([red, glass], floor), gh.build([red], floor)
+    for light in (True, False):
+        out = run_behind(ctx, data, under, light=light)
+        # glass interior pixels over the rect (away from both rims)
+        ys, xs = np.mgrid[0:data["mat"].shape[0], 0:data["mat"].shape[1]] + 0.5
+        sel = (np.hypot(xs - 470, ys - 300) < 60) & (np.abs(xs - 430) < 50) & (np.abs(ys - 300) < 70)
+        c, ref = out[sel].mean(0), under["scene"][sel].mean(0)
+        rel = float(abs(c[0] - ref[0]) / ref[0])  # (green / blue: + the glass's own colour, 1 - transparency of it)
+        check(c[0] > 1.6 * c[1] and c[0] > 1.6 * c[2] and rel <= 0.2,
+              f"red rect under glass shows red: {np.round(c * 255).astype(int).tolist()} vs its lit colour "
+              f"{np.round(ref * 255).astype(int).tolist()} (red {rel:.0%} off, <= 20%) (shared light {light})")
+        if out_dir and light:
+            gh.save_png(os.path.join(out_dir, "resolve_red_under_glass.png"),
+                        gh.u8(gh.crop(out, 340, 200, 570, 400)), 2)
+
+
+def test_periodic_seam(ctx, out_dir):
+    """(d) A mirror straddling x = 0 on a periodic map (period = the view): the column jump across the seam is at most
+    2x the median jump between neighbouring columns in the mirror (the push-pull fill is toroidal)."""
+    w, h = gh.SIZE
+    mir = replace(materials.PRESETS["mirror"], specular=0.0, roughness=0.3)
+    shapes = [gh.Shape(gh.ngon(x, 300, 60.0, 64), mir, (0.8, 0.8, 0.85)) for x in (0.0, float(w))]
+    shapes += [gh.Shape(gh.rounded_rect(120, 200, 30, 20, 4), materials.PRESETS["matte"], (0.9, 0.3, 0.2)),
+               gh.Shape(gh.rounded_rect(780, 420, 30, 20, 4), materials.PRESETS["matte"], (0.2, 0.4, 0.9))]
+    # a smooth floor and light, both periodic over the view's width (no edge of their own at the seam; the stand-in
+    # light isn't periodic): the light differs a lot either side of the mirror (0.69 at x = 60, 0.41 at x = 840)
+    ys, xs = np.mgrid[0:h, 0:w] + 0.5
+    wave = 0.12 * np.sin(2 * np.pi * 3 * xs / w) * np.cos(2 * np.pi * ys / 160) + 0.05 * np.cos(2 * np.pi * xs / w)
+    floor = np.stack([0.5 + wave, 0.5 + 0.8 * wave, 0.55 + 0.5 * wave], -1)
+    data = gh.build(shapes, floor, light=False)
+    data["scene"] = data["albedo"] * (0.55 + 0.35 * np.sin(2 * np.pi * xs / w))[..., None]
+    res = {}
+    for period in ((float(w), 0.0), None):
+        out = run(ctx, data, sdf=False, period=period)
+        lum = out.mean(-1)
+        rows = slice(300 - 40, 300 + 40)
+        seam = float(np.abs(lum[rows, 0] - lum[rows, w - 1]).mean())
+        cols = list(range(0, 50)) + list(range(w - 51, w - 1))  # inside the mirror, either side of the seam
+        jumps = [float(np.abs(lum[rows, x + 1] - lum[rows, x]).mean()) for x in cols if x != w - 1]
+        res[period] = (seam, float(np.median(jumps)))
+        if out_dir and period:
+            both = np.concatenate([out[200:400, w - 100:], out[200:400, :100]], 1)
+            gh.save_png(os.path.join(out_dir, "resolve_seam_mirror.png"), gh.u8(both), 3)
+    seam, med = res[(float(w), 0.0)]
+    seam0, med0 = res[None]
+    # (a jump under one 8-bit step is rounding: the floor of the bound)
+    check(seam <= max(2.0 * med, 1.0 / 255), f"periodic seam through a mirror: column jump {seam:.4f} at the seam vs "
+          f"median {med:.4f} (<= 2x, or 1/255); without the period {seam0:.4f} vs {med0:.4f}")
+
+
 def main():
     out_dir = sys.argv[1] if len(sys.argv) > 1 else None
     if out_dir:
@@ -198,6 +298,8 @@ def main():
     test_clear_glass(ctx)
     test_mirror_band(ctx, out_dir)
     test_glint(ctx)
+    test_periodic_seam(ctx, out_dir)
+    test_body_under_glass(ctx, out_dir)
     print(f"{len(FAILS)} failed" if FAILS else "all passed")
     return 1 if FAILS else 0
 

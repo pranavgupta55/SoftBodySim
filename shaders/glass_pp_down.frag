@@ -4,6 +4,8 @@
 //   o_ratio  scene_lit / albedo (with RATIO_EPS) on background pixels (material id 0): the light reaching the floor
 //   o_col    scene_lit on the background and opaque bodies: the surroundings glass / mirrors reflect
 // gl_glass.py's resolve then knows, under a glass body, the light there (ratio) and a fallback colour.
+// On a u_wrap axis (periodic, the view = one period) source texels past the level's edge wrap around to its start,
+// so the pyramid is toroidal and has no seam there; otherwise they are skipped.
 layout(location = 0) out vec4 o_ratio;
 layout(location = 1) out vec4 o_col;
 
@@ -11,6 +13,7 @@ uniform bool u_first;
 uniform sampler2D u_scene;
 uniform sampler2D u_prev_ratio;
 uniform sampler2D u_prev_col;
+uniform bvec2 u_wrap;
 
 void main() {
     ivec2 o = ivec2(gl_FragCoord.xy) * 2;
@@ -18,6 +21,8 @@ void main() {
     ivec2 lim = u_first ? u_clip : textureSize(u_prev_ratio, 0);
     for (int k = 0; k < 4; k++) {
         ivec2 c = u_first ? 2 * o + 2 * ivec2(k & 1, k >> 1) : o + ivec2(k & 1, k >> 1);
+        if (u_wrap.x) c.x %= lim.x;
+        if (u_wrap.y) c.y %= lim.y;
         if (c.x >= lim.x || c.y >= lim.y) continue;
         if (u_first) {
             uint id = mat_id(c);

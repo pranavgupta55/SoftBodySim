@@ -15,24 +15,32 @@ What a mirror shows follows one convention: the eye looks down along VIEW3 = (VI
 what it sees, MIRROR_DEPTH_PX * |R.xy| / R.z px away (flat interior: a short way up the screen; tilted rim: far out
 beside the body), starting from the body's nearest edge.
 
-"Behind" a glass body: the G-buffer is one opaque layer, so scene_lit holds the glass body itself where it is. The
-floor under it is redrawn: gbuf["behind"] if F provides one (an RGBA8 copy of the base pass: background, grid,
-trails, before the bodies), else GLWorld's own base pass run again into a texture of ours (it is a fullscreen pass
-whose uniforms and textures are still bound from this frame), else nothing. It is lit by the light ratio
-scene_lit / albedo of the surrounding floor (background pixels), inpainted under the bodies by push-pull; with no
-floor at all the surrounding scene colour itself is inpainted. Bodies hidden under a glass body (overlaps) aren't
-recovered.
+"Behind" a glass body: the G-buffer is one opaque layer, so scene_lit holds the glass body itself where it is. What
+lies under it: gbuf["behind"] (F's pass A: background, grid, trails and every opaque body, with behind_nrm /
+behind_mat) lit directly at each pixel like compose does (glass_behind.frag: albedo x (ambient + light + gi +
+caustics) + emissive, tone mapped) when L's shared["light"] is there. Otherwise (no light pass, or an older G-buffer
+without behind_nrm) the floor is gbuf["behind"] or GLWorld's own base pass run again into a texture of ours (a
+fullscreen pass whose uniforms and textures are still bound from this frame), lit by the light ratio scene_lit /
+albedo of the surrounding floor (background pixels) inpainted under the bodies by push-pull; with no floor at all the
+surrounding scene colour itself is inpainted. The push-pull pyramid also gives mirrors their blurred surroundings. On
+a periodic axis whose period is the view (PERIOD_WRAP_PX) the pyramid is toroidal, so it has no seam there.
 
 Fluid (FLUID_FILTER): FLUID-kind pixels are splatted into an R16F field, blurred (separable Gaussian, sigma
 FLUID_SIGMA_WORLD x zoom px, wrapping on periodic axes) and thresholded at FLUID_THRESHOLD, so neighbouring fluid
 bodies merge into one liquid surface (gaps bridged, corners rounded); the field's gradient is its normal and its
-value its thickness, feeding the same resolve. Filled views only (frame.filled): in the points view a fluid body's
-points and springs resolve like any see-through pixels, so the mesh stays visible instead of melting into one blob.
+value its thickness, feeding the same resolve. The liquid is lit by the light ratio scene_lit / albedo of the fluid
+bodies' own interior pixels, splatted and blurred with the colour (so a spot over the pool lights it, not the shadowed
+floor in the gaps). Liquid pixels are never dropped: a bridge pixel that finds no fluid body nearby takes the
+world's first FLUID material. A fluid body the filter would erase only because it is small and alone (no liquid
+around it at all) stays as itself. Filled views only (frame.filled): in the points view a fluid body's points and
+springs resolve like any see-through pixels, so the mesh stays visible instead of melting into one blob.
 
 Caustics (CausticsEffect): each light shoots CAUSTIC_RAYS evenly spaced rays, each marched once in a geometry shader
 (caustics_rays.geom); the straight pieces of a ray's path in open air after it was refracted (/ reflected) are drawn
 as additive lines into shared["caustics"] (RGBA16F), then a separable blur. Continuous lines, not points sampled along
 the rays: no dotted / grainy rays, and deterministic, so stable from frame to frame. Filled views only (frame.filled).
+The lights are lights.active's (sanitised); a point / spot light that reaches no glass / mirror / fluid body is
+skipped, at most CAUSTIC_MAX_LIGHTS draw, and past two lights each shoots fewer rays (CAUSTIC_RAY_BUDGET).
 """
 import os
 
@@ -54,6 +62,7 @@ MIRROR_SOFT_PX = 3.0  # a reflection landing on its own body fades from the scen
 GLINT_DIR = (-0.5, -0.6, 0.62)  # direction toward the fixed key light for glints (up-left and above the plane)
 GLINT_STRENGTH = 0.6  # x material.specular
 RATIO_EPS = 0.03  # light ratio (scene + eps) / (albedo + eps): keeps dark floors from blowing up
+BEHIND_DIRECT = True  # light F's behind layer at each pixel (glass_behind.frag); False: the push-pull light ratio
 # ---- in-plane march (glass_common.march)
 SDF_TRACE = True  # march mirror / glass-rim reflections in the plane when S's sdf is there (~+0.3 ms at 900x584)
 MARCH_STEPS = 96
@@ -71,6 +80,11 @@ FLUID_THRESHOLD = 0.35  # field >= this is liquid (hex-packed octagons cover ~57
 FLUID_NORMAL_GAIN = 8.0  # smoothed liquid gradient (per px) -> normal.xy
 FLUID_THICK_PX = 16.0  # thickness where the smoothed liquid is 1
 FLUID_SEARCH = 12  # px a bridge pixel looks around (8 directions) for a fluid body, for its material
+# A FLUID pixel under the threshold stays as its own body (bevel normal, own colour) when the smoothed liquid there is
+# below this: a small drop or thin stream far from any liquid, which the blur alone would erase (while its shadow
+# stays). Next to liquid it is still cut away, so a pool's rim stays smooth.
+FLUID_ISOLATED = 0.02
+FLUID_IOR_MAX = 2.0  # the liquid's ior is clamped to [1, this] (high ior on a wobbly surface only makes black crowns)
 # ---- caustics
 CAUSTICS = False  # CausticsEffect runs only when this (its .enabled) or the world's `caustics` attribute is True
 CAUSTIC_RAYS = 4096  # per light
@@ -89,7 +103,11 @@ CAUSTIC_MAX_T = 600.0  # px of ray path
 CAUSTIC_GAIN = 1.0
 CAUSTIC_MIRRORS = False  # also deposit light only mirrors bent (a flat mirror wall = a second, streaky light source)
 CAUSTIC_STEPS = 192  # march steps per caustic ray (rays cross the whole view)
+CAUSTIC_MAX_LIGHTS = 8  # at most this many lights cast caustics (the brightest), after culling
+CAUSTIC_RAY_BUDGET = 2 * CAUSTIC_RAYS  # rays over all lights: past 2 lights each gets fewer (spacing-normalised)
+CAUSTIC_MIN_RAYS = CAUSTIC_RAYS // 4  # but never fewer than this per light
 PUSHPULL_MIN = 8  # push-pull stops halving at this size (px): fewer, cheaper passes; holes this coarse are rare
+PERIOD_WRAP_PX = 2.0  # a periodic axis whose period is within this of the view's size wraps the push-pull pyramid
 KINDS_EVERY = 10  # runs between rescans of the world's material kinds (skips the passes a world doesn't need)
 
 _FS_VERT = """#version 330 core
@@ -117,7 +135,7 @@ def _defines(**over):
              MIRROR_DEPTH_PX=MIRROR_DEPTH_PX, MIRROR_SOFT_PX=MIRROR_SOFT_PX, VIEW3=(VIEW_TILT[0], VIEW_TILT[1], -1.0),
              GLINT_DIR=GLINT_DIR, GLINT_STRENGTH=GLINT_STRENGTH, FLUID_NORMAL_GAIN=FLUID_NORMAL_GAIN,
              FLUID_THICK_PX=FLUID_THICK_PX,
-             FLUID_SEARCH=FLUID_SEARCH)
+             FLUID_SEARCH=FLUID_SEARCH, FLUID_ISOLATED=float(FLUID_ISOLATED), FLUID_IOR_MAX=float(FLUID_IOR_MAX))
     d.update(over)
     return "".join(f"#define {k} {_glsl(v)}\n" for k, v in d.items())
 
@@ -161,7 +179,8 @@ class _Pool:
     def __init__(self, ctx):
         self.ctx, self.items = ctx, {}
 
-    def tex(self, key, size, comps, dtype, linear=False):
+    def tex(self, key, size, comps, dtype, linear=False, repeat=(False, False)):
+        """The texture `key` (made or remade to fit); `repeat` = (x, y) wrap modes, set when they change."""
         t = self.items.get(key)
         if t is None or t.size != tuple(size) or t.components != comps or t.dtype != dtype:
             if t is not None:
@@ -173,6 +192,8 @@ class _Pool:
             t.filter = (f, f)
             t.repeat_x = t.repeat_y = False
             self.items[key] = t
+        if (t.repeat_x, t.repeat_y) != tuple(bool(r) for r in repeat):
+            t.repeat_x, t.repeat_y = (bool(r) for r in repeat)
         return t
 
     def fbo(self, *texs):
@@ -217,6 +238,44 @@ def _common(prog, frame, sdf_tex=None):
     period = tuple(float(p or 0.0) for p in (frame.period or (0.0, 0.0)))
     _set(prog, u_albedo=0, u_normal=1, u_mat=2, u_table=3, u_sdf=4, u_clip=tuple(int(c) for c in frame.clip),
          u_period=period)
+
+
+def _wrap(frame):
+    """(x, y): whether the push-pull pyramid wraps on that axis: periodic, and the view shows exactly one period."""
+    period = frame.period or (0.0, 0.0)
+    return tuple(bool(float(p or 0.0) > 0.0 and abs(float(p) - float(c)) <= PERIOD_WRAP_PX)
+                 for p, c in zip(period, frame.clip))
+
+
+def _tone():
+    """compose's tone mapping settings (L's gl_lights), for the lit behind layer: (on, knee)."""
+    try:
+        import gl_lights
+    except ImportError:
+        return False, 0.8
+    return bool(getattr(gl_lights, "TONEMAP", False)), min(max(float(getattr(gl_lights, "TONE_KNEE", 0.8)), 0.0), 0.99)
+
+
+def _exposure(world):
+    try:
+        import gl_lights
+        return float(gl_lights.exposure(world))
+    except (ImportError, AttributeError):
+        return 1.0
+
+
+def _first_fluid_id(gw, frame):
+    """The material id of the first FLUID material in the table (0 if none): GLWorld's mat_kinds, else the table
+    texture read back (harnesses)."""
+    kinds = getattr(gw, "mat_kinds", None)
+    if kinds is None:
+        try:
+            tab = np.frombuffer(frame.material_tex.read(), np.float32).reshape(-1, materials.TEXELS, 4)
+            kinds = [-1] + [int(round(float(row[3][1]))) for row in tab[1:]]  # (materials.pack: kind = texel 3 .y)
+        except Exception:  # noqa: BLE001 (an unreadable table: a search miss just stays unresolved)
+            return 0
+    hit = np.flatnonzero(np.asarray(kinds) == materials.FLUID)
+    return int(hit[0]) if len(hit) else 0
 
 
 def _restore(fbo):
@@ -300,16 +359,52 @@ class GlassEffect:
         vao.render(moderngl.TRIANGLE_STRIP, vertices=4)
         return tex
 
-    def _fluid(self, frame):
-        """Half-res fluid field passes -> (field, smoothed liquid, colour) textures, all LINEAR."""
+    def _black(self):
+        """A 1x1 black texture standing in for a missing shared light / gi / caustics."""
+        t = self.pool.items.get("black")
+        if t is None:
+            t = self.pool.items["black"] = self.ctx.texture((1, 1), 4, np.zeros(4, np.float16).tobytes(), dtype="f2")
+            t.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        return t
+
+    def _behind_lit(self, frame):
+        """gbuf["behind"] lit at each pixel like compose (glass_behind.frag) -> an RGBA16F texture, or None when there
+        is no behind layer (no see-through body drawn this frame) or no light pass (L's shared["light"]): then the
+        resolve lights the floor by the push-pull light ratio, as before."""
+        gb, sh = frame.gbuf, frame.shared
+        if not BEHIND_DIRECT or sh.get("light") is None or any(
+                gb.get(k) is None for k in ("behind", "behind_nrm", "behind_mat")):
+            return None
+        tex = self.pool.tex("behind_lit", tuple(gb["behind"].size), 4, "f2")
+        prog, _ = self._prog("glass_behind.frag")
+        _common(prog, frame)
+        black = self._black()
+        units = dict(u_behind=gb["behind"], u_behind_nrm=gb["behind_nrm"], u_behind_mat=gb["behind_mat"],
+                     u_light=sh["light"], u_gi=sh.get("gi", black), u_caustics=sh.get("caustics", black))
+        for unit, (name, t) in enumerate(units.items(), 5):
+            t.use(unit)
+            _set(prog, **{name: unit})
+        world = getattr(frame, "world", None)
+        tonemap, knee = _tone()
+        _set(prog, u_ambient=tuple(float(c) for c in lights.of_world(world)[1]), u_tonemap=tonemap, u_knee=knee,
+             u_exposure=_exposure(world))
+        self._draw("glass_behind.frag", self.pool.fbo(tex))
+        return tex
+
+    def _fluid(self, frame, scene, spec):
+        """Half-res fluid field passes -> (field, smoothed liquid, colour, light ratio) textures, all LINEAR."""
         clip = tuple(int(c) for c in frame.clip)
         hs = ((clip[0] + 1) // 2, (clip[1] + 1) // 2)
         hp = tuple(float(p or 0.0) / 2 for p in (frame.period or (0.0, 0.0)))
         t = lambda name, comps: self.pool.tex(name, hs, comps, "f2", linear=True)
-        a, b = (t("field_a", 1), t("fcol_a", 4)), (t("field_b", 1), t("fcol_b", 4))
+        a = (t("field_a", 1), t("fcol_a", 4), t("fratio_a", 4))
+        b = (t("field_b", 1), t("fcol_b", 4), t("fratio_b", 4))
         c, d = t("field_c", 1), t("field_d", 1)
         prog, _ = self._prog("fluid_splat.frag")
         _common(prog, frame)
+        scene.use(5)
+        (spec if spec is not None else scene).use(6)
+        _set(prog, u_scene=5, u_spec=6, u_spec_on=spec is not None)
         self._draw("fluid_splat.frag", self.pool.fbo(*a))
         zoom = float(frame.zoom)
         sigma = float(np.clip(FLUID_SIGMA_WORLD * zoom, *FLUID_SIGMA_PX)) / 2
@@ -323,13 +418,17 @@ class GlassEffect:
                 if field_only:
                     src.use(5)
                 else:
-                    src[0].use(5)
-                    src[1].use(6)
-                _set(prog, u_src=5, u_src_col=6, u_dir=axis, u_sigma=sg, u_step=float(st), u_hsize=hs, u_hperiod=hp)
+                    for unit, s in enumerate(src, 5):
+                        s.use(unit)
+                _set(prog, u_src=5, u_src_col=6, u_src_ratio=7, u_dir=axis, u_sigma=sg, u_step=float(st), u_hsize=hs,
+                     u_hperiod=hp)
                 self._draw("fluid_blur.frag", self.pool.fbo(*(dst if not field_only else (dst,))), **defs)
-        return a[0], d, a[1]  # field (thresholded in the resolve), smoothed liquid (normal, thickness), colour
+        # field (thresholded in the resolve), smoothed liquid (normal, thickness), colour, light ratio
+        return a[0], d, a[1], a[2]
 
-    def _pushpull(self, frame, scene):
+    def _pushpull(self, frame, scene, wrap):
+        """Push-pull inpainting pyramid -> the quarter-res (light ratio, colour) fill, LINEAR. Toroidal on the axes
+        where `wrap` (_wrap): the pull pass wraps its source texels, the push pass's bilinear taps repeat."""
         w, h = ((int(c) + 1) // 2 for c in frame.clip)
         sizes = []  # quarter res first (glass_pp_down's u_first), then halving
         while True:
@@ -337,12 +436,12 @@ class GlassEffect:
             sizes.append((w, h))
             if max(w, h) <= PUSHPULL_MIN:
                 break
-        own = [(self.pool.tex(("pr", k), s, 4, "f2"), self.pool.tex(("pc", k), s, 4, "f2"))
+        own = [(self.pool.tex(("pr", k), s, 4, "f2", repeat=wrap), self.pool.tex(("pc", k), s, 4, "f2", repeat=wrap))
                for k, s in enumerate(sizes)]
         prog, _ = self._prog("glass_pp_down.frag")
         _common(prog, frame)
         scene.use(5)
-        _set(prog, u_scene=5, u_prev_ratio=6, u_prev_col=7)
+        _set(prog, u_scene=5, u_prev_ratio=6, u_prev_col=7, u_wrap=wrap)
         for k in range(len(sizes)):
             _set(prog, u_first=k == 0)
             if k:
@@ -353,11 +452,11 @@ class GlassEffect:
                 scene.use(7)
             self._draw("glass_pp_down.frag", self.pool.fbo(*own[k]))
         prog, _ = self._prog("glass_pp_up.frag")
-        _set(prog, u_own_ratio=5, u_own_col=6, u_coarse_ratio=7, u_coarse_col=8)
+        _set(prog, u_own_ratio=5, u_own_col=6, u_coarse_ratio=7, u_coarse_col=8, u_wrap=wrap)
         filled = None
         for k in range(len(sizes) - 1, -1, -1):
-            out = (self.pool.tex(("fr", k), sizes[k], 4, "f2", linear=True),
-                   self.pool.tex(("fc", k), sizes[k], 4, "f2", linear=True))
+            out = (self.pool.tex(("fr", k), sizes[k], 4, "f2", linear=True, repeat=wrap),
+                   self.pool.tex(("fc", k), sizes[k], 4, "f2", linear=True, repeat=wrap))
             own[k][0].use(5)
             own[k][1].use(6)
             coarse = filled if filled is not None else own[k]
@@ -385,15 +484,19 @@ class GlassEffect:
         if scene is None:  # no compose module: the resolve reads a copy of whatever is in GLWorld.tex
             scene = self.pool.tex("scene_copy", gw.size, 4, "f1")
             ctx.copy_framebuffer(scene, out)
-        floor = self._floor(gw, frame)
+        direct = self._behind_lit(frame)
+        raw = self._floor(gw, frame)  # (gbuf["behind"] itself when there is one: nothing drawn)
+        floor = direct if direct is not None else raw
         timer.lap("floor")
         sdf = shared.get("sdf") if self.sdf_trace else None
+        spec = shared.get("spec")
         field = None
         # the points view shows each body's points and springs: no liquid merged over (and between) them
         if self.fluid_filter and materials.FLUID in kinds and getattr(frame, "filled", True):
-            field = self._fluid(frame)
+            field = self._fluid(frame, scene, spec)
             timer.lap("fluid")
-        fill_ratio, fill_col = self._pushpull(frame, scene)
+        wrap = _wrap(frame)
+        fill_ratio, fill_col = self._pushpull(frame, scene, wrap)
         timer.lap("pushpull")
         prog, _ = self._prog("glass_resolve.frag", sdf=sdf is not None)
         _common(prog, frame, sdf)
@@ -404,11 +507,16 @@ class GlassEffect:
         (field[0] if field is not None else fill_ratio).use(9)
         (field[2] if field is not None else fill_ratio).use(11)
         (field[1] if field is not None else fill_ratio).use(12)
-        spec = shared.get("spec")
+        (field[3] if field is not None else fill_ratio).use(13)
+        (raw if raw is not None else scene).use(14)
         (spec if spec is not None else scene).use(10)
-        _set(prog, u_scene=5, u_behind=6, u_behind_on=floor is not None, u_fill_ratio=7, u_fill_col=8, u_field=9,
-             u_fluid_col=11, u_fluid_smooth=12,
-             u_fluid_on=field is not None, u_fluid_t=float(FLUID_THRESHOLD), u_spec=10, u_spec_on=spec is not None)
+        emit_gain = _exposure(getattr(frame, "world", None))
+        _set(prog, u_scene=5, u_behind=6, u_behind_on=floor is not None, u_behind_direct=direct is not None,
+             u_floor=14,
+             u_fill_ratio=7, u_fill_col=8, u_field=9, u_fluid_col=11, u_fluid_smooth=12, u_fluid_ratio=13,
+             u_fluid_on=field is not None, u_fluid_t=float(FLUID_THRESHOLD), u_spec=10, u_spec_on=spec is not None,
+             u_wrap=wrap, u_emit_gain=float(emit_gain),
+             u_fluid_mat=_first_fluid_id(gw, frame) if field is not None else 0)
         self._draw("glass_resolve.frag", out, sdf=sdf is not None)
         timer.lap("resolve")
         self.timings = timer.done()
@@ -434,6 +542,7 @@ class CausticsEffect:
         self.pool = _Pool(ctx)
         self.enabled = CAUSTICS
         self.kinds = _Kinds()
+        self._optical_key, self._optical = None, None  # per body: glass / mirror / fluid (_boxes)
         self.progs, self.vaos = {}, {}
         self.profile = False
         self.timings = {}
@@ -462,6 +571,52 @@ class CausticsEffect:
     def _smooth():
         return CAUSTIC_NORMAL_SMOOTH_PX > 0 and CAUSTIC_NORMAL_TAPS > 0
 
+    def _boxes(self, world):
+        """(lo, hi) world-unit AABBs (n, 2) of the world's glass / mirror / fluid bodies, or None when unknown (no
+        point array: then no light is culled). Body kinds are rescanned with the kinds (KINDS_EVERY runs)."""
+        bodies = getattr(world, "bodies", None)
+        P, offsets = getattr(world, "P", None), getattr(world, "offsets", None)
+        if not bodies or P is None or offsets is None or len(offsets) != len(bodies):
+            return None
+        key = (id(world), len(bodies))
+        if self._optical_key != key or self.kinds.age == 0:
+            self._optical_key = key
+            optic = {materials.GLASS, materials.MIRROR, materials.FLUID}
+            self._optical = np.array([materials.of_body(b).kind in optic for b in bodies], bool)
+        if not self._optical.any():
+            return np.zeros((0, 2)), np.zeros((0, 2))
+        P = np.asarray(P, np.float64)
+        starts = np.asarray(offsets, np.int64)
+        lo = np.minimum.reduceat(P, starts, axis=1).T[self._optical]
+        hi = np.maximum.reduceat(P, starts, axis=1).T[self._optical]
+        return lo, hi
+
+    def _lights(self, world):
+        """The lights that cast caustics: lights.active (sanitised, enabled); a point or spot light whose radius
+        reaches no glass / mirror / fluid body's box is skipped (directional lights never); the CAUSTIC_MAX_LIGHTS
+        brightest of the rest."""
+        ls = lights.active(world)
+        boxes = self._boxes(world) if any(lt.kind != lights.DIRECTIONAL for lt in ls) else None
+        if boxes is not None:
+            lo, hi = boxes
+            centre, half = (lo + hi) / 2, (hi - lo) / 2
+            period = getattr(world, "period", None)
+            period = np.array([float(p or 0.0) for p in period] if period is not None else [0.0, 0.0])
+            keep = []
+            for lt in ls:
+                if lt.kind == lights.DIRECTIONAL:
+                    keep.append(lt)
+                    continue
+                d = np.asarray(lt.pos, np.float64) - centre
+                d = np.where(period > 0, d - period * np.round(d / np.where(period > 0, period, 1.0)), d)
+                gap = np.hypot(*np.maximum(np.abs(d) - half, 0.0).T) if len(d) else np.zeros(0)
+                if len(gap) and gap.min() <= float(lt.radius):
+                    keep.append(lt)
+            ls = keep
+        if len(ls) > CAUSTIC_MAX_LIGHTS:
+            ls = sorted(ls, key=lambda lt: -float(lt.intensity) * max(lt.color))[:CAUSTIC_MAX_LIGHTS]
+        return ls
+
     def run(self, gw, frame):
         world = getattr(frame, "world", None)
         if not (self.enabled or getattr(world, "caustics", False)):
@@ -471,9 +626,10 @@ class CausticsEffect:
         kinds = self.kinds.of(world)
         if not kinds & {materials.GLASS, materials.MIRROR, materials.FLUID}:
             return
-        ls = [lt for lt in lights.of_world(world)[0] if lt.enabled]
+        ls = self._lights(world)
         if not ls:
             return
+        n_rays = int(min(CAUSTIC_RAYS, max(CAUSTIC_MIN_RAYS, CAUSTIC_RAY_BUDGET // len(ls))))
         ctx = self.ctx
         prev = ctx.fbo
         timer = _Timer(ctx, self.profile, self.queries)
@@ -507,9 +663,9 @@ class CausticsEffect:
                  u_light_dir=tuple(float(c) for c in lt.dir), u_cone=float(np.radians(lt.cone_outer)),
                  u_light_col=tuple(float(c) * lt.intensity * CAUSTIC_GAIN for c in lt.color),
                  u_radius_px=max(float(lt.radius) * zoom, 1.0), u_falloff=float(lt.falloff),
-                 u_rays=CAUSTIC_RAYS, u_max_t=float(CAUSTIC_MAX_T),
+                 u_rays=n_rays, u_max_t=float(CAUSTIC_MAX_T),
                  u_size=tuple(float(s) for s in self.size))
-            vao.render(moderngl.POINTS, vertices=CAUSTIC_RAYS)
+            vao.render(moderngl.POINTS, vertices=n_rays)
         ctx.disable(moderngl.BLEND)
         ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
         timer.lap("rays")
