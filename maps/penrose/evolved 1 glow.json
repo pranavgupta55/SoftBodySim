@@ -73,7 +73,7 @@
 "lighting": {
 "enabled": true,
 "gi": true,
-"gi_gain": 6.5,
+"gi_gain": 2.4,
 "background": {
 "lightness": 0.4,
 "saturation": 0.3
@@ -98,7 +98,7 @@
 "absorption": 0.0,
 "reflectivity": 0.04,
 "emissive": "hue",
-"emissive_strength": 0.12
+"emissive_strength": 0.03
 }
 }
 },

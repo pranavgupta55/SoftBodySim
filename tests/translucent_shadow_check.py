@@ -12,6 +12,7 @@ it. Light is read from LightsEffect's shared["light"] (diffuse, before compose),
     caustics (no brighter than open ground + 5%); caustics off -> about transparency x open ground
 (d) a water pool's shadow is lighter than an opaque one's
 (e) GI: an emitter behind a clear glass slab lights the far side (an opaque slab blocks it)
+(e2) GI energy: past fully clear glass panes the GI never exceeds the empty room's
 (f) the points view: no translucent fields (see-through silhouettes are left out there)
 Exit status 1 on the first failed check.
 """
@@ -147,6 +148,22 @@ def main():
         gi_vals[name] = mean(r.gi(), (slice(140, 160), slice(230, 250))).mean()
     check(gi_vals["glass"] > 3.0 * gi_vals["opaque"] + 1e-4,
           f"(e) GI passes clear glass ({gi_vals['glass']:.4f}) but not an opaque wall ({gi_vals['opaque']:.4f})")
+
+    # (e2) GI energy: past a pane of fully clear glass (transparency 1, no absorption, no emission) the GI is the
+    # empty room's, never more (no light counted twice through glass)
+    far = {}
+    for name, panes in (("empty", ()), ("pane", ((200, 16),)), ("panes", tuple((180 + 10 * i, 4) for i in range(5)))):
+        lamp = body((255, 200, 120), "glow", rect=(120, 150, 30, 30), emissive_strength=3.0)
+        walls = [body((200, 220, 240), "glass", rect=(x, 150, wd, 240), transparency=1.0, absorption=0.0,
+                      emissive_strength=0.0) for x, wd in panes]
+        w = world(lamp, *walls, light=False)
+        w.gi = True
+        r.render(w)
+        far[name] = mean(r.gi(), (slice(120, 180), slice(230, 360))).mean()
+    for name in ("pane", "panes"):
+        check(far[name] <= 1.01 * far["empty"] + 1e-5,
+              f"(e2) GI past clear glass ({name}: {far[name]:.4f}) <= the empty room's ({far['empty']:.4f})")
+    check(far["pane"] >= 0.95 * far["empty"], f"(e2) ... and one clear pane keeps it ({far['pane']:.4f})")
 
     # (f) points view
     sh = r.render(world(body(red, "jelly", transparency=0.7)), filled=False)
