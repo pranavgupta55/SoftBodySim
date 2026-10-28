@@ -16,7 +16,8 @@ variants. Every run is the physics only (no display, no drawing) for `seconds` o
 
 with --weights w1,w2,w3 (default 0.7,0.2,0.1).
 
-Then the last round's top `finalists` and the base run `final_seconds` each, and the best is written to
+Then the last round's top `finalists` and the base (not with --no-final-base) run `final_seconds` each, on
+--final-seeds fresh spawn seeds (ranked by their mean), and the best is written to
 maps/<tiling>/NAME.json (with the spawn settings it was evolved under, and for penrose the tiling's settings: pentagrid
 seed, edge, rotation, min slope, cup rule ("cups") and, for the "pair" rule, its gap, see scene._layout_tiling),
 and the base's archetype "clusters" settings, if any: the variants' added tiles follow them too), so it shows up as "<tiling>/NAME" in the Worlds panel. Progress goes to stdout (one line per round) and every run to
@@ -32,7 +33,8 @@ original search, run for run):
       data.
   --halving STAGES ("auto": seconds/6, seconds/2, seconds; or e.g. "10,30,60", the last one = --seconds): every child
       runs the first stage, the best half (at least `keep`) go on to the next one (rerun from scratch); only the last
-      stage's scores rank them.
+      stage's scores rank them. --stages "SECONDS:SURVIVORS,...,SECONDS" (e.g. "10:50,30:25,60") instead sets each
+      stage's survivors explicitly (a stage without ":N" halves as above) and the last stage's seconds = --seconds.
   --paired: all runs of a round (its children and their parents) share one fresh shape-spawn seed, so score
       differences come from the layout; the kept parents are re-run each round on it and rank by the mean of all
       their scores (parents and children compete for `keep`). The final phase uses one more fresh seed for all.
@@ -47,9 +49,9 @@ layout (--seed) at the current spawn settings' density (scene.DIAMONDS_SPAWN / P
 --base LAYOUT (a name in maps/<tiling>) starts from that layout, its tiling and its own spawn settings.
 
 --rounds is a maximum with --deadline (local time): before each round after the first, the run checks that one more
-round (the longest one so far, or the stage plan's estimate if longer) plus the final phase (ceil((finalists + 1) /
-workers) waves of final runs, timed from the last round's runs per sim second) and a margin still end before the
-deadline, and goes straight to the final phase if not, so the map is saved in time.
+round (the longest one so far, or the stage plan's estimate if longer) plus the final phase (ceil((finalists [+ 1
+for the base]) x final_seeds / workers) waves of final runs, timed from the last round's runs per sim second) and a
+margin still end before the deadline, and goes straight to the final phase if not, so the map is saved in time.
 
 Runs use `workers` processes (each imports and compiles once); launch it at low priority, e.g. `nice -n 10`, with
 OMP_NUM_THREADS=1.
@@ -318,6 +320,13 @@ def parse_deadline(text):
     return None if text is None else time.mktime(time.strptime(text, "%Y-%m-%d %H:%M"))
 
 
+def survivors(n, si, args):
+    """How many of the n children run in stage si go on to stage si + 1: --stages' explicit count (at most n), else
+    the best half, at least `keep`."""
+    k = args.survivors[si]
+    return min(n, k) if k is not None else max(math.ceil(n / 2), min(n, args.keep))
+
+
 def stage_plan(args):
     """[(sim seconds, runs)] of one round: the halving stages (children only; the parents join the last one when
     paired)."""
@@ -325,15 +334,21 @@ def stage_plan(args):
     for i, secs in enumerate(args.stages):
         last = i == len(args.stages) - 1
         plan.append((secs, n + (args.keep if last and args.paired else 0)))
-        n = max(math.ceil(n / 2), min(n, args.keep))
+        if not last:
+            n = survivors(n, i, args)
     return plan
+
+
+def final_runs(args):
+    """The final phase's runs: (finalists [+ the base]) x final_seeds."""
+    return (args.finalists + (1 if args.final_base else 0)) * args.final_seeds
 
 
 def fits_deadline(deadline, now, round_secs, run_secs_per_sim, args):
     """(fits, estimate in s) of one more round (the longest so far, or the stage plan's waves at the measured wall
-    seconds per sim second if longer) plus the final phase: ceil((finalists + 1) / workers) waves of final_seconds
-    runs at that rate, +15%, + DEADLINE_MARGIN."""
-    waves = math.ceil((args.finalists + 1) / args.workers)
+    seconds per sim second if longer) plus the final phase: ceil(final_runs / workers) waves of final_seconds runs at
+    that rate, +15%, + DEADLINE_MARGIN."""
+    waves = math.ceil(final_runs(args) / args.workers)
     final = waves * args.final_seconds * run_secs_per_sim * 1.15
     planned = sum(math.ceil(n / args.workers) * secs * run_secs_per_sim for secs, n in stage_plan(args))
     need = max(max(round_secs), planned) + final + DEADLINE_MARGIN
@@ -356,8 +371,13 @@ def main(argv=None):
     p.add_argument("--remove", type=int, default=3)
     p.add_argument("--add", type=int, default=3)
     p.add_argument("--seconds", type=float, default=60, help="sim seconds per run")
-    p.add_argument("--finalists", type=int, default=8)
+    p.add_argument("--finalists", type=int, default=8, help="the last round's top N re-run in the final phase")
     p.add_argument("--final-seconds", type=float, default=180)
+    p.add_argument("--final-seeds", type=int, default=1,
+                   help="fresh spawn seeds each finalist runs on in the final phase (ranked by the mean)")
+    p.add_argument("--final-base", action=argparse.BooleanOptionalAction, default=True,
+                   help="also re-run the base in the final phase (for the comparison in the note); "
+                        "--no-final-base saves its runs, the saved map is the best finalist either way")
     p.add_argument("--size", default="1800x1169", help="world size WxH (the screen's: window px / SCALE_DOWN / zoom)")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--weights", default="0.7,0.2,0.1", help="w1,w2,w3: spread, unstuck, tile evenness")
@@ -373,12 +393,26 @@ def main(argv=None):
                    help='successive halving stages in sim s, e.g. "10,30,60" (the last = --seconds); "auto": '
                         'seconds/6, seconds/2, seconds')
     p.add_argument("--no-halving", dest="halving", action="store_const", const="off", help="one stage: --seconds")
+    p.add_argument("--stages", default=None,
+                   help='explicit stage plan "SECONDS:SURVIVORS,...,SECONDS", e.g. "10:50,30:25,60" (overrides '
+                        '--halving; a stage without ":N" keeps the best half, at least keep; the last stage\'s '
+                        'seconds = --seconds)')
     p.add_argument("--paired", action=argparse.BooleanOptionalAction, default=True,
                    help="one shape seed per round for children and parents; parents re-scored and averaged")
     p.add_argument("--crossover", type=float, default=0.25, help="share of children made by cell crossover")
     p.add_argument("--no-crossover", dest="crossover", action="store_const", const=0.0)
     args = p.parse_args(argv)
-    if args.halving == "off":
+    args.survivors = None
+    if args.stages is not None:
+        parts = [v.strip().split(":") for v in args.stages.split(",")]
+        if any(len(v) > 2 for v in parts) or len(parts[-1]) != 1:
+            p.error('--stages: "SECONDS:SURVIVORS,...,SECONDS" (the last stage has no survivor count)')
+        args.stages = [float(v[0]) for v in parts]
+        args.survivors = [int(v[1]) if len(v) == 2 else None for v in parts[:-1]]
+        if any(k is not None and k < 1 for k in args.survivors):
+            p.error("--stages: survivor counts must be at least 1")
+        args.seconds = args.stages[-1]
+    elif args.halving == "off":
         args.stages = [args.seconds]
     elif args.halving == "auto":
         args.stages = [args.seconds / 6, args.seconds / 2, args.seconds]
@@ -386,6 +420,10 @@ def main(argv=None):
         args.stages = [float(v) for v in args.halving.split(",")]
         if abs(args.stages[-1] - args.seconds) > 1e-9:
             p.error(f"--halving's last stage ({args.stages[-1]:g}) must be --seconds ({args.seconds:g})")
+    if args.survivors is None:
+        args.survivors = [None] * (len(args.stages) - 1)
+    if args.final_seeds < 1:
+        p.error("--final-seeds must be at least 1")
     import numpy as np
     size = tuple(float(v) for v in args.size.lower().split("x"))
     weights = tuple(float(v) for v in args.weights.split(","))
@@ -410,7 +448,8 @@ def main(argv=None):
     import scene
     rule_reach = 2 * side + max(float(tiling.get("cup_gap", scene.CUP_GAP)), float(tiling.get("near", 0.0)))
     features = (f"targeted {args.targeted_share:g}" if args.targeted else "untargeted") + \
-        (f", halving {'/'.join(f'{s:g}' for s in args.stages)} s" if len(args.stages) > 1 else "") + \
+        (f", stages {' / '.join(f'{s:g} s' + (f' -> {k}' if k is not None else '') for s, k in zip(args.stages, args.survivors + [None]))}"
+         if len(args.stages) > 1 else "") + \
         (", paired seeds + elite re-scoring" if args.paired else "") + \
         (f", crossover {args.crossover:g}" if args.crossover > 0 else "")
     print(f"{args.name}: {tiling}, {base_desc}, spawn {spawn}, up to {args.rounds} rounds x {args.children} runs of "
@@ -482,7 +521,7 @@ def main(argv=None):
                 kids = sorted((x for x in results if x["tag"] not in {e["tag"] for e in parents}),
                               key=lambda x: -x["score"])
                 if not last:
-                    n = max(math.ceil(len(kids) / 2), min(len(kids), args.keep))
+                    n = survivors(len(kids), si, args)
                     stage_note.append(f"{secs:g} s: {len(kids)} -> {n}, best {kids[0]['score']:.4f}")
                     jobs = [{"tag": x["tag"], "keys": x["keys"]} for x in kids[:n]]  # survivors: their own layouts
             for res in results:  # the parents' re-runs
@@ -508,17 +547,31 @@ def main(argv=None):
                   f"{mean(ranking[len(ranking) // 2]):.4f}{elite}"
                   f"{' [' + '; '.join(stage_note) + ']' if stage_note else ''}, {time.time() - t0:.0f} s", flush=True)
             parents = [{"tag": e["tag"], "keys": e["keys"], "scores": e["scores"], "res": e["res"]} for e in top]
-        seed = int(rng.integers(1, 1 << 30)) if args.paired else None
-        jobs = [{"tag": "base", "keys": base, "frames": final_frames, "seed": seed}]
-        jobs += [{"tag": e["tag"], "keys": e["keys"], "frames": final_frames, "seed": seed}
-                 for e in ranking[:args.finalists] if e["tag"] != "base"]
-        final = run_all(pool, jobs, "final")
+        finalists = [(e["tag"], e["keys"]) for e in ranking[:args.finalists] if e["tag"] != "base"]
+        if args.final_base or not finalists:  # (no round ran: the base is the only candidate)
+            finalists.insert(0, ("base", base))
+        jobs = []
+        for _ in range(args.final_seeds):
+            seed = int(rng.integers(1, 1 << 30)) if args.paired else None
+            jobs += [{"tag": tag, "keys": keys, "frames": final_frames, "seed": seed} for tag, keys in finalists]
+        runs = run_all(pool, jobs, "final")
+    final = []  # one entry per finalist: its score fields averaged over the final seeds
+    for tag, _ in finalists:
+        mine = [x for x in runs if x["tag"] == tag]
+        x = dict(mine[0])
+        for k in ("score", "spread", "unstuck", "slow_speed", "even"):
+            x[k] = float(sum(m[k] for m in mine) / len(mine))
+        x["scores"] = [m["score"] for m in mine]
+        x["seeds"] = [m["seed"] for m in mine]
+        final.append(x)
     final.sort(key=lambda x: -x["score"])
     for x in final:
-        print(f"final {x['tag']}: {x['score']:.4f} (spread {x['spread']:.4f}, unstuck {x['unstuck']:.3f}, "
+        each = f" = mean of {' '.join(f'{v:.4f}' for v in x['scores'])}" if len(x["scores"]) > 1 else ""
+        print(f"final {x['tag']}: {x['score']:.4f}{each} (spread {x['spread']:.4f}, unstuck {x['unstuck']:.3f}, "
               f"even {x['even']:.3f})", flush=True)
     best = final[0]
-    base_score = next(x["score"] for x in final if x["tag"] == "base")
+    base_score = next((x["score"] for x in final if x["tag"] == "base"), None)
+    vs_base = f" vs base {base_score:.4f}" if base_score is not None else ""
     sys.path.insert(0, REPO)
     from diamonds_map import save_layout
     stopped = f" (deadline {args.deadline}: stopped after {rounds_done})" if rounds_done < args.rounds else ""
@@ -526,15 +579,16 @@ def main(argv=None):
             f"{stopped} of {args.children} remove-{args.remove}/add-{args.add} variants run {args.seconds:g} s (top "
             f"{args.keep} kept per round; {features}), score {weights[0]:g} spread + {weights[1]:g} unstuck (worst "
             f"{WORST_CELLS} of {CELLS}x{CELLS} cells) + {weights[2]:g} tile evenness; last round's top "
-            f"{args.finalists} + base re-run {args.final_seconds:g} s: {best['tag']} {best['score']:.4f} vs base "
-            f"{base_score:.4f}")
+            f"{args.finalists}{' + base' if base_score is not None else ''} re-run {args.final_seconds:g} s"
+            f"{f' on {args.final_seeds} seeds' if args.final_seeds > 1 else ''}: {best['tag']} {best['score']:.4f}"
+            f"{vs_base}")
     save_layout(out, None, size, note=note, spawn=spawn, keys=best["keys"],
                 tiling=tiling if tiling["tiling"] != "diamonds" else None)
     drop = ("keys", "stuck_xy")
     with open(os.path.join(log_dir, "summary.json"), "w") as f:
         json.dump({"name": args.name, "out": out, "note": note, "features": features,
                    "final": [{k: v for k, v in x.items() if k not in drop} for x in final]}, f, indent=1)
-    print(f"saved {out} ({best['tag']}, {best['score']:.4f} vs base {base_score:.4f}) in {time.time() - t0:.0f} s",
+    print(f"saved {out} ({best['tag']}, {best['score']:.4f}{vs_base}) in {time.time() - t0:.0f} s",
           flush=True)
 
 
