@@ -38,6 +38,12 @@ One chunk test (ChunkTest, run_chunk):
 Deterministic for a given (map, chunk, seed, settings): the seed draws the shapes, their placement and velocities.
 The CLI runs every chunk of the chosen grids on N seeds (seed = 1..N), prints a per-chunk table (mean, std across
 seeds, wall time) and writes JSON. chunk_viewer.py shows the same test in real time.
+
+Other layouts (chunk-based evolution): a layout is a set of tile keys (diamonds_map.tile_key, as a map file stores
+them under "tiles") of the map's own tiling. run_chunk_keys / ChunkTest(keys=...) test a chunk of such a layout in the
+map's settings (spawn, tiling, shift); run_chunk(info, ...) == run_chunk_keys(info, info.keys, ...) bit for bit.
+ChunkPool runs batches of (keys, chunk id, seed) jobs on a persistent process pool; whole_map_score runs one
+whole-map evolve_layout scoring run of a layout (a spot check).
 """
 import argparse
 import json
@@ -87,7 +93,7 @@ class MapInfo:
 
     def __init__(self, name):
         import scene
-        from diamonds_map import layout_lighting
+        from diamonds_map import layout_lighting, layout_shift, load_layout
         self.path = map_path(name)
         self.name = os.path.splitext(os.path.basename(self.path))[0]
         with open(self.path) as f:
@@ -102,6 +108,63 @@ class MapInfo:
         self.spawn = scene.diamonds_spawn(self.path)
         self.lighting = layout_lighting(self.path)
         self.palette = self.lighting.get("palette") or getattr(world, "palette", None)
+        self.tiling = scene._layout_tiling(self.path)
+        self.shift = layout_shift(self.path)
+        self.keys = frozenset(norm_key(k) for k in load_layout(self.path)[0])  # the map's own layout
+        self._index = None  # tile key -> (tiling order, corners): built on first use (tile_index)
+        self._layouts = {}  # layout_tiles' cache: frozenset of keys -> its tiles
+
+    def tile_index(self):
+        """{tile key: (tiling order, corners (2, n))} of every tile of the map's tiling lying in the world: the
+        candidates a layout picks from, as scene.build_diamonds_scene / diamonds_map.pick_diamonds build them."""
+        if self._index is None:
+            import scene
+            from diamonds_map import lattice_diamonds, penrose_tiles, steep_tiles
+            W, H = self.size
+            t = self.tiling
+            if t["tiling"] == "penrose":
+                side = float(t["edge"])
+                tiles = steep_tiles(penrose_tiles(W, H, side, seed=int(t["pentagrid_seed"]),
+                                                  rotation=float(t["rotation"])), float(t["min_slope"]))
+            else:
+                tiles = lattice_diamonds(W, H, scene.DIAMOND_SIDE, seed=scene.DIAMONDS_SEED, y0=scene.DIAMOND_SIDE)
+            eps = 1e-6  # pick_diamonds' "inside" test and key_index (the same reductions)
+            inside = [d[0] for d in tiles if d[0][0].min() >= -eps and d[0][0].max() <= W + eps
+                      and d[0][1].min() >= -eps and d[0][1].max() <= H + eps]
+            self._index = {}
+            for k, c in enumerate(inside):
+                mx, my = np.asarray(c, dtype=float).mean(axis=1).tolist()
+                self._index[(round(mx, 1), round(my, 1))] = (k, c)
+        return self._index
+
+    def layout_tiles(self, keys):
+        """[(polygon (2, n) in map coordinates, palette pick)] of a layout's tiles, exactly as
+        scene.build_diamonds_scene builds the map with them: tiling order, the map's shift, palette picks drawn in
+        that order. KeyError if a key isn't a tile of the map's tiling (lying in the world)."""
+        keys = keys if isinstance(keys, frozenset) else frozenset(norm_key(k) for k in keys)
+        got = self._layouts.get(keys)
+        if got is not None:
+            return got
+        import scene
+        from diamonds_map import shift_diamonds
+        index = self.tile_index()
+        missing = [k for k in keys if k not in index]
+        if missing:
+            raise KeyError(f"{len(missing)} layout keys aren't tiles of {self.name}'s tiling, e.g. {missing[:3]}")
+        picked = sorted(index[k][0] for k in keys)
+        corners = {k: c for k, c in index.values()}
+        diamonds = shift_diamonds([(corners[i], None) for i in picked], self.shift, *self.size)
+        rng = np.random.default_rng(scene.DIAMONDS_SEED + 2)  # build_diamonds_scene's palette picks, in order
+        got = [(np.array(c, dtype=float), int(rng.integers(1 << 30))) for c, _ in diamonds]
+        if len(self._layouts) >= 64:
+            self._layouts.clear()
+        self._layouts[keys] = got
+        return got
+
+
+def norm_key(k):
+    """A tile key as a hashable (x, y) tuple, rounded as diamonds_map.tile_key rounds."""
+    return round(float(k[0]), 1), round(float(k[1]), 1)
 
 
 def chunk_rects(size, n=CHUNKS, grids=tuple(GRIDS)):
@@ -150,14 +213,16 @@ def _clip_area(poly, x0, y0, x1, y1):
     return float(abs(0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)))
 
 
-def chunk_tiles(info, rect):
+def chunk_tiles(info, rect, keys=None):
     """[(polygon (2, n) in map coordinates, possibly shifted by a world size across the wrap, palette pick)] of the
-    tiles overlapping the chunk rect, and the area of the rect they cover."""
+    tiles overlapping the chunk rect, and the area of the rect they cover. keys: a layout (tile keys of the map's
+    tiling) instead of the map's own tiles."""
     W, H = info.size
     x0, y0, w, h = rect
     x1, y1 = x0 + w, y0 + h
     out, covered = [], 0.0
-    for poly, pick in zip(info.tiles, info.tile_picks):
+    tiles = zip(info.tiles, info.tile_picks) if keys is None else info.layout_tiles(keys)
+    for poly, pick in tiles:
         for sx in (-W, 0.0, W):
             for sy in (-H, 0.0, H):
                 p = poly + np.array([[sx], [sy]])
@@ -241,9 +306,10 @@ def _polygon_area(points):
 
 class ChunkTest:
     """One chunk test's world, ready to step (see the module doc). Local coordinates: the world spans
-    (0, 0) .. world_size and the chunk rect sits at `rect` (offset by the margin); map = local + `offset`."""
+    (0, 0) .. world_size and the chunk rect sits at `rect` (offset by the margin); map = local + `offset`.
+    keys: test this layout (tile keys of the map's tiling) instead of the map's own tiles."""
 
-    def __init__(self, info, chunk, seed, fill=FILL, seconds=SECONDS, vel=VEL, margin=MARGIN):
+    def __init__(self, info, chunk, seed, fill=FILL, seconds=SECONDS, vel=VEL, margin=MARGIN, keys=None):
         from entities import EnvConfig, FixedBody, SoftBody, polygon_points
         import pumpkins
         from solver import World
@@ -255,7 +321,7 @@ class ChunkTest:
         self.world_size = (w + 2 * mx, h + 2 * my)
         self.rect = (mx, my, w, h)  # local
         self.offset = np.array([x0 - mx, y0 - my])
-        tiles, covered = chunk_tiles(info, chunk["rect"])
+        tiles, covered = chunk_tiles(info, chunk["rect"], keys)
         self.free_area = w * h - covered
         world = World()
         world.show_grid = False
@@ -419,7 +485,8 @@ class ChunkTest:
 
 
 def run_chunk(info, chunk, seed, **kw):
-    """Build and run one chunk test to the end; its result dict plus "wall" (s, build + run) and "build_wall"."""
+    """Build and run one chunk test to the end; its result dict plus "wall" (s, build + run) and "build_wall".
+    kw: ChunkTest's settings (fill, seconds, vel, margin, keys)."""
     t0 = time.perf_counter()
     test = ChunkTest(info, chunk, seed, **kw)
     t1 = time.perf_counter()
@@ -431,19 +498,124 @@ def run_chunk(info, chunk, seed, **kw):
     return res
 
 
+def run_chunk_keys(info, keys, chunk_id, seed, **kw):
+    """run_chunk on a layout: chunk `chunk_id` (an id like "grid r1c2", or a chunk_rects entry) of the world built
+    from `keys` (tile keys of the map's tiling) instead of the map's own tiles. The same result dict."""
+    chunk = find_chunk(info.size, chunk_id) if isinstance(chunk_id, str) else chunk_id
+    return run_chunk(info, chunk, seed, keys=keys, **kw)
+
+
 _WORKER = {}
 
 
-def _init_worker(name):
+def _watch_parent():
+    """A pool worker's watchdog thread: exit when the parent process is gone (the worker got re-parented), so a
+    killed run leaves no orphan workers."""
+    import threading
+    parent = os.getppid()
+
+    def watch():
+        while True:
+            time.sleep(1.0)
+            if os.getppid() != parent:
+                os._exit(0)
+    threading.Thread(target=watch, daemon=True).start()
+
+
+def _init_worker(name, kw=None):
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    _watch_parent()
     from entities import EnvConfig
     EnvConfig.backend = "cpu"
     _WORKER["info"] = MapInfo(name)
+    _WORKER["kw"] = dict(kw or {})
 
 
 def _job(args):
     chunk, seed, kw = args
     return run_chunk(_WORKER["info"], chunk, seed, **kw)
+
+
+def _pool_job(job):
+    keys, chunk_id, seed = job[:3]
+    kw = dict(_WORKER["kw"], **(job[3] if len(job) > 3 else {}))
+    return run_chunk_keys(_WORKER["info"], keys, chunk_id, seed, **kw)
+
+
+def _pool_whole(job):
+    keys, seconds, seed = job
+    return whole_map_score(_WORKER["info"].path, keys, seconds, seed)
+
+
+class ChunkPool:
+    """A persistent pool of `workers` processes (spawn start method; each loads the map and compiles numba once) for
+    scoring many chunk tests of many layouts. Use it from a script file (spawn re-imports __main__), as a context
+    manager:
+
+        with ChunkPool("evolved 1 halloween", 6) as pool:
+            results = pool.score([(keys, "grid r1c2", seed), ...])
+
+    score(jobs): jobs = [(keys, chunk_id, seed)] (an optional 4th item: a dict of ChunkTest settings for that job
+    over the pool's own `kw`: fill, seconds, vel) -> their run_chunk_keys results, in job order. Each job's keys go
+    with it (pickled, ~20 KB: nothing next to a test); each worker caches its last 64 layouts' tiles.
+    whole(jobs): jobs = [(keys, seconds, seed)] -> whole_map_score results, in order, on the same workers.
+    Leaving the block (or close()) shuts the workers down and waits for them; an exception terminates them. Workers
+    also exit by themselves within a second if the parent process dies."""
+
+    def __init__(self, map_name, workers, **kw):
+        import multiprocessing as mp
+        self.map_path = map_path(map_name)
+        self.workers = int(workers)
+        self._pool = mp.get_context("spawn").Pool(self.workers, initializer=_init_worker,
+                                                  initargs=(self.map_path, kw))
+
+    def score(self, jobs):
+        jobs = [(frozenset(norm_key(k) for k in j[0]),) + tuple(j[1:]) for j in jobs]
+        return self._pool.map(_pool_job, jobs, chunksize=1)
+
+    def whole(self, jobs):
+        jobs = [(sorted(norm_key(k) for k in keys), seconds, seed) for keys, seconds, seed in jobs]
+        return self._pool.map(_pool_whole, jobs, chunksize=1)
+
+    def pids(self):
+        """The worker processes' pids (for tests)."""
+        return [p.pid for p in self._pool._pool]
+
+    def close(self, terminate=False):
+        if self._pool is None:
+            return
+        if terminate:
+            self._pool.terminate()
+        else:
+            self._pool.close()
+        self._pool.join()
+        self._pool = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close(terminate=exc_type is not None)
+
+
+def whole_map_score(map_name, keys, seconds, seed, weights=(0.7, 0.2, 0.1)):
+    """One whole-map run of the layout `keys` (tile keys of the map's tiling) scored exactly as evolve_layout scores
+    its runs (evolve_layout.run: `seconds` of sim time in the map's spawn settings and tiling, shape spawn seed
+    `seed`, score = w1 spread + w2 unstuck + w3 tile evenness over the last 10 s): run's result dict (score, spread,
+    unstuck, slow_speed, even, diamonds, keys, cells, stuck_xy, secs, ...). In this process; ChunkPool.whole runs
+    several in parallel."""
+    import scene
+    import evolve_layout
+    path = map_path(map_name)
+    with open(path) as f:
+        size = tuple(float(v) for v in json.load(f).get("size", (1800.0, 1169.0)))
+    cwd = os.getcwd()
+    try:
+        evolve_layout.init(size, scene.diamonds_spawn(path), tuple(weights), scene._layout_tiling(path))
+        return evolve_layout.run({"tag": "whole", "keys": sorted(norm_key(k) for k in keys),
+                                  "frames": int(round(seconds * 60)), "seed": seed})
+    finally:
+        os.chdir(cwd)  # (init moves to the repo)
 
 
 def main(argv=None):

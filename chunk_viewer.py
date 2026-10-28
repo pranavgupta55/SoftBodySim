@@ -2,6 +2,10 @@
 same step loop), drawn with pygame in the map's palette.
 
     python3 chunk_viewer.py ["evolved 1 halloween"] [--chunk "grid r0c1"] [--seed 1] [--fill 0.6] [--seconds 10]
+                            [--layout FILE.json]
+
+--layout: show another layout's tiles (a map file's "tiles" keys, e.g. an evolved map, or a path) in the map's
+settings (spawn, tiling, palette); its keys must be tiles of the map's tiling.
 
 Keys:
     Left / Right    previous / next chunk (row by row)       Up / Down   chunk one row up / down
@@ -64,7 +68,8 @@ def draw(screen, font, test, info, zoom, state):
                                                  round(h * zoom)), 2)
     sc = test.score()
     slow = sum(v < ct.SLOW_SPEED for v in test.speeds().values())
-    line1 = (f"{info.name}  |  chunk {test.chunk['id']}  |  seed {test.seed}  |  t {test.time:5.2f} / "
+    name = info.name + (f" + layout {state['layout_name']}" if state.get("layout_name") else "")
+    line1 = (f"{name}  |  chunk {test.chunk['id']}  |  seed {test.seed}  |  t {test.time:5.2f} / "
              f"{test.seconds:g} s  |  speed {state['speed']}x{'  |  PAUSED' if state['paused'] else ''}"
              f"{'  |  DONE' if test.done else ''}")
     line2 = (f"shapes {len(test.shapes)} (fill {test.fill_achieved:.2f})  cleared {len(test.cleared)}  in chunk "
@@ -84,18 +89,28 @@ def main(argv=None):
     p.add_argument("--vel", type=float, default=ct.VEL)
     p.add_argument("--frames", type=int, default=None, help="run this many frames as fast as possible, then quit")
     p.add_argument("--screenshot", default=None, help="with --frames: save the last frame here")
+    p.add_argument("--layout", default=None,
+                   help="a layout file (or map name) whose tiles to show instead of the map's own (same tiling)")
     args = p.parse_args(argv)
     if args.frames is not None:
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
     info = ct.MapInfo(args.map)
+    keys, layout_name = None, None
+    if args.layout:
+        from diamonds_map import load_layout
+        path = ct.map_path(args.layout)
+        keys = frozenset(ct.norm_key(k) for k in load_layout(path)[0])
+        layout_name = os.path.splitext(os.path.basename(path))[0]
+        info.layout_tiles(keys)  # fails early on keys that aren't tiles of the map's tiling
     chunks = ct.chunk_rects(info.size)
     grids = list(ct.GRIDS)
     idx = next(i for i, c in enumerate(chunks) if c["id"] == args.chunk)
-    state = {"seed": args.seed, "speed": 1, "paused": False, "tint": True}
+    state = {"seed": args.seed, "speed": 1, "paused": False, "tint": True, "layout_name": layout_name}
 
     def build():
-        test = ct.ChunkTest(info, chunks[idx], state["seed"], fill=args.fill, seconds=args.seconds, vel=args.vel)
+        test = ct.ChunkTest(info, chunks[idx], state["seed"], fill=args.fill, seconds=args.seconds, vel=args.vel,
+                            keys=keys)
         colour(test, info)
         return test
 
