@@ -1203,7 +1203,11 @@ class GLWorld:
     def _stamps(self, stamps, radii):
         """(k, 11) [cx, cy, offx, offy, atlas x, atlas y, w, h, colour, layer, material] for the circles pygame
         would draw."""
-        keys, inv = np.unique(np.column_stack([radii, stamps[:, 4]]), axis=0, return_inverse=True)
+        # unique (radius, width) pairs: one complex key per stamp (a 1-D unique sorts it like the rows, by radius then
+        # width, and is far cheaper than np.unique(axis=0) over thousands of points-view dots)
+        ckeys, inv = np.unique(np.asarray(radii, np.float64) + 1j * stamps[:, 4].astype(np.float64),
+                               return_inverse=True)
+        keys = np.column_stack([ckeys.real, ckeys.imag])
         table = np.zeros((len(keys), 6), np.int64)
         ok = np.zeros(len(keys), bool)
         for k, (rad, width) in enumerate(keys):
