@@ -1,7 +1,7 @@
 """Watch one chunk stuckness test (chunk_test.py) in real time: the very same test world (ChunkTest, same seed,
 same step loop), drawn with pygame in the map's palette.
 
-    python3 chunk_viewer.py ["evolved 1 halloween"] [--chunk "grid r0c1"] [--seed 1] [--fill 0.6] [--seconds 5]
+    python3 chunk_viewer.py ["evolved 1 halloween"] [--chunk "grid r0c1"] [--seed 1] [--fill 0.6] [--seconds 10]
 
 Keys:
     Left / Right    previous / next chunk (row by row)       Up / Down   chunk one row up / down

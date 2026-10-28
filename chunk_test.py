@@ -1,6 +1,6 @@
 """Per-chunk stuckness test of a penrose / diamonds map: how well does one region of the map drain a crowd of shapes?
 
-    python3 chunk_test.py "evolved 1 halloween" [--seeds 3] [--grids grid] [--fill 0.6] [--seconds 5]
+    python3 chunk_test.py "evolved 1 halloween" [--seeds 3] [--grids grid] [--fill 0.6] [--seconds 10]
                           [--workers 1] [--out results.json]
 
 The map (maps/penrose/NAME.json, or a path) is split into a CHUNKS x CHUNKS (4 x 4) grid of chunk rects; three more
@@ -24,7 +24,7 @@ One chunk test (ChunkTest, run_chunk):
     saturates: on evolved 1 halloween 0.5 is always met, 0.6 gives ~0.56-0.58 and 0.7 only ~0.59-0.60, so the
     achieved fill is reported ("fill_achieved"). Each shape gets a random velocity of uniform direction and speed
     0..`vel` (default 30 px/s).
-  * Run `seconds` (default 5) of sim time. Once per frame, a shape whose bounding box lies wholly outside the chunk
+  * Run `seconds` (default 10) of sim time. Once per frame, a shape whose bounding box lies wholly outside the chunk
     rect (below it, or off a side) has cleared the chunk: its clear time is recorded and it is removed, so nothing
     piles up and it can't come back.
   * Score:
@@ -55,7 +55,7 @@ import numpy as np  # noqa: E402
 CHUNKS = 4  # chunks per side of the grid
 MARGIN = 0.10  # empty space around the chunk rect, as a share of its size, on every side
 FILL = 0.6  # share of the chunk's free area covered by the shapes' placement circles
-SECONDS = 5.0  # sim time per test
+SECONDS = 10.0  # sim time per test
 VEL = 30.0  # px/s: each shape's initial speed is uniform in 0..VEL, direction uniform
 SLOW_SPEED = 10.0  # px/s: a remaining shape slower than this over the last second is "slow" (resting, not draining)
 GAP = 1.0  # world units kept between placement circles, and between a circle and a tile
