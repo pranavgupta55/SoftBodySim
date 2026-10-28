@@ -78,7 +78,7 @@
 "lighting": {
 "enabled": true,
 "gi": true,
-"gi_gain": 2.2,
+"gi_gain": 5.0,
 "background": {
 "lightness": 0.4,
 "saturation": 0.3
@@ -99,11 +99,11 @@
 "emissive_strength": 1.0
 },
 "diamond": {
-"transparency": 0.97,
+"transparency": 0.5,
 "absorption": 0.0,
 "reflectivity": 0.04,
 "emissive": "hue",
-"emissive_strength": 0.03
+"emissive_strength": 0.02
 }
 },
 "palette": "halloween"
