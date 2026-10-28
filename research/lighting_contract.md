@@ -54,7 +54,10 @@ id there to find its transmittance from, so on frames where the fill draws any, 
 RGBA8, view-sized, rgb = the silhouette's transmittance (material.glsl mat_tr_px; an outline takes its body's
 colour), a = 1 on a silhouette, 0 elsewhere; absent on every other frame (filled views included). gl_sdf's
 translucent split (sdf_tr.frag) and the GI scene (rc_scene.frag) take a flagged px's transmittance from it, so
-glass shadows and GI through glass match the filled view. A see-through body's twin keeps its transparency
+glass shadows and GI through glass match the filled view. With it comes `gbuf["tr_emit"]` (RGBA16F, view-sized,
+same frames): rgb = the silhouette px's GI emission (material.glsl mat_tr_emit_px: emissive x emissive_strength x
+the body's tinted colour, 0 for an unlit material), which the GI scene uses as the px's glow (or a stick / dot's
+own there, if brighter), so emissive glass lights the room as in the filled view. A see-through body's twin keeps its transparency
 (other twins get 0): the GI scene lets an emissive stick / dot of it that reaches past the silhouette (no occluder
 bit) through like the body.
 

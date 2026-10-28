@@ -17,6 +17,7 @@ layout(location = 0) out vec4 f_color;
 layout(location = 1) out vec4 f_normal;
 layout(location = 2) out uint f_mat;
 layout(location = 3) out vec4 f_tr;  // u_flags_only: gbuf["tr"] (world_fill.frag)
+layout(location = 4) out vec4 f_tr_emit;  // u_flags_only: gbuf["tr_emit"] (bound with gbuf["tr"])
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -40,6 +41,7 @@ void main() {
         f_normal = vec4(0.0, 0.0, 0.0, float(mat_flags(m) | FLAG_LIT) / 255.0);
         f_mat = 0u;
         f_tr = mat_tr_px(m, (v_mat & STAMP_BORDER) != 0 ? vec3(1.0) : mat_tinted(m, v_col));
+        f_tr_emit = mat_tr_emit_px(m, mat_tinted(m, v_col));  // (a black border part: none)
         return;
     }
     int flags = mat_flags(m);
