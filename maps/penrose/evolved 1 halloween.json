@@ -99,7 +99,7 @@
 "emissive_strength": 1.0
 },
 "diamond": {
-"transparency": 0.5,
+"transparency": 0.75,
 "absorption": 0.0,
 "reflectivity": 0.04,
 "emissive": "hue",
