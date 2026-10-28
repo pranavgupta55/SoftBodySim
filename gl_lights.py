@@ -234,7 +234,7 @@ class LightsEffect:
             reach, fade_start = shadow_reach(self.size, frame)
             values = {"u_res": tuple(float(s) for s in self.size), "u_period": _period(frame),
                       "u_shadow_reach": reach, "u_shadow_fade_start": fade_start, "u_relief": float(DIFFUSE_RELIEF),
-                      "u_tr_scale": tr_scale(gw, frame)}
+                      "u_tr_scale": tr_scale(gw, frame), "u_sdf_origin": tuple(sh.get("sdf_origin", (0.0, 0.0)))}
             for name, v in values.items():
                 if name in prog:
                     prog[name].value = v

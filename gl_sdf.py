@@ -2,7 +2,8 @@
 
 make(ctx, size) -> [SdfEffect (order 100), GiEffect (order 150)], gl_effects' plugin API.
 
-SdfEffect publishes frame.shared["sdf"]: R32F, the render size, LINEAR filtered, the signed distance in render px
+SdfEffect publishes frame.shared["sdf"]: R32F, the render size (plus the lit-render margin, below), LINEAR filtered,
+the signed distance in render px
 from each pixel centre to the nearest boundary of a shadow-casting occluder (G-buffer `normal` flags bit0 and bit1
 both set), negative inside, minimum-image across frame.period. Built by jump flooding in fragment ping-pong passes
 (GL 4.1, no compute): a seed pass (pixels on either side of a boundary store their own coordinates, RG16I),
@@ -21,6 +22,14 @@ or gl_lights.CAUSTIC_SHARE < 1), SdfEffect also publishes, all at the render siz
     (material.glsl mat_transmittance: transparency x Beer-Lambert toward its colour);
 from a split pass (sdf_tr.frag) and one more jump flood over both masks (jfa2_*.frag). gl_lights then shadows with sdf_opaque x sdf_shadow_tr.
 Frames without them cost nothing extra and render exactly as before.
+
+Lit-render margin (gl_world.LIT_MARGIN): when the frame has FrameInfo.occ (a G-buffer padded around the view, with
+the bodies just off screen drawn in it), every field above is built over it instead of the view-sized G-buffer, and
+shared["sdf_origin"] = FrameInfo.origin: render px p is texel p + origin of the fields (0, 0 without a margin).
+sdf_shadow.glsl's sdf_at / sdf_tint_at add it (uniform u_sdf_origin, which every program sampling the fields sets
+from shared["sdf_origin"]). So walls just past the view's edge shade it. GI stays view-sized: a ray between two
+points of the (convex) view never leaves it, so off-screen occluders could only block off-screen emitters, which
+the GI doesn't have.
 
 GiEffect (radiance cascades, an experiment) publishes frame.shared["gi"]: RGBA16F at the render size, the light
 emissive bodies throw on everything around them (occluded by shadow casters), to add to the diffuse light. It
@@ -163,8 +172,9 @@ class SplitFlood:
                 "step": frame.load(FULLSCREEN_VERT, "jfa2_step.frag", inc),
                 "dist": frame.load(FULLSCREEN_VERT, "jfa2_dist.frag", inc)}
 
-    def build(self, frame, progs, period):
-        g = frame.gbuf
+    def build(self, frame, progs, period, g=None):
+        """g: the G-buffer textures to split (frame.gbuf, or the margin's padded frame.occ)."""
+        g = frame.gbuf if g is None else g
         sp = progs["split"]
         for unit, (name, tex) in enumerate((("u_normal", g["normal"]), ("u_albedo", g["albedo"]),
                                             ("u_mat", g["mat"]), ("u_mats", frame.material_tex))):
@@ -260,6 +270,20 @@ class SdfEffect:
         self.translucent = _Translucent()
         self.split = None  # SplitFlood, made on the first frame that needs it
         self.split_progs = None
+        # by size (the margin's padding varies as off-screen casters move): the last few, so a body moving in and
+        # out of the margin doesn't reallocate every frame
+        self.jfas, self.splits = {}, {}
+
+    CACHE = 4
+
+    def _cached(self, cache, size, make):
+        obj = cache.pop(size, None)
+        if obj is None:
+            obj = make()
+            while len(cache) >= self.CACHE:
+                cache.pop(next(iter(cache))).release()
+        cache[size] = obj  # (most recent last)
+        return obj
 
     def _wants_tr(self, gw, frame):
         world = getattr(frame, "world", None)
@@ -272,33 +296,32 @@ class SdfEffect:
 
 
     def run(self, gw, frame):
-        size = tuple(frame.size)
+        # the lit-render margin (gl_world.LIT_MARGIN): the fields cover the padded G-buffer, render px p at texel
+        # p + origin (published as shared["sdf_origin"] for sdf_shadow.glsl's u_sdf_origin)
+        src = getattr(frame, "occ", None) or frame.gbuf
+        origin = tuple(float(o) for o in getattr(frame, "origin", (0, 0))) if src is not frame.gbuf else (0.0, 0.0)
+        size = tuple(src["normal"].size)
         if self.progs is None:
             self.progs = _jfa_progs(frame)
-        if self.jfa is None or self.jfa.size != size:
-            if self.jfa is not None:
-                self.jfa.release()
-            self.jfa = JumpFlood(self.ctx, size, linear=True)
+        self.jfa = self._cached(self.jfas, size, lambda: JumpFlood(self.ctx, size, linear=True))
         self.ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
         period = _period(frame.period)
-        frame.shared["sdf"] = self.jfa.build(frame, self.progs, frame.gbuf["normal"], 0, period)
+        frame.shared["sdf"] = self.jfa.build(frame, self.progs, src["normal"], 0, period)
+        frame.shared["sdf_origin"] = origin
         if not self._wants_tr(gw, frame):
             return
         if self.split_progs is None:
             self.split_progs = SplitFlood.progs(frame)
-        if self.split is None or self.split.size != size:
-            if self.split is not None:
-                self.split.release()
-            self.split = SplitFlood(self.ctx, size)
+        self.split = self._cached(self.splits, size, lambda: SplitFlood(self.ctx, size))
         sh = frame.shared
-        sh["sdf_opaque"], sh["sdf_tr"], sh["sdf_tint"] = self.split.build(frame, self.split_progs, period)
+        sh["sdf_opaque"], sh["sdf_tr"], sh["sdf_tint"] = self.split.build(frame, self.split_progs, period, src)
 
     def release(self):
-        for o in (self.jfa, self.split):
-            if o is not None:
-                o.release()
+        for o in [*self.jfas.values(), *self.splits.values()]:
+            o.release()
         for p in [*(self.progs or {}).values(), *(self.split_progs or {}).values()]:
             p.release()
+        self.jfas, self.splits = {}, {}
         self.jfa = self.progs = self.split = self.split_progs = None
 
 

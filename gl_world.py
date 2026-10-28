@@ -33,6 +33,12 @@ Lit passes (_bodies):
 - points view: dots and sticks use each material's points-view twin (kind OPAQUE, no shadow, bevel 0: no optics, no
   stripes) and are no occluders; the filled view's shapes are then drawn invisibly (only normal.a written), so the
   silhouettes cast the same shadows as in the filled view (GLASS / FLUID silhouettes excepted: no shadow there).
+- margin (up to LIT_MARGIN px per side, non-periodic axes): the shadow-casting primitives reaching past the view
+  are drawn again, shifted, into a padded G-buffer (`occ`, each side only as wide as they reach), and the view's
+  G-buffer is copied into its middle (_margin). gl_sdf builds the shadow fields over that, so bodies just off screen
+  still cast shadows (and block caustics / refraction marches) into the view; everything else reads the view-sized
+  G-buffer as before. No caster reaching past the view (the world box walls cast none by default), or periodic on
+  both axes: no margin, nothing extra drawn or built.
 Surface patterns are pinned to each body's persistent pattern_seed (and soft bodies' pattern_rest), saved by scene_io.
 
 Anything not handled here falls back to pygame: World.draw / draw_grid / Trails.draw keep working on any surface
@@ -67,6 +73,11 @@ GRID_DEFAULTS = {k: tuple(v.default) for k, v in inspect.signature(World.draw_gr
 STAMP_BORDER = 1 << 24  # added to a stamp's material: a black border part (world_stamp.frag: FLAG_BORDER, unlit)
 SEE_THROUGH = (materials.GLASS, materials.FLUID)  # kinds drawn in the lit pass B, over gbuf["behind"]
 BEHIND_KEYS = ("behind", "behind_nrm", "behind_mat")  # GLWorld.gbuf keys of the pass A copy
+# px of lit-render margin around the view (lighting on): bodies within it are drawn into a padded copy of the G-buffer
+# (GLWorld.occ) that the SDF fields are built from, so a wall just off screen still shades the view's edge. 0 = off.
+# Periodic axes get none (their wrap already brings the neighbours in).
+LIT_MARGIN = 128
+MARGIN_STEP = 32  # px: each side's padding is rounded up to a multiple of this (fewer reallocations as bodies move)
 
 
 def _load(ctx, vert, frag, includes=("world_common.glsl",)):
@@ -556,7 +567,12 @@ class GLWorld:
         self.n_materials, self.body_mat, self.eye_mat = 1, np.zeros(0, np.int64), 0
         self.body_mat_points = np.zeros(0, np.int64)  # body_mat's points-view twins (_materials)
         self.mat_kinds = np.array([-1, materials.OPAQUE], np.int64)  # Material.kind per id
+        self.mat_casts = np.array([False, materials.resolve().casts_shadow], bool)  # Material.casts_shadow per id
         self.behind, self.behind_fbo = None, None  # pass A's copy (gbuf["behind"...]), made on the first glass frame
+        # the lit-render margin (_margin): padded albedo / normal / mat + their own depth, made on first use
+        self.occ, self.occ_fbo, self.occ_depth = None, None, None
+        self._ring = None  # (pack, lines, stamp instances, seethrough) of the last lit body pass
+        self._ring_streams = None  # the margin's fill / line / stamp streams and fill vertex texture
         self._mat_sig, self._mat_bytes = None, None
         self._rest = weakref.WeakKeyDictionary()  # body -> (pattern_seed, rest coordinates)
         self._rest_topo, self._rest_all = None, np.zeros((0, 2), np.float32)
@@ -584,6 +600,7 @@ class GLWorld:
         if self.behind_fbo is not None:
             self.behind_fbo.release()
         self.behind, self.behind_fbo = None, None
+        self._release_occ()
         for key in ("albedo", "normal", "mat"):
             t = (self.gbuf or {}).get(key)
             if t is not None:
@@ -675,7 +692,8 @@ class GLWorld:
         self.base_vao.render(moderngl.TRIANGLE_STRIP, vertices=4)
         overlays = self._bodies(world, filled, zoom, outlines, lit)
         if lit:
-            self._effects(world, clip, zoom, filled)
+            occ, origin = self._margin(world, clip, zoom, filled)
+            self._effects(world, clip, zoom, filled, occ, origin)
             self._overlays(overlays)
         self._restore(prev)
 
@@ -725,6 +743,7 @@ class GLWorld:
         self.body_mat_points = np.array([twin[i] for i in body_mat.tolist()], np.int64)
         self.eye_mat = id_of(EYE_MATERIAL)  # the pumpkin eyes' material (_eye_stamps)
         self.mat_kinds = np.array([-1] + [m.kind for m in table[1:]], np.int64)
+        self.mat_casts = np.array([False] + [bool(m.casts_shadow) for m in table[1:]], bool)
         self.body_mat, self.n_materials = body_mat, len(table)
         packed = np.zeros((len(table), materials.TEXELS, 4), np.float32)
         packed[0] = materials.pack(materials.resolve())  # row 0: the background (lit, default material)
@@ -759,8 +778,8 @@ class GLWorld:
         self._rest_topo = topo
         return self._rest_all
 
-    def _effects(self, world, clip, zoom, filled=True):
-        """The lit effects in order (gl_effects); none: the albedo as is."""
+    def _effects(self, world, clip, zoom, filled=True, occ=None, origin=(0, 0)):
+        """The lit effects in order (gl_effects); none: the albedo as is. occ / origin: the margin (_margin)."""
         ctx = self.ctx
         if self.effects is None:
             self.effects = make_effects(ctx, self.size)
@@ -774,7 +793,8 @@ class GLWorld:
         if period is not None:
             period = (float(period[0]) * zoom, float(period[1]) * zoom)
         self.frame = FrameInfo(self.size, clip, float(zoom), period, world, self.gbuf, self.material_tex,
-                               self.n_materials, {}, gw=self, ctx=ctx, fbo=self.fbo, filled=bool(filled))
+                               self.n_materials, {}, gw=self, ctx=ctx, fbo=self.fbo, filled=bool(filled),
+                               occ=occ, origin=tuple(origin))
         for e in self.effects:
             e.run(self, self.frame)
         ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
@@ -821,6 +841,7 @@ class GLWorld:
         inst = self._stamps(stamps, data["radii"]) if len(stamps) else np.zeros((0, 11), np.int64)
         n_stamps = self.stamps.write(inst) if len(inst) else 0
         two = lit and self._see_through(fills, lines, inst)
+        self._ring = (data, lines, inst, 0) if lit and filled else None  # (the points view: _occluder_fill)
         self._set_pass(lit, filled, seethrough=1 if two else 0)
         self._draw_bodies(n_fills, n_lines, n_stamps, blend=not lit)
         if two:
@@ -866,27 +887,29 @@ class GLWorld:
             self._uv_key = (rest, vp.copy())
         return self.fills.write(fills)
 
-    def _draw_bodies(self, n_fills, n_lines, n_stamps, blend=False):
+    def _draw_bodies(self, n_fills, n_lines, n_stamps, blend=False, ring=None):
         """The three instanced draws (fills, lines, circles) from the streams as last written, into the bound
-        framebuffer, depth-tested by layer. blend: the unlit pass's translucent grab lines."""
+        framebuffer, depth-tested by layer. blend: the unlit pass's translucent grab lines. ring: the margin's own
+        streams and vertex texture (_margin) instead of the main ones."""
         ctx = self.ctx
+        fills, lines, stamps, verts_tex = ring or (self.fills, self.lines, self.stamps, self.verts_tex)
         self.material_tex.use(2)
         ctx.enable(moderngl.DEPTH_TEST)
         ctx.depth_func = "<="
         if n_fills:
-            self.verts_tex.use(0)
+            verts_tex.use(0)
             self.uvs_tex.use(1)
-            self.fills.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n_fills)
+            fills.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n_fills)
         if n_lines:
             if blend:
                 ctx.enable(moderngl.BLEND)  # translucent grab lines; opaque ones (alpha 1) draw as before
                 ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ZERO, moderngl.ONE
-            self.lines.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n_lines)
+            lines.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n_lines)
             ctx.disable(moderngl.BLEND)
         if n_stamps:
             self.atlas.upload()
             self.atlas.tex.use(0)
-            self.stamps.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n_stamps)
+            stamps.vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n_stamps)
         ctx.disable(moderngl.DEPTH_TEST)
 
     def _set_pass(self, lit, filled, seethrough=0, flags_only=False):
@@ -949,6 +972,7 @@ class GLWorld:
         n_lines = self.lines.write(lines) if len(lines) else 0
         inst = self._stamps(data["stamps"], data["radii"]) if len(data["stamps"]) else np.zeros((0, 11), np.int64)
         n_stamps = self.stamps.write(inst) if len(inst) else 0
+        self._ring = (data, lines, inst, 1)  # the margin draws these silhouettes too (GLASS / FLUID left out)
         if not (n_fills or n_lines or n_stamps):
             return
         fbo = self.gbuf_fbo
@@ -962,6 +986,145 @@ class GLWorld:
         fbo.depth_mask = True
         fbo.use()
         self._set_pass(True, False)
+
+    @staticmethod
+    def margin_limits(world):
+        """(x, y): the most lit-render margin per side of each axis, px: LIT_MARGIN, 0 on a periodic axis."""
+        m = max(int(LIT_MARGIN), 0)
+        period = getattr(world, "period", None)
+        if period is None:
+            return m, m
+        return tuple(0 if float(p or 0.0) > 0.0 else m for p in period)
+
+    def _release_occ(self):
+        for o in (self.occ_fbo, *(self.occ or {}).values(), self.occ_depth):
+            if o is not None:
+                o.release()
+        self.occ, self.occ_fbo, self.occ_depth = None, None, None
+
+    def _ring_select(self, ids, lo, hi, view, pad, seethrough):
+        """Which primitives (material ids, inclusive px boxes [lo, hi]) the margin draws: shadow casters (GLASS /
+        FLUID left out when seethrough == 1, as the pass leaves them out) inside the padded area [-pad, view + pad)
+        that aren't wholly inside the view."""
+        ids = np.asarray(ids, np.int64) & (STAMP_BORDER - 1)
+        ok = (ids > 0) & (ids < len(self.mat_casts))
+        safe = np.where(ok, ids, 0)
+        ok &= self.mat_casts[safe]
+        if seethrough == 1:
+            ok &= ~np.isin(self.mat_kinds[safe], SEE_THROUGH)
+        inside_pad = np.all((hi >= -pad) & (lo < view + pad), axis=1)
+        in_view = np.all((lo >= 0) & (hi < view), axis=1)
+        return ok & inside_pad & ~in_view
+
+    def _margin(self, world, clip, zoom, filled=True):
+        """The lit-render margin: the shadow-casting primitives of the last lit body pass (self._ring) that reach
+        past the view, shifted and drawn into the padded G-buffer `occ` (its own depth buffer), then the view's
+        G-buffer copied into its middle (world_pad.frag). Each side is padded only as far as those primitives reach
+        (rounded up to MARGIN_STEP px, at most LIT_MARGIN; none on a periodic axis), so the fields grow only where
+        something casts from off screen. Returns (occ dict, origin = (left, top) padding) for FrameInfo, or
+        (None, (0, 0)) when there is no margin (nothing casting from off screen: the fields are then built from
+        gbuf, exactly as without a margin)."""
+        ring, self._ring = self._ring, None
+        mx, my = self.margin_limits(world)
+        if ring is None or not (mx or my):
+            return None, (0, 0)
+        data, lines, inst, seethrough = ring
+        fills, verts = data["fills"], data["verts"]
+        cx, cy = clip
+        view, pad = np.array([cx, cy]), np.array([mx, my])
+        boxes = []  # (lo, hi) of the kept primitives of each kind
+        keep_f = np.zeros(len(fills), bool)
+        if len(fills):
+            keep_f = self._ring_select(fills[:, 8], fills[:, 4:6], fills[:, 6:8], view, pad, seethrough)
+            boxes.append((fills[keep_f, 4:6], fills[keep_f, 6:8]))
+        keep_l = np.zeros(len(lines), bool)
+        if len(lines):
+            w = (lines[:, 4] // 2 + 1)[:, None]
+            ends = lines[:, :4].reshape(-1, 2, 2)
+            lo, hi = ends.min(axis=1) - w, ends.max(axis=1) + w
+            keep_l = self._ring_select(lines[:, 8], lo, hi, view, pad, seethrough)
+            boxes.append((lo[keep_l], hi[keep_l]))
+        keep_s = np.zeros(len(inst), bool)
+        if len(inst):
+            lo = inst[:, 0:2] + inst[:, 2:4]
+            hi = lo + inst[:, 6:8] - 1
+            keep_s = self._ring_select(inst[:, 10], lo, hi, view, pad, seethrough)
+            boxes.append((lo[keep_s], hi[keep_s]))
+        if not (keep_f.any() or keep_l.any() or keep_s.any()):
+            return None, (0, 0)
+        lo = np.min(np.concatenate([b[0] for b in boxes]), axis=0)
+        hi = np.max(np.concatenate([b[1] for b in boxes]), axis=0)
+        step = max(int(MARGIN_STEP), 1)
+        def ext(reach, m):  # padding for a side the kept primitives reach `reach` px past
+            return int(min(m, -(-max(int(reach), 0) // step) * step))
+        left, top = ext(-lo[0], mx), ext(-lo[1], my)
+        right, bottom = ext(hi[0] - cx + 1, mx), ext(hi[1] - cy + 1, my)
+        size = (cx + left + right, cy + top + bottom)
+        ctx = self.ctx
+        if self.occ is None or self.occ["normal"].size != size:
+            self._release_occ()
+            self.occ = {"albedo": ctx.texture(size, 4), "normal": ctx.texture(size, 4),
+                        "mat": ctx.texture(size, 1, dtype="u2")}
+            for t in self.occ.values():
+                t.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self.occ_depth = ctx.depth_renderbuffer(size)
+            self.occ_fbo = ctx.framebuffer([self.occ[k] for k in ("albedo", "normal", "mat")], self.occ_depth)
+            if "pad" not in self.progs:
+                prog = self.progs["pad"] = _load(ctx, None, "world_pad.frag", ())
+                prog["u_albedo"].value, prog["u_normal"].value, prog["u_mat"].value = 0, 1, 2
+        # its own streams and vertex texture: rewriting the main ones the body pass just drew from would stall
+        # until the GPU is done with them (the fills' rest-frame coordinates are the main uvs_tex, same vertices)
+        if self._ring_streams is None:
+            p = self.progs
+            self._ring_streams = [_Stream(ctx, p["fill"], "4i 4i 2i/i", ("in_info", "in_box", "in_mat")),
+                                  _Stream(ctx, p["line"], "4i 4i 2i/i", ("in_ends", "in_style", "in_mat")),
+                                  _Stream(ctx, p["stamp"], "4i 4i 3i/i", ("in_pos", "in_mask", "in_style")), None]
+        rs = self._ring_streams
+        shift = np.array([left, top, left, top])
+        n_fills = n_lines = n_stamps = 0
+        if keep_f.any():
+            f = fills[keep_f].copy()
+            f[:, 4:8] += shift
+            rows = -(-len(verts) // VERT_ROW)
+            if rs[3] is None or rs[3].size[1] < rows:
+                if rs[3] is not None:
+                    rs[3].release()
+                rs[3] = ctx.texture((VERT_ROW, max(rows, 2 * rs[3].size[1] if rs[3] is not None else rows)), 2,
+                                    dtype="i4")
+                rs[3].filter = (moderngl.NEAREST, moderngl.NEAREST)
+            buf = np.zeros((rows * VERT_ROW, 2), np.int32)
+            buf[:len(verts)] = verts + np.array([left, top], np.int32)
+            rs[3].write(buf.tobytes(), viewport=(0, 0, VERT_ROW, rows))
+            n_fills = rs[0].write(f)
+        if keep_l.any():
+            ln = lines[keep_l].copy()
+            ln[:, 0:4] += shift
+            n_lines = rs[1].write(ln)
+        if keep_s.any():
+            st = inst[keep_s].copy()
+            st[:, 0:2] += shift[:2]
+            n_stamps = rs[2].write(st)
+        ctx.disable(moderngl.BLEND | moderngl.DEPTH_TEST)
+        self.occ_fbo.use()
+        self.occ_fbo.clear(0.0, 0.0, 0.0, 0.0, depth=1.0)
+        progs = [self.progs[k] for k in ("fill", "line", "stamp")]
+        for prog in progs:
+            prog["u_size"].value = size
+        self._set_clip(size, True, zoom)
+        self._set_pass(True, True, seethrough=seethrough)
+        self._draw_bodies(n_fills, n_lines, n_stamps, ring=rs)
+        for prog in progs:
+            prog["u_size"].value = self.size
+        self._set_clip(clip, True, zoom)
+        self._set_pass(True, filled)
+        prog = self.progs["pad"]
+        prog["u_origin"].value = (left, top)
+        prog["u_view"].value = (cx, cy)
+        self.gbuf["albedo"].use(0)
+        self.gbuf["normal"].use(1)
+        self.gbuf["mat"].use(2)
+        self.fullscreen(prog)
+        return self.occ, (left, top)
 
     def _stamps(self, stamps, radii):
         """(k, 11) [cx, cy, offx, offy, atlas x, atlas y, w, h, colour, layer, material] for the circles pygame

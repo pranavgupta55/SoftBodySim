@@ -93,6 +93,11 @@ lights -> compose = albedo x ambient + emissive.
   `float sdf_shadow(sampler2D sdf, vec2 p, vec2 dir, float max_t, float softness_px, vec2 period)` (1 = lit) and
   `float sdf_at(sampler2D sdf, vec2 p, vec2 period)`. L includes sdf_shadow.glsl only when `"sdf" in shared`
   (otherwise a stub returning 1.0, defined in L's own source).
+- Lit-render margin (gl_world.LIT_MARGIN, 128 px): when shadow casters reach past the view (non-periodic axes only),
+  gl_world draws them into a padded G-buffer copy (`FrameInfo.occ`, the view's G-buffer in its middle at
+  `FrameInfo.origin`), and S builds `sdf` / `sdf_opaque` / `sdf_tr` / `sdf_tint` over it: render px p is texel
+  p + `shared["sdf_origin"]` (0, 0 without a margin). sdf_shadow.glsl's `sdf_at` / `sdf_tint_at` add the uniform
+  `u_sdf_origin`, which every program sampling those fields sets from `shared["sdf_origin"]`. Nothing else is padded.
 - `gi` (S, optional): RGBA16F irradiance from emissive surfaces / bounce (radiance cascades); compose adds it.
 - `light` / `spec` (L): RGBA16F diffuse and specular light per pixel (already including shadows, bands, ambient
   excluded).

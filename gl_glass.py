@@ -237,7 +237,7 @@ def _common(prog, frame, sdf_tex=None):
         sdf_tex.use(4)
     period = tuple(float(p or 0.0) for p in (frame.period or (0.0, 0.0)))
     _set(prog, u_albedo=0, u_normal=1, u_mat=2, u_table=3, u_sdf=4, u_clip=tuple(int(c) for c in frame.clip),
-         u_period=period)
+         u_period=period, u_sdf_origin=tuple(frame.shared.get("sdf_origin", (0.0, 0.0))))
 
 
 def _wrap(frame):

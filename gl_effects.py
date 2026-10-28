@@ -22,8 +22,10 @@ u_size and u_clip, to_clip, unpack_rgb, floordiv / ceildiv). FrameInfo.fullscree
 with prog into whatever framebuffer is bound.
 
 Additions beyond the contract (optional to use): FrameInfo.gw (the GLWorld), FrameInfo.ctx (the moderngl context)
-and FrameInfo.fbo (GLWorld.fbo: GLWorld.tex + the shared depth buffer, what compose / glass draw into), and
-FrameInfo.filled (the view mode: False in the points + springs view).
+and FrameInfo.fbo (GLWorld.fbo: GLWorld.tex + the shared depth buffer, what compose / glass draw into),
+FrameInfo.filled (the view mode: False in the points + springs view), and FrameInfo.occ / FrameInfo.origin (the
+lit-render margin: a G-buffer copy padded around the view, so occluders just off screen still cast shadows; gl_sdf
+builds its fields from it and publishes shared["sdf_origin"], the texel of render px (0, 0) in those fields).
 Albedo note: with lighting on, gbuf["albedo"] is the unlit colour with the material's tint and procedural pattern
 applied (identical to the unlit pixels for a material with tint_strength 0 and no pattern).
 """
@@ -71,6 +73,12 @@ class FrameInfo:
     ctx: object = None
     fbo: object = None
     filled: bool = True  # the view mode: False = points + springs (V's first mode), True = filled shapes
+    # the lit-render margin (gl_world.LIT_MARGIN): {"albedo", "normal", "mat"} like gbuf, but covering the view plus
+    # a margin around it (bodies just outside the view are drawn there), or None (no margin this frame). Render px
+    # (x, y) is texel (x + origin[0], y + origin[1]) of these; origin is 0 on a periodic axis (the wrap already
+    # brings the neighbours in). Only the occluder side reads them (gl_sdf's fields); everything else stays gbuf.
+    occ: dict = None
+    origin: tuple = (0, 0)
 
     def fullscreen(self, prog):
         """Draw a fullscreen triangle strip with prog into the bound framebuffer."""
