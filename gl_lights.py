@@ -15,7 +15,8 @@ those shadows stay opaque and only the caustics light them, no light counted twi
 
 ComposeEffect (order 300): GLWorld.tex = tone(exposure x (albedo * (ambient + light + gi + caustics) + spec +
 emissive)) on lit pixels (TONEMAP: a hue-preserving shoulder above TONE_KNEE plus a +-0.5/255 dither; off: a plain
-clamp; exposure: world.exposure, 1 by default), albedo unchanged on unlit ones; then a copy into
+clamp; exposure: world.exposure, 1 by default; the knee: world.tone_knee, TONE_KNEE by default), albedo unchanged
+on unlit ones; then a copy into
 shared["scene_lit"] (RGBA8) for refraction. Missing light / spec / gi / caustics read as black.
 """
 import math
@@ -110,6 +111,16 @@ def pack_lights(lights, zoom):
 def _period(frame):
     p = getattr(frame, "period", None)
     return (0.0, 0.0) if p is None else (float(p[0] or 0.0), float(p[1] or 0.0))
+
+
+def tone_knee(world):
+    """world.tone_knee (where compose's shoulder starts) or TONE_KNEE: finite, in [0, 0.99]."""
+    k = getattr(world, "tone_knee", None)
+    try:
+        k = float(TONE_KNEE if k is None else k)
+    except (TypeError, ValueError):
+        k = float(TONE_KNEE)
+    return min(max(k, 0.0), 0.99) if math.isfinite(k) else float(TONE_KNEE)
 
 
 def exposure(world):
@@ -315,7 +326,7 @@ class ComposeEffect:
         if "u_ambient" in prog:
             prog["u_ambient"].value = tuple(float(c) for c in tuple(ambient)[:3])
         values = {"u_levels": float(LIGHT_LEVELS), "u_tonemap": bool(TONEMAP),
-                  "u_knee": min(max(float(TONE_KNEE), 0.0), 0.99), "u_exposure": exposure(frame.world)}
+                  "u_knee": tone_knee(frame.world), "u_exposure": exposure(frame.world)}
         for name, v in values.items():
             if name in prog:
                 prog[name].value = v

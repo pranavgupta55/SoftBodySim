@@ -138,6 +138,16 @@ def gi_gain(world):
     return min(_gain(GI_GAIN) * (1.0 if g is None else _gain(g)), MAX_GAIN)
 
 
+def gi_edge(world):
+    """world.gi_edge (rim light on see-through bodies, rc_out.frag): in [0, 1]; 0 when unset or bad."""
+    e = getattr(world, "gi_edge", None)
+    try:
+        e = float(e or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(max(e, 0.0), 1.0) if math.isfinite(e) else 0.0
+
+
 def _set(prog, name, value):
     if name in prog:
         prog[name].value = value
@@ -695,6 +705,15 @@ class GiEffect:
         _set(o, "u_mat", 2)
         _set(o, "u_period", period)
         _set(o, "u_gain", gi_gain(world))
+        sdf, edge = frame.shared.get("sdf"), gi_edge(world)
+        if sdf is not None and edge > 0.0:  # rim light (rc_out.frag): needs the field over the see-through casters
+            g["normal"].use(3)
+            sdf.use(4)
+            _set(o, "u_flags", 3)
+            _set(o, "u_sdf", 4)
+            _set(o, "u_sdf_origin", tuple(float(v) for v in frame.shared.get("sdf_origin", (0, 0))))
+            _set(o, "u_rperiod", _period(frame.period))
+        _set(o, "u_edge", edge if sdf is not None else 0.0)
         self.out_fbo.use()
         frame.fullscreen(o)
         frame.shared["gi"] = self.out

@@ -354,7 +354,8 @@ def apply_map_lighting(world, lighting):
     diamonds_map.layout_lighting) on a freshly built world, before its palette is applied. Keys, all optional:
       "enabled": bool -> world.lighting (the world starts lit); "gi": bool -> world.gi (gl_sdf's radiance-cascade GI:
       emissive bodies light the room); "gi_gain": float -> world.gi_gain (its GI brightness, times
-      gl_sdf.GI_GAIN); "ambient": [r, g, b] linear -> world.ambient; "lights": [Light dicts]
+      gl_sdf.GI_GAIN); "gi_edge": 0..1 -> world.gi_edge (rim light on see-through bodies, gl_sdf.gi_edge);
+      "ambient": [r, g, b] linear -> world.ambient; "lights": [Light dicts]
       (lights.Light.to_dict) -> world.lights;
       "materials": {palette role: materials.PRESETS name}: each body of that role gets it as its own `material`
       (so palette switches keep it); "material_over": {palette role: {Material field: value}}: its `material_over`;
@@ -376,6 +377,8 @@ def apply_map_lighting(world, lighting):
         world.gi = bool(lighting["gi"])
     if lighting.get("gi_gain") is not None:
         world.gi_gain = float(lighting["gi_gain"])
+    if lighting.get("gi_edge") is not None:
+        world.gi_edge = float(lighting["gi_edge"])
     if lighting.get("ambient") is not None:
         world.ambient = tuple(float(c) for c in lighting["ambient"])
     if lighting.get("lights"):

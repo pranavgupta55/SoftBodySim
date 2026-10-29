@@ -3,13 +3,17 @@
 Shown in the sidebar (main_opengl.py) while lighting is on and the active world is a map with a "lighting" block
 (scene.build_diamonds_scene sets world.map_key, e.g. "penrose/evolved 1 halloween", and world.map_lighting). Each
 slider writes straight to the world, so the next frame shows it (no rebuild, physics untouched):
-  room:   GI gain (world.gi_gain), ambient (world.ambient: the map's ambient hue times this, its brightest channel),
+  room:   GI gain (world.gi_gain), exposure (world.exposure), highlight knee (world.tone_knee,
+          gl_lights.tone_knee: where bright colours start rolling off toward white), ambient (world.ambient: the
+          map's ambient hue times this, its brightest channel),
           floor lightness / saturation (world.palette_background, palettes.lit_background; the background is redone
           from the current palette's)
   shapes (palette role "hexagon"): glow (emissive_strength in material_over), albedo (body.emissive_albedo: the grey
           a glowing body is lit as, palettes.sync_emissive / glow_tint; also scales the light it throws in the GI)
   tiles (palette role "diamond"): clear (transparency), glow (emissive_strength), reflect (reflectivity),
-          absorb (absorption)
+          absorb (absorption), IOR (ior: how far the floor seen through them is bent), rim (world.gi_edge,
+          gl_sdf: see-through tiles lit by the light just outside their cluster's edge, as opaque ones are; 1 = the
+          transparency-0 look at any transparency; the filled views only)
 Material fields go into each body's material_over, which palettes.sync_emissive leaves alone on a palette switch
 (it only rewrites emissive / tint / tint_strength), so the values survive the Palette card; the view modes don't
 touch materials at all. The card reads its values back from the world, so it always shows what is drawn.
@@ -27,6 +31,7 @@ import os
 
 import pygame
 
+import gl_lights
 import lights as L
 import materials as M
 import palettes
@@ -40,6 +45,8 @@ LABEL_W = 50  # base px: this card's label column (its labels are longer than th
 
 # (key, label, low, high, step)
 SLIDERS = [("gi_gain", "GI gain", 0.0, 20.0, 0.1),
+           ("exposure", "exposure", 0.25, 3.0, 0.01),
+           ("tone_knee", "knee", 0.2, 0.99, 0.01),
            ("ambient", "ambient", 0.0, 0.5, 0.005),
            ("floor_lightness", "floor lit", 0.0, 1.0, 0.01),
            ("floor_saturation", "floor sat", 0.0, 1.0, 0.01),
@@ -48,11 +55,13 @@ SLIDERS = [("gi_gain", "GI gain", 0.0, 20.0, 0.1),
            ("tile_clear", "tile clear", 0.0, 1.0, 0.01),
            ("tile_glow", "tile glow", 0.0, 0.5, 0.005),
            ("tile_reflect", "tile refl", 0.0, 1.0, 0.01),
-           ("tile_absorb", "tile abs", 0.0, 0.2, 0.002)]
+           ("tile_absorb", "tile abs", 0.0, 0.2, 0.002),
+           ("tile_rim", "tile rim", 0.0, 1.0, 0.01),
+           ("tile_ior", "tile IOR", 1.0, 2.5, 0.01)]
 SPECS = {s[0]: s for s in SLIDERS}
 ROLE_FIELDS = {"shape_glow": ("hexagon", "emissive_strength"), "tile_clear": ("diamond", "transparency"),
                "tile_glow": ("diamond", "emissive_strength"), "tile_reflect": ("diamond", "reflectivity"),
-               "tile_absorb": ("diamond", "absorption")}
+               "tile_absorb": ("diamond", "absorption"), "tile_ior": ("diamond", "ior")}
 EPS = 1e-6
 
 
@@ -72,6 +81,13 @@ def get(world, key):
     if key == "gi_gain":
         g = getattr(world, "gi_gain", None)
         return 1.0 if g is None else float(g)
+    if key == "exposure":
+        e = getattr(world, "exposure", None)
+        return 1.0 if e is None else float(e)
+    if key == "tone_knee":
+        return gl_lights.tone_knee(world)
+    if key == "tile_rim":
+        return float(getattr(world, "gi_edge", None) or 0.0) if _role_bodies(world, "diamond") else None
     if key == "ambient":
         return float(max(getattr(world, "ambient", None) or L.DEFAULT_AMBIENT))
     if key in ("floor_lightness", "floor_saturation"):
@@ -95,6 +111,12 @@ def set_value(world, key, value):
     value = float(value)
     if key == "gi_gain":
         world.gi_gain = value
+    elif key == "exposure":
+        world.exposure = value
+    elif key == "tone_knee":
+        world.tone_knee = value
+    elif key == "tile_rim":
+        world.gi_edge = value
     elif key == "ambient":
         amb = tuple(getattr(world, "ambient", None) or L.DEFAULT_AMBIENT)
         base = getattr(world, "look_ambient_hue", None)

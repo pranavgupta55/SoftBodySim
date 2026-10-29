@@ -34,9 +34,10 @@ SIZE = (800, 520)
 ZOOM = 0.5
 EXPECT = {"gi_gain": 6.4, "ambient": 0.08, "floor_lightness": 0.4, "floor_saturation": 0.3, "shape_glow": 1.0,
           "shape_albedo": palettes.GLOW_ALBEDO, "tile_clear": 0.75, "tile_glow": 0.06, "tile_reflect": 0.04,
-          "tile_absorb": 0.0}
+          "tile_absorb": 0.0, "exposure": 1.0, "tile_rim": 0.0, "tile_ior": 1.5, "tone_knee": 0.8}
 TUNED = {"gi_gain": 2.0, "ambient": 0.3, "floor_lightness": 0.7, "floor_saturation": 0.9, "shape_glow": 2.5,
-         "shape_albedo": 0.8, "tile_clear": 0.3, "tile_glow": 0.3, "tile_reflect": 0.6, "tile_absorb": 0.1}
+         "shape_albedo": 0.8, "tile_clear": 0.3, "tile_glow": 0.3, "tile_reflect": 0.6, "tile_absorb": 0.1,
+         "exposure": 1.6, "tile_rim": 1.0, "tile_ior": 2.2, "tone_knee": 0.3}
 FAILS = []
 
 
