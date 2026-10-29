@@ -1,0 +1,50 @@
+# Files an OSPool chunk_evolve job needs (agent B, 2026-10-29). One repo-relative path per line; '#' = comment.
+# All are shipped FLAT (HTCondor puts every input in the job's cwd by basename); no folders need recreating.
+#
+# How this list was made (after agent A's flat-layout fixes to palettes.py and diamonds_map.py):
+#   * dynamic: an audit hook (imports + file opens) in every process of a tiny ospool_evolve run (1 round, 2
+#     ChunkPool workers, a whole-map spot check in spawned workers), inside python:3.13-slim on linux/amd64, with
+#     ONLY these files flat in cwd: it opened exactly the 19 modules and 2 data files below, exit 0.
+#   * static: an ast walk of every import (top-level and in functions) from ospool_evolve.py. The only extra
+#     reachable modules are
+#       - gpu_backend.py (imports mlx at import time), via solver._make_backend only when a World's backend
+#         resolves to "gpu"; the job's workers force EnvConfig.backend = "cpu". EXCLUDED.
+#       - ui_style, editor (-> fontDict, which pygame.init()s and loads fonts/*.ttf at import, plus freehand,
+#         gravity_dial, peg_layer, scene_io, scene_menu, selection), via palettes._ui(), called only by the app's
+#         palette-card drawing code. EXCLUDED.
+#   Nothing on this path imports mlx, moderngl, gl_* or initialises a pygame display at import time.
+
+# --- entry point ---
+ospool_evolve.py
+
+# --- evolution driver and chunk tests ---
+chunk_evolve.py
+chunk_mutate.py
+chunk_test.py
+evolve_layout.py
+diamonds_map.py
+
+# --- simulation core (scene.py imports the presets_* modules at import time) ---
+scene.py
+solver.py
+solver_jit.py
+entities.py
+looping.py
+pumpkins.py
+pumpkin_eyes.py
+materials.py
+lights.py
+palettes.py
+presets_basic.py
+presets_cradle.py
+presets_lighting.py
+
+# --- data. maps/diamonds.json lives in a subfolder in the repo; shipped flat it lands as ./diamonds.json, which
+# diamonds_map.MAP_PATH falls back to (next to the module) when ./maps/diamonds.json is absent. ---
+maps/diamonds.json
+
+# --- base map (default --base "evolved 1 halloween"; swap for the run's base). Pass it as a file path (--base
+# base-v1.json); the evolved map is written to ./outputs/. The repo filename has SPACES: spaces in HTCondor's
+# comma-separated transfer_input_files are untested on our OSPool setup (and a classic pitfall), so stage it
+# under a space-free name. ---
+maps/penrose/evolved 1 halloween.json

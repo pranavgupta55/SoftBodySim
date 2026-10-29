@@ -36,8 +36,7 @@ echo "== IMAGE CHECK"; apptainer exec softbody-py313-v1.sif python3 -c \
 rm -rf $HOME/tmp/importcheck && mkdir -p $HOME/tmp/importcheck
 grep -v '^#' .staged | while read -r f; do cp "$f" $HOME/tmp/importcheck/; done
 ( cd $HOME/tmp/importcheck
-  mkdir -p fonts maps
-  mv -f Montserrat-Bold.ttf Montserrat-ExtraLight.ttf Montserrat-Regular.ttf Montserrat-Thin.ttf fonts/
+  mkdir -p maps
   mv -f diamonds.json maps/
   echo "== JOB IMPORTS"; SDL_VIDEODRIVER=dummy apptainer exec \
     ~/jobs/softbody-evolve-v1/softbody-py313-v1.sif python3 -c "import ospool_evolve, chunk_evolve; print('ok')" )
