@@ -1,6 +1,6 @@
 """Per-chunk stuckness test of a penrose / diamonds map: how well does one region of the map drain a crowd of shapes?
 
-    python3 chunk_test.py "evolved 1 halloween" [--seeds 3] [--grids grid] [--fill 0.6] [--seconds 10]
+    python3 chunk_test.py "evolved 1 halloween" [--seeds 3] [--grids grid] [--fill 0.6] [--seconds 4]
                           [--workers 1] [--out results.json]
 
 The map (maps/penrose/NAME.json, or a path) is split into a CHUNKS x CHUNKS (4 x 4) grid of chunk rects; three more
@@ -24,7 +24,7 @@ One chunk test (ChunkTest, run_chunk):
     saturates: on evolved 1 halloween 0.5 is always met, 0.6 gives ~0.56-0.58 and 0.7 only ~0.59-0.60, so the
     achieved fill is reported ("fill_achieved"). Each shape gets a random velocity of uniform direction and speed
     0..`vel` (default 30 px/s).
-  * Run `seconds` (default 10) of sim time. Once per frame, a shape whose bounding box lies wholly outside the chunk
+  * Run `seconds` (default 4) of sim time. Once per frame, a shape whose bounding box lies wholly outside the chunk
     rect (below it, or off a side) has cleared the chunk: its clear time is recorded and it is removed, so nothing
     piles up and it can't come back.
   * Score:
@@ -32,8 +32,13 @@ One chunk test (ChunkTest, run_chunk):
         area_score  = cleared shape area / shape area          (the same weighted by polygon area)
         flow        = mean over shapes of 1 - t_clear / T      (a shape still there at T counts 0; rewards fast
                                                                draining, so it separates chunks that all clear)
+        free        = 1 - slow shapes / shapes                 (slow: still in the chunk at T and slower than
+                                                               SLOW_SPEED over the last SLOW_WINDOW s; the
+                                                               evolution's metric)
     and the shapes still in the chunk at the end are "stuck": their centres (map coordinates, wrapped) and their
-    speed over the last second go into "stuck" ([x, y, px/s, radius]) for a heatmap.
+    speed over the last SLOW_WINDOW s go into "stuck" ([x, y, px/s, radius]) for a heatmap.
+    The 4 s / 5 px/s / 0.5 s settings come from a parameter search (settle_collect / settle_analyze, 2177 runs): the
+    slow count at 4 s ranks chunks like the count still in at 10 s (Spearman 0.95; 0.68 counting every shape in).
 
 Deterministic for a given (map, chunk, seed, settings): the seed draws the shapes, their placement and velocities.
 The CLI runs every chunk of the chosen grids on N seeds (seed = 1..N), prints a per-chunk table (mean, std across
@@ -61,9 +66,10 @@ import numpy as np  # noqa: E402
 CHUNKS = 4  # chunks per side of the grid
 MARGIN = 0.10  # empty space around the chunk rect, as a share of its size, on every side
 FILL = 0.6  # share of the chunk's free area covered by the shapes' placement circles
-SECONDS = 10.0  # sim time per test
+SECONDS = 4.0  # sim time per test
 VEL = 30.0  # px/s: each shape's initial speed is uniform in 0..VEL, direction uniform
-SLOW_SPEED = 10.0  # px/s: a remaining shape slower than this over the last second is "slow" (resting, not draining)
+SLOW_SPEED = 5.0  # px/s: a remaining shape slower than this over the last SLOW_WINDOW is "slow" (settled: stuck)
+SLOW_WINDOW = 0.5  # s: the speed is the centroid's displacement over this window / the window
 GAP = 1.0  # world units kept between placement circles, and between a circle and a tile
 TRIES = 2048  # random positions tried per shape (in batches of CANDIDATES) before it is skipped
 CANDIDATES = 256
@@ -369,7 +375,7 @@ class ChunkTest:
         self.frames = int(round(seconds * FPS))
         self.cleared = []  # (body, time s)
         self.remaining = list(self.shapes)
-        self._history = []  # per frame: centres of the remaining shapes (for the last-second speeds)
+        self._history = []  # per frame: centres of the remaining shapes (for the SLOW_WINDOW speeds)
         self.sample_dt = sample_dt
         self._track = None
         if sample_dt is not None:
@@ -475,13 +481,13 @@ class ChunkTest:
             self.cleared += [(b, self.time) for b in gone]
             self.world.remove(bodies=gone)
         self._history.append({id(b): b.points.mean(axis=1).copy() for b in self.remaining})
-        if len(self._history) > FPS + 1:
+        if len(self._history) > int(round(SLOW_WINDOW * FPS)) + 1:
             self._history.pop(0)
         if self._track is not None and self.frame % self._sample_every == 0:
             self._sample()
 
     def speeds(self):
-        """{id(body): mean speed over the last second (or what has run of it), px/s} of the remaining shapes."""
+        """{id(body): mean speed over the last SLOW_WINDOW s (or what has run of it), px/s} of the remaining shapes."""
         out = {}
         if len(self._history) < 2:
             return {id(b): 0.0 for b in self.remaining}
@@ -494,12 +500,14 @@ class ChunkTest:
 
     def score(self):
         n = len(self.shapes)
+        slow = sum(v < SLOW_SPEED for v in self.speeds().values())
         area = sum(b.chunk_area for b in self.shapes)
         T = self.seconds
         return {
             "score": len(self.cleared) / n if n else 1.0,
             "area_score": sum(b.chunk_area for b, _ in self.cleared) / area if area else 1.0,
             "flow": sum(1.0 - t / T for _, t in self.cleared) / n if n else 1.0,
+            "free": 1.0 - slow / n if n else 1.0,
         }
 
     def result(self):
@@ -710,13 +718,14 @@ def main(argv=None):
         row = {"chunk": c["id"], "rect": rs[0]["rect"], "score": float(sc.mean()), "score_std": float(sc.std()),
                "area_score": float(np.mean([r["area_score"] for r in rs])),
                "flow": float(np.mean([r["flow"] for r in rs])),
+               "free": float(np.mean([r["free"] for r in rs])),
                "wall": float(np.mean([r["wall"] for r in rs]))}
         summary.append(row)
         print(f"{c['id']:16s} {row['score']:6.3f} {row['score_std']:5.3f} {row['area_score']:6.3f} {row['flow']:6.3f} "
               f"{np.mean([r['shapes'] for r in rs]):6.0f} {np.mean([r['fill_achieved'] for r in rs]):5.2f} "
               f"{rs[0]['tiles']:5d} {row['wall']:6.2f}  " + " ".join(f"{v:.3f}" for v in sc), flush=True)
     noise = {}
-    for key in ("score", "area_score", "flow"):
+    for key in ("score", "area_score", "flow", "free"):
         per = [np.array([r[key] for r in by_chunk[c["id"]]]) for c in chunks]
         means = np.array([v.mean() for v in per])
         within = float(np.sqrt(np.mean([v.var() for v in per])))  # rms of the per-chunk std across seeds

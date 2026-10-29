@@ -119,7 +119,7 @@ def main(argv=None):
     p.add_argument("--mutate-share", type=float, default=MUTATE_SHARE)
     p.add_argument("--seed", type=int, default=None, help="job draw seed (default: fresh entropy)")
     p.add_argument("--fill", type=float, default=ct.FILL)
-    p.add_argument("--seconds", type=float, default=ct.SECONDS)
+    p.add_argument("--seconds", type=float, default=10.0)  # the ground truth: shapes still in at 10 s
     p.add_argument("--sample-dt", type=float, default=SAMPLE_DT)
     p.add_argument("--max-runs", type=int, default=None, help="also stop queueing after this many runs (tests)")
     args = p.parse_args(argv)

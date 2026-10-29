@@ -9,18 +9,20 @@ chunks of chunk_test.chunk_rects; a tile belongs to the grid chunk whose rect ho
 changes only the tiles its chunk owns. The three half-chunk shifted grids straddle the seams and only score them.
 
 One round, incumbent layout K, S fresh seeds shared by every job of the round (paired):
-  1. Score the 16 grid chunks of K on the S seeds. A chunk's metric is its mean `flow` over the seeds (score is
-     logged too).
-  2. Make ~16 x V chunk variants (chunk_mutate.mutate_chunk, steered by the chunk's stuck shapes on all seeds),
-     allotted in proportion to 1 - flow (weaker chunks get more, every chunk at least one); score each variant's
-     chunk on the same seeds.
-  3. Per chunk, the best variant replaces the incumbent's tiles only if its flow beats the incumbent's by more than
+  1. Score the 16 grid chunks of K on the S seeds. A chunk's metric (--metric) is its mean `free` over the seeds
+     (1 - the share of shapes settled in the chunk at the end of the 4 s test, chunk_test's default; or `flow`).
+     score is logged too.
+  2. Make ~16 x V chunk variants (chunk_mutate.mutate_chunk, steered by the chunk's stuck shapes on all seeds:
+     the settled ones for `free`), allotted in proportion to 1 - metric (weaker chunks get more, every chunk at
+     least one); score each variant's chunk on the same seeds.
+  3. Per chunk, the best variant replaces the incumbent's tiles only if its metric beats the incumbent's by more than
      --margin.
   4. Assemble K' (chunk_mutate.assemble, which drops border tiles that break the placement rules). Score the
      shifted chunks whose tiles differ between K and K' on the same seeds, for both. A changed grid chunk's seam
-     damage is the summed flow change of those shifted chunks over it; a chunk past -(--seam-threshold) is re-scored
+     damage is the summed metric change of those shifted chunks over it; a chunk past -(--seam-threshold) is re-scored
      on --recheck-seeds fresh seeds and judged on all of them; if still past it, the worst is reverted,
-     K' re-assembled and re-scored. (One chunk's flow varies ~0.02 between seeds, so the threshold sits at ~2x.)
+     K' re-assembled and re-scored. (One chunk's flow varies ~0.02 between seeds, free ~0.027, so the threshold sits
+     at ~2x.)
   5. Save K' to maps/<base's folder>/OUT_NAME.json (the base's spawn, tiling, clusters and lighting kept) and to
      LOG_DIR/layouts/rN.json.
   6. Every --spot-every rounds and after the last round: one whole-map run of K' per spot seed (chunk_test.
@@ -56,9 +58,9 @@ sys.path.insert(0, REPO)
 
 import numpy as np  # noqa: E402
 
-from chunk_test import CHUNKS, chunk_rects, map_path  # noqa: E402
+from chunk_test import CHUNKS, SLOW_SPEED, chunk_rects, map_path  # noqa: E402
 
-TEST_WALL = 1.4  # s: one 10 s chunk test on one core (evolved 1 halloween, measured)
+TEST_WALL = 1.1  # s: one 4 s chunk test on one core (evolved 1 halloween, measured)
 ALL_GRIDS = ("grid", "shift_x", "shift_y", "shift_xy")
 DEADLINE_MARGIN = 120.0  # s kept spare before --deadline (plus 10% on the round estimate)
 SPOT_WALL_PER_SIM = 0.45  # s wall per sim second of a whole-map run (measured 0.40), until one is timed
@@ -227,7 +229,7 @@ class Scorer:
 
 def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin=0.005, seam_threshold=0.04,
            recheck_seeds=2, n_remove=3, n_add=3, share=0.5, seed=0, deadline=None, spot_every=2, spot_seconds=120.0,
-           spot_seeds=2, test_wall=TEST_WALL, clock=time.time, say=print):
+           spot_seeds=2, test_wall=TEST_WALL, metric="free", clock=time.time, say=print):
     """Run up to `rounds` rounds from be.base_keys (see the module doc); returns {"keys", "rounds", "history",
     "spots"}. `be`: a MapBackend or a fake with the same members."""
     os.makedirs(os.path.join(log_dir, "layouts"), exist_ok=True)
@@ -250,11 +252,11 @@ def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin
     t0 = clock()
     history, spots, round_secs, base_spot, spot_secs = [], [], [], None, None
     say(f"chunk_evolve -> {out_path}: base {len(base)} tiles, up to {rounds} rounds x ~{16 * variants} variants, "
-        f"{seeds} seeds, margin {margin:g}, seam threshold {seam_threshold:g}, {workers} workers"
+        f"{seeds} seeds, metric {metric}, margin {margin:g}, seam threshold {seam_threshold:g}, {workers} workers"
         f"{', deadline in %.0f s' % (deadline - t0) if deadline else ''}; log {log_path}")
     log({"type": "start", "out": out_path, "tiles": len(base), "rounds": rounds, "variants": variants,
-         "seeds": seeds, "margin": margin, "seam_threshold": seam_threshold, "remove": n_remove, "add": n_add,
-         "share": share, "seed": seed, "spot_seeds": spot_seed_list})
+         "seeds": seeds, "metric": metric, "margin": margin, "seam_threshold": seam_threshold, "remove": n_remove,
+         "add": n_add, "share": share, "seed": seed, "spot_seeds": spot_seed_list})
 
     def note(r):
         last = spots[-1] if spots else None
@@ -262,7 +264,7 @@ def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin
               f"{spot_seeds} seeds)") if last else ""
         return (f"{os.path.splitext(os.path.basename(out_path))[0]} ({time.strftime('%Y-%m-%d')}): chunk_evolve from "
                 f"{getattr(be, 'name', 'base')}, {r} rounds of ~{16 * variants} chunk variants (remove {n_remove} / "
-                f"add {n_add}) x {seeds} paired seeds, flow margin {margin:g}, seam threshold {seam_threshold:g}"
+                f"add {n_add}) x {seeds} paired seeds, {metric} margin {margin:g}, seam threshold {seam_threshold:g}"
                 f"{sp}")
 
     def spot_check(r):
@@ -311,12 +313,12 @@ def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin
             sc = Scorer(pool, size, pad, round_seeds, log, r)
             # 1. the incumbent's grid chunks
             inc = dict(zip(grids, sc.score([(K, g, "inc", {}) for g in grids])))
-            flow = {g: mean_of(inc[g]) for g in grids}
+            flow = {g: mean_of(inc[g], metric) for g in grids}
             # 2. variants, more for the weaker chunks
             alloc = allocate(flow, len(grids) * variants)
             var = {}
             for g in grids:
-                stuck = [s for res in inc[g] for s in res.get("stuck", [])]
+                stuck = [s for res in inc[g] for s in res.get("stuck", []) if metric != "free" or s[2] < SLOW_SPEED]
                 var[g] = [be.mutate(rng, K, g, stuck, n_remove, n_add, share) for _ in range(alloc[g])]
             reqs = [(v, g, "var", {"variant": i}) for g in grids for i, v in enumerate(var[g])]
             vres = sc.score(reqs)
@@ -326,7 +328,7 @@ def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin
             for g in grids:
                 best = None
                 for v in var[g]:
-                    f, s = mean_of(vres[k]), mean_of(vres[k], "score")
+                    f, s = mean_of(vres[k], metric), mean_of(vres[k], "score")
                     k += 1
                     if best is None or (f, s) > best[0]:
                         best = ((f, s), v)
@@ -342,7 +344,7 @@ def evolve(be, out_path, log_dir, rounds, variants=6, seeds=2, workers=6, margin
                 res = scorer.score([(K, s, "shift_inc" + suffix, {}) for s in chunks]
                                    + [(Kn, s, "shift_new" + suffix, {"reverted": list(reverted)}) for s in chunks])
                 n = len(chunks)
-                return {s: mean_of(res[n + i]) - mean_of(res[i]) for i, s in enumerate(chunks)}
+                return {s: mean_of(res[n + i], metric) - mean_of(res[i], metric) for i, s in enumerate(chunks)}
 
             while True:
                 live = [g for g in changed if g not in reverted]
@@ -417,9 +419,11 @@ def main(argv=None, backend=None):
     p.add_argument("--variants", type=int, default=6, help="chunk variants per grid chunk per round, on average")
     p.add_argument("--seeds", type=int, default=2, help="paired seeds per round (fresh each round)")
     p.add_argument("--workers", type=int, default=6)
-    p.add_argument("--margin", type=float, default=0.005, help="a variant must beat the chunk's flow by more")
+    p.add_argument("--metric", choices=("free", "flow"), default="free",
+                   help="chunk metric: free (1 - settled share at the end) or flow")
+    p.add_argument("--margin", type=float, default=0.005, help="a variant must beat the chunk's metric by more")
     p.add_argument("--seam-threshold", type=float, default=0.04,
-                   help="a changed chunk is reverted if the shifted chunks over it lose more flow than this in total")
+                   help="a changed chunk is reverted if the shifted chunks over it lose more than this in total")
     p.add_argument("--recheck-seeds", type=int, default=2,
                    help="fresh seeds a suspect seam is re-scored on before reverting (0: no re-check)")
     p.add_argument("--remove", type=int, default=3, help="tiles removed per chunk variant")
@@ -455,7 +459,7 @@ def main(argv=None, backend=None):
                   recheck_seeds=args.recheck_seeds, n_remove=args.remove, n_add=args.add,
                   share=args.targeted_share, seed=args.seed, deadline=parse_deadline(args.deadline),
                   spot_every=args.spot_every, spot_seconds=args.spot_seconds, spot_seeds=args.spot_seeds,
-                  test_wall=args.test_wall)
+                  test_wall=args.test_wall, metric=args.metric)
 
 
 if __name__ == "__main__":

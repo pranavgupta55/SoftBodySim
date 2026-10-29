@@ -66,7 +66,7 @@ def fake_result(keys, chunk_id, seed):
     noise = 0.02 * np.random.default_rng([seed, sum(map(ord, chunk_id))]).random()
     flow = float(np.clip(0.5 + 0.03 * sum(value(t, grid) for t in inside) + noise, 0.0, 1.0))
     stuck = [[t[0], t[1], 0.0, 5.0] for t in inside if value(t, grid) < 0]
-    return {"chunk": chunk_id, "seed": seed, "flow": flow, "score": min(1.0, flow + 0.1), "stuck": stuck,
+    return {"chunk": chunk_id, "seed": seed, "flow": flow, "free": flow, "score": min(1.0, flow + 0.1), "stuck": stuck,
             "wall": 1.4}
 
 

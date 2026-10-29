@@ -48,7 +48,7 @@ def run(test):
     return test
 
 
-def check_identical(info, chunk, seed, keys=None, seconds=ct.SECONDS):
+def check_identical(info, chunk, seed, keys=None, seconds=10.0):
     a = run(ct.ChunkTest(info, chunk, seed, keys=keys, seconds=seconds))
     b = run(ct.ChunkTest(info, chunk, seed, keys=keys, seconds=seconds, sample_dt=0.1))
     same = np.array_equal(a.world.P, b.world.P) and np.array_equal(a.world.V, b.world.V)

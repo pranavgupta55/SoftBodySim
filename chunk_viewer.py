@@ -1,7 +1,7 @@
 """Watch one chunk stuckness test (chunk_test.py) in real time: the very same test world (ChunkTest, same seed,
 same step loop), drawn with pygame in the map's palette.
 
-    python3 chunk_viewer.py ["evolved 1 halloween"] [--chunk "grid r0c1"] [--seed 1] [--fill 0.6] [--seconds 10]
+    python3 chunk_viewer.py ["evolved 1 halloween"] [--chunk "grid r0c1"] [--seed 1] [--fill 0.6] [--seconds 4]
                             [--layout FILE.json]
 
 --layout: show another layout's tiles (a map file's "tiles" keys, e.g. an evolved map, or a path) in the map's
@@ -13,7 +13,7 @@ Keys:
     S / A           next / previous seed (restarts)          R           restart (same seed)
     Space           pause / resume                           N           one frame (1/60 s) while paused
     1 / 2 / 4       speed 1x / 2x / 4x                       T           outline the shapes still in the chunk
-                                                             (red: slower than SLOW_SPEED over the last second)
+                                                             (red: slower than SLOW_SPEED over the last SLOW_WINDOW)
     Esc / Q         quit
 At 1x one sim second takes one real second (frames of 1/60 s, each World.step(1/60) = 4 ticks of 1/240 s, run as
 real time accrues). The test stops at its end time and holds the final state and score; R / S run it again.
@@ -60,8 +60,8 @@ def draw(screen, font, test, info, zoom, state):
     if state["tint"]:
         for b in test.remaining:
             loop = np.round(b.points * zoom).astype(int).T.tolist()
-            # red: under SLOW_SPEED over the last second (resting: the stuck ones); white: still in the chunk, moving
-            col = STUCK_COL if test.time >= 1.0 and sp.get(id(b), 0.0) < ct.SLOW_SPEED else MOVING_COL
+            # red: under SLOW_SPEED over the last SLOW_WINDOW (settled: stuck); white: still in the chunk, moving
+            col = STUCK_COL if test.time >= ct.SLOW_WINDOW and sp.get(id(b), 0.0) < ct.SLOW_SPEED else MOVING_COL
             pygame.draw.polygon(surf, col, loop, 2)
     x0, y0, w, h = test.rect
     pygame.draw.rect(surf, RECT_COL, pygame.Rect(round(x0 * zoom), round(y0 * zoom), round(w * zoom),
