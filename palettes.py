@@ -17,9 +17,13 @@ glows in the new one, equally bright in every palette.
 """
 import pygame
 
-import ui_style as ui
-from ui_style import HUD
-from editor import BTN_GAP, CARD_BTN_H, CARD_TITLE_H
+
+def _ui():
+    """The card's UI modules, imported on first use: ui_style loads the fonts (fonts/ under the cwd), which headless
+    map building (scene.build_diamonds_scene -> apply_palette, e.g. an OSPool job) mustn't need."""
+    import ui_style as ui
+    from editor import BTN_GAP, CARD_BTN_H, CARD_TITLE_H
+    return ui, ui.HUD, BTN_GAP, CARD_BTN_H, CARD_TITLE_H
 
 
 def _hex(*codes):
@@ -178,6 +182,7 @@ class PaletteCard:
 
     @staticmethod
     def card_height(compact=False):
+        ui, HUD, BTN_GAP, CARD_BTN_H, CARD_TITLE_H = _ui()
         px, pad = HUD.px, HUD.CARD_PAD
         n = len(PALETTES)
         return pad + px(CARD_TITLE_H) + n * px(CARD_BTN_H) + (n - 1) * px(BTN_GAP) + pad - px(1)
@@ -191,6 +196,7 @@ class PaletteCard:
 
     def _buttons(self):
         """[(palette name, rect)] in native screen px."""
+        ui, HUD, BTN_GAP, CARD_BTN_H, CARD_TITLE_H = _ui()
         px, pad = HUD.px, HUD.CARD_PAD
         y, bh, gap = self.rect.y + pad + px(CARD_TITLE_H), px(CARD_BTN_H), px(BTN_GAP)
         return [(name, pygame.Rect(self.rect.x + pad, y + k * (bh + gap), self.rect.w - 2 * pad, bh))
@@ -207,6 +213,7 @@ class PaletteCard:
         return True
 
     def draw_card(self, surface, origin, mouse_px, compact=False):
+        ui, HUD, BTN_GAP, CARD_BTN_H, CARD_TITLE_H = _ui()
         ox, oy = origin
         r = self.rect.move(-ox, -oy)
         HUD.draw_frame(surface, r)

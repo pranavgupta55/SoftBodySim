@@ -11,6 +11,8 @@ import os
 import numpy as np
 
 MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "diamonds.json")
+if not os.path.isfile(MAP_PATH):  # flat copies of the code and data (an OSPool job's scratch dir): next to this file
+    MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diamonds.json")
 SQRT3_2 = math.sqrt(3) / 2
 
 
