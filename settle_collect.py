@@ -135,7 +135,8 @@ def main(argv=None):
     if args.mutate_share > 0:
         from chunk_mutate import TileUniverse
         uni = TileUniverse(info)
-    kw = {"fill": args.fill, "seconds": args.seconds, "sample_dt": args.sample_dt}
+    kw = {"fill": args.fill, "seconds": args.seconds, "sample_dt": args.sample_dt,
+          "vel": 30.0}  # (the settle search ran on the old slow starts)
     print(f"settle_collect: {info.name}, {args.workers} workers, {args.minutes:g} min, mutate share "
           f"{args.mutate_share:g}, appending to {out} ({had} runs there)", flush=True)
 

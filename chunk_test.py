@@ -22,8 +22,10 @@ One chunk test (ChunkTest, run_chunk):
     target are drawn first and placed largest first, each at the snuggest of a few random free spots (SNUG); ones
     that don't fit are skipped, then more are drawn one at a time to top up (see ChunkTest._place). Random placement
     saturates: on evolved 1 halloween 0.5 is always met, 0.6 gives ~0.56-0.58 and 0.7 only ~0.59-0.60, so the
-    achieved fill is reported ("fill_achieved"). Each shape gets a random velocity of uniform direction and speed
-    0..`vel` (default 30 px/s).
+    achieved fill is reported ("fill_achieved"). Each shape gets a random velocity: by default (vel None) drawn
+    like the whole map's flow, vx ~ N(0, VEL_STD[0]) and vy ~ N(VEL_MEAN[1], VEL_STD[1]) (VEL_MEAN / VEL_STD:
+    measured on evolved 1 halloween, 168 shapes, t = 30..60 s: median speed 177 px/s, 98% moving down); with `vel`
+    a number, uniform direction and speed 0..vel (the old test: 30).
   * Run `seconds` (default 4) of sim time. Once per frame, a shape whose bounding box lies wholly outside the chunk
     rect (below it, or off a side) has cleared the chunk: its clear time is recorded and it is removed, so nothing
     piles up and it can't come back.
@@ -67,7 +69,9 @@ CHUNKS = 4  # chunks per side of the grid
 MARGIN = 0.10  # empty space around the chunk rect, as a share of its size, on every side
 FILL = 0.6  # share of the chunk's free area covered by the shapes' placement circles
 SECONDS = 4.0  # sim time per test
-VEL = 30.0  # px/s: each shape's initial speed is uniform in 0..VEL, direction uniform
+VEL = None  # None: initial velocities like the whole map's (VEL_MEAN / VEL_STD); a number: speed 0..VEL, any way
+VEL_MEAN = (0.0, 173.0)  # px/s (y down): shape velocity on the whole map (evolved 1 halloween, t = 30..60 s)
+VEL_STD = (72.0, 115.0)
 SLOW_SPEED = 5.0  # px/s: a remaining shape slower than this over the last SLOW_WINDOW is "slow" (settled: stuck)
 SLOW_WINDOW = 0.5  # s: the speed is the centroid's displacement over this window / the window
 GAP = 1.0  # world units kept between placement circles, and between a circle and a tile
@@ -356,13 +360,17 @@ class ChunkTest:
         self.shapes = []
         pick_rng = np.random.default_rng([int(seed), 7178])
         for spec, (cx, cy, angle) in placed:
-            speed, d = float(rng.uniform(0, vel)), float(rng.uniform(0, 2 * math.pi))
+            if vel is None:
+                v0 = (float(rng.normal(VEL_MEAN[0], VEL_STD[0])), float(rng.normal(VEL_MEAN[1], VEL_STD[1])))
+            else:
+                speed, d = float(rng.uniform(0, vel)), float(rng.uniform(0, 2 * math.pi))
+                v0 = (speed * math.cos(d), speed * math.sin(d))
             if spec["kind"] == "pumpkin":  # as scene.build_diamonds_scene: upright, leaning up to 30 degrees
                 b = pumpkins.make(cx, cy, spec["size"], tilt=angle - math.pi / 6, point_radius=2)
             else:
                 b = SoftBody(polygon_points(cx, cy, spec["r"], spec["sides"], angle=-math.pi / 2 + angle),
                              stiffness=0.1, skip_sets=2, point_radius=2)
-            b.vels[:] = np.array([[speed * math.cos(d)], [speed * math.sin(d)]])
+            b.vels[:] = np.array([[v0[0]], [v0[1]]])
             b.palette_role, b.palette_pick = "hexagon", int(pick_rng.integers(1 << 30))
             b.chunk_area = _polygon_area(b.points)
             b.chunk_r, b.chunk_c = spec["r"], (cx, cy)  # its placement circle
@@ -679,7 +687,7 @@ def main(argv=None):
                                                     'default all of --grids')
     p.add_argument("--fill", type=float, default=FILL)
     p.add_argument("--seconds", type=float, default=SECONDS)
-    p.add_argument("--vel", type=float, default=VEL)
+    p.add_argument("--vel", type=float, default=VEL, help="speed 0..VEL any way (default: like the whole map)")
     p.add_argument("--workers", type=int, default=1, help="processes (1: in this process)")
     p.add_argument("--out", default=None, help="JSON output path (default: print only)")
     args = p.parse_args(argv)
