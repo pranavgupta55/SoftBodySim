@@ -5,7 +5,7 @@
                             [--commands-out ospool/COMMANDS.md] [--repo DIR] [--clean]
 
 Follows OSPoolTesting/AGENT_RUNBOOK.md sections 4-7. The job folder (default
-~/Desktop/PennAir/OSPoolTesting/jobs/softbody-evolve-v1/) is made from templates/python-job (read only):
+~/Desktop/PennAiR/OSPoolTesting/jobs/softbody-evolve-v1/) is made from templates/python-job (read only):
   - every file named in --files (repo-relative paths or globs, # comments), copied flat (inputs arrive by basename;
     run.sh moves files listed from a subfolder back into it), skipping the base map if listed,
     plus ospool_evolve.py if the list leaves it out;
@@ -36,7 +36,7 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.abspath(__file__))
-OSPOOL = os.path.expanduser("~/Desktop/PennAir/OSPoolTesting")
+OSPOOL = os.path.expanduser("~/Desktop/PennAiR/OSPoolTesting")
 TEMPLATES = os.path.join(OSPOOL, "templates", "python-job")
 JOB_NAME = "softbody-evolve-v1"
 SCRIPT = "ospool_evolve.py"

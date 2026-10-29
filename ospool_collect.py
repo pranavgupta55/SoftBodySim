@@ -3,7 +3,7 @@
     python3 ospool_collect.py [RESULTS_DIR] [--sweep ospool/sweep.json] [--top 5] [--export N]
                               [--maps-dir maps/penrose] [--html PATH] [--no-open]
 
-RESULTS_DIR (default ~/Desktop/PennAir/OSPoolTesting/jobs/softbody-evolve-v1) is a job folder after the runbook's
+RESULTS_DIR (default ~/Desktop/PennAiR/OSPoolTesting/jobs/softbody-evolve-v1) is a job folder after the runbook's
 block F pull: results/outputs_<tag>.tar.gz (one per job, made by run.sh even when the job fails) and logs/job_<cluster>_
 <proc>.{log,out,err}. Each tarball is unpacked next to itself into results/outputs_<tag>/ (skipped if that folder is
 already there; members are extracted with tarfile's "data" filter, so nothing lands outside it) and is expected to
@@ -52,7 +52,7 @@ import tempfile
 import time
 
 REPO = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_RESULTS = os.path.expanduser("~/Desktop/PennAir/OSPoolTesting/jobs/softbody-evolve-v1")
+DEFAULT_RESULTS = os.path.expanduser("~/Desktop/PennAiR/OSPoolTesting/jobs/softbody-evolve-v1")
 CHARTJS = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
 ERR_TAIL = 12  # lines of .err shown for a failed job
 # per-job arguments, not part of a sweep setting (argparse dest names; "--x-y" flags normalise to x_y)

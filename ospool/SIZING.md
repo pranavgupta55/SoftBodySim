@@ -1,5 +1,9 @@
 # OSPool sizing and sweep for chunk_evolve (option 1)
 
+General OSPool lessons drawn from this file (memory from measured RSS, the eviction cost model, Numba cold cache) now live in
+`~/Desktop/PennAiR/OSPoolTesting/runFindings/README.md` (lessons 9–11). What batch 1 actually measured is in
+`runFindings/2026-10-29_softbody-evolve-v1.md`. This file is the plan as made before that batch.
+
 One OSPool job = one complete `chunk_evolve` evolution (`ospool_evolve.py`), looping rounds until its deadline.
 Measured 2026-10-29 on the laptop (Apple M4, 4 performance + 6 efficiency cores, 16 GB), load average 4.5-5.7
 from other apps during the runs. Scripts and logs: the session scratchpad `ospool_d/` (not in the repo).
