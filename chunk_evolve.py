@@ -10,7 +10,7 @@ changes only the tiles its chunk owns. The three half-chunk shifted grids stradd
 
 One round, incumbent layout K, S fresh seeds shared by every job of the round (paired):
   1. Score the 16 grid chunks of K on the S seeds. A chunk's metric (--metric) is its mean `free` over the seeds
-     (1 - the share of shapes settled in the chunk at the end of the 4 s test, chunk_test's default; or `flow`).
+     (1 - the share of shapes settled in the chunk at the end of the 5 s test, chunk_test's default; or `flow`).
      score is logged too.
   2. Make ~16 x V chunk variants (chunk_mutate.mutate_chunk, steered by the chunk's stuck shapes on all seeds:
      the settled ones for `free`), allotted in proportion to 1 - metric (weaker chunks get more, every chunk at
@@ -60,7 +60,7 @@ import numpy as np  # noqa: E402
 
 from chunk_test import CHUNKS, SLOW_SPEED, chunk_rects, map_path  # noqa: E402
 
-TEST_WALL = 1.1  # s: one 4 s chunk test on one core (evolved 1 halloween, measured)
+TEST_WALL = 0.9  # s: one 5 s chunk test on one core (evolved 1 halloween, measured)
 ALL_GRIDS = ("grid", "shift_x", "shift_y", "shift_xy")
 DEADLINE_MARGIN = 120.0  # s kept spare before --deadline (plus 10% on the round estimate)
 SPOT_WALL_PER_SIM = 0.45  # s wall per sim second of a whole-map run (measured 0.40), until one is timed
@@ -417,7 +417,7 @@ def main(argv=None, backend=None):
     p.add_argument("--base", default="evolved 1 halloween", help="the starting map (a name in maps/penrose or a path)")
     p.add_argument("--rounds", type=int, default=10, help="rounds (a maximum with --deadline)")
     p.add_argument("--variants", type=int, default=6, help="chunk variants per grid chunk per round, on average")
-    p.add_argument("--seeds", type=int, default=2, help="paired seeds per round (fresh each round)")
+    p.add_argument("--seeds", type=int, default=10, help="paired seeds per round (fresh each round)")
     p.add_argument("--workers", type=int, default=6)
     p.add_argument("--metric", choices=("free", "flow"), default="free",
                    help="chunk metric: free (1 - settled share at the end) or flow")

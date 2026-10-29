@@ -1,6 +1,6 @@
 """Per-chunk stuckness test of a penrose / diamonds map: how well does one region of the map drain a crowd of shapes?
 
-    python3 chunk_test.py "evolved 1 halloween" [--seeds 3] [--grids grid] [--fill 0.6] [--seconds 4]
+    python3 chunk_test.py "evolved 1 halloween" [--seeds 3] [--grids grid] [--fill 0.5] [--seconds 5]
                           [--workers 1] [--out results.json]
 
 The map (maps/penrose/NAME.json, or a path) is split into a CHUNKS x CHUNKS (4 x 4) grid of chunk rects; three more
@@ -18,7 +18,7 @@ One chunk test (ChunkTest, run_chunk):
     pumpkin share and half width range, spread evenly through the order as scene.spawn_kinds does; same body
     constructors and stiffness as scene.build_diamonds_scene) placed at random, non-overlapping, wholly inside the
     chunk rect and clear of its tiles, until their placement circles (circumcircle; a pumpkin's REACH circle) cover
-    `fill` (default 0.6) of the chunk's free area (rect area minus the tiles' area inside it). Shapes for the whole
+    `fill` (default 0.5) of the chunk's free area (rect area minus the tiles' area inside it). Shapes for the whole
     target are drawn first and placed largest first, each at the snuggest of a few random free spots (SNUG); ones
     that don't fit are skipped, then more are drawn one at a time to top up (see ChunkTest._place). Random placement
     saturates: on evolved 1 halloween 0.5 is always met, 0.6 gives ~0.56-0.58 and 0.7 only ~0.59-0.60, so the
@@ -39,8 +39,9 @@ One chunk test (ChunkTest, run_chunk):
                                                                evolution's metric)
     and the shapes still in the chunk at the end are "stuck": their centres (map coordinates, wrapped) and their
     speed over the last SLOW_WINDOW s go into "stuck" ([x, y, px/s, radius]) for a heatmap.
-    The 4 s / 5 px/s / 0.5 s settings come from a parameter search (settle_collect / settle_analyze, 2177 runs): the
-    slow count at 4 s ranks chunks like the count still in at 10 s (Spearman 0.95; 0.68 counting every shape in).
+    The 5 px/s / 0.5 s settings come from a parameter search (settle_collect / settle_analyze, 2177 runs, on the
+    old slow starts and all sizes): the slow count at 4-5 s ranked chunks like the count still in at 10 s (Spearman
+    0.95-0.98; 0.68-0.87 counting every shape in).
 
 Deterministic for a given (map, chunk, seed, settings): the seed draws the shapes, their placement and velocities.
 The CLI runs every chunk of the chosen grids on N seeds (seed = 1..N), prints a per-chunk table (mean, std across
@@ -67,11 +68,14 @@ import numpy as np  # noqa: E402
 
 CHUNKS = 4  # chunks per side of the grid
 MARGIN = 0.10  # empty space around the chunk rect, as a share of its size, on every side
-FILL = 0.6  # share of the chunk's free area covered by the shapes' placement circles
-SECONDS = 4.0  # sim time per test
+FILL = 0.5  # share of the chunk's free area covered by the shapes' placement circles
+SECONDS = 5.0  # sim time per test
 VEL = None  # None: initial velocities like the whole map's (VEL_MEAN / VEL_STD); a number: speed 0..VEL, any way
 VEL_MEAN = (0.0, 173.0)  # px/s (y down): shape velocity on the whole map (evolved 1 halloween, t = 30..60 s)
 VEL_STD = (72.0, 115.0)
+# the shapes that get stuck most: each kind's size drawn only from one end of its range, this share of it: pumpkins
+# and heptagons from the top (the largest), hexagons from the bottom (the smallest). None: the whole ranges.
+EXTREMES = 1.0 / 3.0
 SLOW_SPEED = 5.0  # px/s: a remaining shape slower than this over the last SLOW_WINDOW is "slow" (settled: stuck)
 SLOW_WINDOW = 0.5  # s: the speed is the centroid's displacement over this window / the window
 GAP = 1.0  # world units kept between placement circles, and between a circle and a tile
@@ -279,26 +283,35 @@ def _tile_field(tiles, rect, reach=40.0):
 class SpawnDraw:
     """Shape specs {"kind", "r" (placement circle radius), "size" (pumpkin half width), "sides"} in the map's spawn
     order: the k-th is a pumpkin when floor((k + 1) x pumpkin_share) > floor(k x share) (scene.spawn_kinds), the
-    others take the side counts in turn; sizes uniform in their ranges (as scene.build_diamonds_scene)."""
+    others take the side counts in turn; sizes uniform in their ranges (as scene.build_diamonds_scene), or with
+    `extremes` (EXTREMES) only in that share of them at the stuck-prone end: the top for pumpkins and polygons of 7+
+    sides, the bottom for fewer sides."""
 
-    def __init__(self, spawn, rng):
+    def __init__(self, spawn, rng, extremes=None):
         import pumpkins
         self.spawn, self.rng = spawn, rng
         self.share = float(spawn.get("pumpkin_share", 0.0))
         self.r_range = tuple(float(v) for v in spawn["sizes"])
         self.p_range = tuple(float(v) for v in spawn.get("pumpkin_sizes", pumpkins.SIZES))
         self.reach = pumpkins.REACH
+        self.extremes = extremes
         self.k = self.others = 0
+
+    def _size(self, lo, hi, top):
+        if self.extremes is not None:
+            span = (hi - lo) * float(self.extremes)
+            lo, hi = (hi - span, hi) if top else (lo, lo + span)
+        return float(self.rng.uniform(lo, hi))
 
     def next(self):
         k, sides = self.k, self.spawn["sides"]
         self.k += 1
         if math.floor((k + 1) * self.share) > math.floor(k * self.share):
-            size = float(self.rng.uniform(*self.p_range))
+            size = self._size(*self.p_range, True)
             return {"kind": "pumpkin", "size": size, "r": size * self.reach}
         self.others += 1
-        return {"kind": "polygon", "r": float(self.rng.uniform(*self.r_range)),
-                "sides": int(sides[(self.others - 1) % len(sides)])}
+        n = int(sides[(self.others - 1) % len(sides)])
+        return {"kind": "polygon", "r": self._size(*self.r_range, n >= 7), "sides": n}
 
     def take(self, area):
         """The next specs, until their circles' area reaches `area`."""
@@ -323,7 +336,7 @@ class ChunkTest:
     Read only: the simulation is bit-identical with and without it."""
 
     def __init__(self, info, chunk, seed, fill=FILL, seconds=SECONDS, vel=VEL, margin=MARGIN, keys=None,
-                 sample_dt=None):
+                 sample_dt=None, extremes=EXTREMES):
         from entities import EnvConfig, FixedBody, SoftBody, polygon_points
         import pumpkins
         from solver import World
@@ -355,7 +368,7 @@ class ChunkTest:
         # --- shapes: fill x the free area of placement circles (see _place), then their bodies
         rng = np.random.default_rng([int(seed), 7177])
         target = fill * self.free_area
-        placed, placed_area = self._place(SpawnDraw(info.spawn, rng), local_tiles, rng, target)
+        placed, placed_area = self._place(SpawnDraw(info.spawn, rng, extremes), local_tiles, rng, target)
         self.fill_achieved = placed_area / max(self.free_area, 1e-9)
         self.shapes = []
         pick_rng = np.random.default_rng([int(seed), 7178])
@@ -538,7 +551,7 @@ class ChunkTest:
 
 def run_chunk(info, chunk, seed, **kw):
     """Build and run one chunk test to the end; its result dict plus "wall" (s, build + run) and "build_wall".
-    kw: ChunkTest's settings (fill, seconds, vel, margin, keys, sample_dt)."""
+    kw: ChunkTest's settings (fill, seconds, vel, margin, keys, sample_dt, extremes)."""
     t0 = time.perf_counter()
     test = ChunkTest(info, chunk, seed, **kw)
     t1 = time.perf_counter()
