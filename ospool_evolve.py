@@ -73,6 +73,8 @@ OUT = "outputs"
 PACK_MARGIN = 300.0  # s before the job's end kept for packing outputs/ (chunk_evolve keeps its own margin on top)
 ROUNDS = 100000  # --rounds default: effectively unlimited, the deadline stops the run
 OWN_FLAGS = ("--workers", "--deadline", "--log-dir")
+THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+               "VECLIB_MAXIMUM_THREADS", "NUMBA_NUM_THREADS")
 
 
 class Terminated(BaseException):
@@ -94,9 +96,10 @@ def cpu_model():
     return platform.processor() or platform.machine()
 
 
-def env_info():
+def env_info(omp_num_threads):
+    """omp_num_threads: HTCondor's value, before main pins every process to one thread."""
     import numpy
-    out = {"host": socket.gethostname(), "cpu_model": cpu_model(), "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+    out = {"host": socket.gethostname(), "cpu_model": cpu_model(), "omp_num_threads": omp_num_threads,
            "os_cpu_count": os.cpu_count(),
            "affinity": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
            "python": sys.version.split()[0], "numpy": numpy.__version__, "platform": platform.platform()}
@@ -233,7 +236,12 @@ def main(argv=None):
     out_dir = os.path.abspath(OUT)
     os.makedirs(out_dir, exist_ok=True)
     shutil.rmtree(os.path.join(out_dir, "layouts"), ignore_errors=True)  # a rerun's stale rounds
-    workers = max(1, int(os.environ.get("OMP_NUM_THREADS") or 1))
+    omp = os.environ.get("OMP_NUM_THREADS")
+    workers = max(1, int(omp or 1))
+    # HTCondor sets these to request_cpus and the pool's workers inherit them, so each worker's numpy could thread
+    # up to request_cpus wide: jobs were held for "Excessive CPU usage" (8-9 CPUs on 4). One thread per process.
+    for var in THREAD_VARS:
+        os.environ[var] = "1"
     deadline = time.strftime("%Y-%m-%d %H:%M", time.localtime(t0 + args.hours * 3600.0 - PACK_MARGIN))
     base = os.path.abspath(args.base)  # (whole-map spot runs chdir to the code's folder)
     ce_argv = ["map", "--base", base, "--seed", str(args.seed), "--workers", str(workers), "--deadline", deadline,
@@ -249,7 +257,7 @@ def main(argv=None):
     signal.signal(signal.SIGINT, on_signal)
     status, code, error = "ok", 0, None
     try:
-        summary.write(env=env_info())
+        summary.write(env=env_info(omp))
         print(f"ospool_evolve {args.tag}: seed {args.seed}, {workers} workers, deadline {deadline} (local), host "
               f"{summary.data['env']['host']}, jit {summary.data['env']['jit']}", flush=True)
         import chunk_evolve
